@@ -132,6 +132,53 @@ def test_check_rejects_stale_event_timeout(
     assert installer.check().installed is False
 
 
+@pytest.mark.parametrize(
+    "failure",
+    ("command", "type", "matcher", "duplicate"),
+)
+def test_check_requires_one_exact_owned_group_per_event(
+    tmp_path: Path, failure: str
+) -> None:
+    path = tmp_path / "settings.json"
+    installer = _installer("codex", path)
+    installer.install()
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    group = manifest["hooks"]["Stop"][-1]
+    entry = group["hooks"][0]
+    if failure == "command":
+        entry["command"] = entry["command"].replace("v1", "v10")
+    elif failure == "type":
+        entry["type"] = "prompt"
+    elif failure == "matcher":
+        group["matcher"] = "Bash"
+    else:
+        manifest["hooks"]["Stop"].append(json.loads(json.dumps(group)))
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert installer.check().installed is False
+
+
+def test_check_accepts_an_explicit_exact_wrapper_command(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    expected = "AGENT_SESSION_HARNESS_OWNED=v1 /opt/harness-bridge codex"
+    module = importlib.import_module("agent_session_harness.hooks.install")
+    installer = module.HookInstaller(
+        runtime="codex",
+        path=path,
+        expected_command=expected,
+    )
+
+    installer.install()
+
+    assert installer.check().installed is True
+    wrong_runtime = module.HookInstaller(
+        runtime="claude",
+        path=path,
+        expected_command=expected.removesuffix("codex") + "claude",
+    )
+    assert wrong_runtime.check().installed is False
+
+
 def test_installer_can_pin_an_absolute_harness_entrypoint(tmp_path) -> None:
     path = tmp_path / "settings.json"
     executable = tmp_path / "bin with spaces" / "agent-session-harness"

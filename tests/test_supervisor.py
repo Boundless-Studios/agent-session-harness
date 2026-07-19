@@ -84,6 +84,7 @@ class FakeCheckpointManager:
         *,
         crash_once=False,
         acknowledge_verified=True,
+        checkpoint_verified=True,
     ):
         self.supervisor_module = supervisor_module
         self.root = root
@@ -92,6 +93,7 @@ class FakeCheckpointManager:
         self.calls = []
         self.acknowledge_calls = []
         self.acknowledge_verified = acknowledge_verified
+        self.checkpoint_verified = checkpoint_verified
 
     def checkpoint(self, request):
         self.calls.append(request.idempotency_key)
@@ -122,7 +124,7 @@ class FakeCheckpointManager:
         receipt = self.receipts.setdefault(
             request.idempotency_key,
             self.supervisor_module.VerifiedCheckpoint(
-                verified=True,
+                verified=self.checkpoint_verified,
                 fingerprint=capsule.fingerprint,
                 path=capsule_path,
             ),
@@ -266,6 +268,7 @@ def _supervisor(
     stale_on_heartbeat=False,
     stale_on_fence=False,
     heartbeat_interval_seconds=20.0,
+    checkpoint_verified=True,
 ):
     process, supervisor = _modules()
     driver = FakeProcessDriver(process, crash_effect=crash_effect)
@@ -275,7 +278,10 @@ def _supervisor(
         stale_on_fence=stale_on_fence,
     )
     checkpoints = FakeCheckpointManager(
-        supervisor, tmp_path, crash_once=checkpoint_crash
+        supervisor,
+        tmp_path,
+        crash_once=checkpoint_crash,
+        checkpoint_verified=checkpoint_verified,
     )
     kwargs = {
         "runtime": "codex",
@@ -857,12 +863,36 @@ def test_supervisor_warns_drains_waits_then_rotates_without_overlap(tmp_path) ->
     assert awaiting.phase.value == "awaiting_ack"
     assert awaiting.generation == 1
     assert driver.max_active == 1
-    assert [call[0] for call in coordinator.calls] == ["claim", "fence", "claim"]
+    assert [call[0] for call in coordinator.calls] == [
+        "claim",
+        "heartbeat",
+        "heartbeat",
+        "fence",
+        "claim",
+    ]
     assert [call[0] for call in driver.calls] == ["start", "stop", "start"]
     assert len(set(checkpoints.calls)) == 1
     assert managed.can_dispatch is False
     assert "resume" not in driver.calls[-1][2]
     assert "--continue" not in driver.calls[-1][2]
+
+
+def test_failed_checkpoint_is_bracketed_by_watchdog_heartbeats(tmp_path) -> None:
+    managed, _kwargs, driver, coordinator, _checkpoints = _supervisor(
+        tmp_path,
+        checkpoint_verified=False,
+    )
+    managed.start()
+
+    stalled = managed.tick(_handoff_activity())
+
+    assert stalled.phase.value == "checkpointing"
+    assert [call[0] for call in coordinator.calls] == [
+        "claim",
+        "heartbeat",
+        "heartbeat",
+    ]
+    assert [call[0] for call in driver.calls] == ["start"]
 
 
 def test_idle_at_rotation_threshold_waits_for_post_drain_handoff_request(

@@ -229,10 +229,14 @@ def _activity_id(
         return str(payload.get("turn_id") or f"turn:{conversation_id}")
     if hook_name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
         raw_value = payload.get("tool_use_id") or payload.get("call_id")
-        return str(raw_value) if raw_value else f"tool:{conversation_id}"
+        if not raw_value:
+            raise ValueError("native tool hook is missing an activity ID")
+        return str(raw_value)
     if hook_name in {"SubagentStart", "SubagentStop"}:
         raw_value = payload.get("agent_id") or payload.get("subagent_id")
-        return str(raw_value) if raw_value else f"subagent:{conversation_id}"
+        if not raw_value:
+            raise ValueError("native subagent hook is missing an activity ID")
+        return str(raw_value)
     return None
 
 

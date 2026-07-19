@@ -145,9 +145,13 @@ def test_capsule_round_trips_canonical_json_with_verified_fingerprint(tmp_path) 
     ("field", "value"),
     [
         ("objective", "Continue with api_key=must-not-persist"),
+        ("objective", "LINEAR_API_KEY=must-not-persist"),
+        ("objective", "OPENAI_API_KEY: must-not-persist"),
+        ("objective", "AWS_SECRET_ACCESS_KEY=must-not-persist"),
         ("exact_next_action", "Use password:must-not-persist"),
         ("decisions", ["Keep token=must-not-persist"]),
         ("task_ids", {"linear": "token=must-not-persist"}),
+        ("task_ids", {"OPENAI_API_KEY": "must-not-persist"}),
         ("dirty_paths", ["secret=must-not-persist"]),
         ("test_results", {"pytest": "secret=must-not-persist"}),
         ("process_summaries", {"worker": "credential=must-not-persist"}),

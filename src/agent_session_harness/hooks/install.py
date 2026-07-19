@@ -51,10 +51,23 @@ class HookInstaller:
         runtime: str | Runtime,
         path: str | os.PathLike[str],
         harness_command: str | os.PathLike[str] | None = None,
+        expected_command: str | None = None,
     ):
         self.runtime = Runtime(runtime)
         self.path = Path(path)
         self.harness_command = self._harness_command(harness_command)
+        self.expected_command = expected_command or (
+            f"{OWNED_MARKER} {shlex.quote(self.harness_command)} "
+            f"hook --runtime {self.runtime.value}"
+        )
+        if (
+            not self.expected_command
+            or len(self.expected_command) > 16_384
+            or "\x00" in self.expected_command
+            or "\n" in self.expected_command
+            or OWNED_MARKER not in self.expected_command.split()
+        ):
+            raise ValueError("expected hook command is invalid")
         self.backup_path = self.path.with_suffix(
             self.path.suffix + ".agent-session-harness.bak"
         )
@@ -69,10 +82,6 @@ class HookInstaller:
         hooks = updated.setdefault("hooks", {})
         if not isinstance(hooks, dict):
             raise ValueError("hook manifest 'hooks' value must be an object")
-        command = (
-            f"{OWNED_MARKER} {shlex.quote(self.harness_command)} "
-            f"hook --runtime {self.runtime.value}"
-        )
         for event_name in HOOK_EVENTS:
             groups = hooks.setdefault(event_name, [])
             if not isinstance(groups, list):
@@ -83,7 +92,7 @@ class HookInstaller:
                     "hooks": [
                         {
                             "type": "command",
-                            "command": command,
+                            "command": self.expected_command,
                             "timeout": (
                                 SESSION_START_HOOK_TIMEOUT_SECONDS
                                 if event_name == "SessionStart"
@@ -156,27 +165,29 @@ class HookInstaller:
             and OWNED_MARKER_PREFIX in entry["command"]
         )
 
-    @staticmethod
-    def _current_entry(entry: object, event_name: str) -> bool:
+    def _expected_group(self, event_name: str) -> dict[str, object]:
         expected_timeout = (
             SESSION_START_HOOK_TIMEOUT_SECONDS
             if event_name == "SessionStart"
             else DEFAULT_HOOK_TIMEOUT_SECONDS
         )
-        return (
-            isinstance(entry, dict)
-            and isinstance(entry.get("command"), str)
-            and OWNED_MARKER in entry["command"]
-            and entry.get("timeout") == expected_timeout
-        )
+        return {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": self.expected_command,
+                    "timeout": expected_timeout,
+                }
+            ],
+        }
 
-    @staticmethod
-    def _is_installed(manifest: dict[str, Any]) -> bool:
+    def _is_installed(self, manifest: dict[str, Any]) -> bool:
         hooks = manifest.get("hooks")
         if not isinstance(hooks, dict):
             return False
-        found: set[str] = set()
-        for event_name, groups in hooks.items():
+        owned_count = 0
+        for groups in hooks.values():
             if not isinstance(groups, list):
                 continue
             for group in groups:
@@ -184,12 +195,16 @@ class HookInstaller:
                     group.get("hooks"), list
                 ):
                     continue
-                if any(
-                    HookInstaller._current_entry(entry, event_name)
-                    for entry in group["hooks"]
-                ):
-                    found.add(event_name)
-        return found == set(HOOK_EVENTS)
+                owned_count += sum(
+                    1 for entry in group["hooks"] if self._owned_entry(entry)
+                )
+        if owned_count != len(HOOK_EVENTS):
+            return False
+        return all(
+            isinstance(hooks.get(event_name), list)
+            and hooks[event_name].count(self._expected_group(event_name)) == 1
+            for event_name in HOOK_EVENTS
+        )
 
     @staticmethod
     def _harness_command(value: str | os.PathLike[str] | None) -> str:

@@ -598,8 +598,14 @@ class Supervisor:
                     target_generation=target,
                     idempotency_key=f"{self.chain_id}:{target}",
                 )
+                # Usage sampling happens earlier in the tick and mirror replay
+                # happens after it. Bracket the only cumulative synchronous
+                # adapter section so neither can consume the predecessor's
+                # watchdog budget.
+                self._heartbeat_if_due(force=True)
                 self._effect("checkpoint", "started", generation=target)
                 receipt = self.checkpoint_manager.checkpoint(request)
+                self._heartbeat_if_due(force=True)
                 if not receipt.verified:
                     self._effect("checkpoint", "failed", generation=target)
                     return self.snapshot
@@ -627,7 +633,6 @@ class Supervisor:
                     }
                 )
                 self._persist()
-                self._heartbeat_if_due()
                 continue
             if phase is SupervisorPhase.CHECKPOINTED:
                 self._set_phase(SupervisorPhase.STOPPING)

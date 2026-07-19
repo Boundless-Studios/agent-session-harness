@@ -146,6 +146,50 @@ def read_private_text(
         return encoded.decode(encoding)
 
 
+def read_private_text_incremental(
+    path: str | os.PathLike[str],
+    *,
+    offset: int,
+    expected_identity: tuple[int, int] | None,
+    max_bytes: int,
+    encoding: str = "utf-8",
+) -> tuple[str, int, tuple[int, int], bool]:
+    """Read only an appended private-file tail, resetting after replacement."""
+
+    if offset < 0 or max_bytes <= 0:
+        raise ValueError("incremental private read bounds are invalid")
+    descriptor = _open_private(Path(path), os.O_RDONLY)
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_size > max_bytes:
+            raise ValueError(f"private file exceeds {max_bytes} bytes")
+        identity = (metadata.st_dev, metadata.st_ino)
+        reset = (
+            expected_identity is not None and identity != expected_identity
+        ) or offset > metadata.st_size
+        start = 0 if reset else offset
+        os.lseek(descriptor, start, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = metadata.st_size - start
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ValueError("private file changed during incremental read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks).decode(encoding), metadata.st_size, identity, reset
+    finally:
+        os.close(descriptor)
+
+
+def private_file_size(path: str | os.PathLike[str]) -> int:
+    descriptor = _open_private(Path(path), os.O_RDONLY)
+    try:
+        return os.fstat(descriptor).st_size
+    finally:
+        os.close(descriptor)
+
+
 def private_file_mode(path: str | os.PathLike[str]) -> int:
     descriptor = _open_private(Path(path), os.O_RDONLY)
     try:

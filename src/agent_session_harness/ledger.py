@@ -15,15 +15,26 @@ from .models import EventType
 from .secure_files import (
     append_private_text,
     exclusive_lock,
+    private_file_size,
     private_exists,
-    read_private_text,
+    read_private_text_incremental,
 )
+
+
+MAX_LEDGER_BYTES = 16 * 1_048_576
+MAX_LEDGER_EVENTS = 50_000
+MAX_EVENT_BYTES = 64 * 1024
 
 
 class EventLedger:
     def __init__(self, path: str | os.PathLike[str]):
         self.path = Path(path)
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self._file_identity: tuple[int, int] | None = None
+        self._read_offset = 0
+        self._line_count = 0
+        self._cached_events: list[LifecycleEvent] = []
+        self._cached_warnings: list[str] = []
 
     def append(self, event: LifecycleEvent) -> None:
         encoded = json.dumps(
@@ -31,8 +42,16 @@ class EventLedger:
             sort_keys=True,
             separators=(",", ":"),
         )
+        encoded_bytes = (encoded + "\n").encode("utf-8")
+        if len(encoded_bytes) > MAX_EVENT_BYTES:
+            raise ValueError("lifecycle event exceeds byte limit")
         with exclusive_lock(self.lock_path):
-            append_private_text(self.path, encoded + "\n")
+            current_size = (
+                private_file_size(self.path) if private_exists(self.path) else 0
+            )
+            if current_size + len(encoded_bytes) > MAX_LEDGER_BYTES:
+                raise ValueError("lifecycle ledger exceeds byte limit")
+            append_private_text(self.path, encoded_bytes.decode("utf-8"))
 
     def materialize(
         self,
@@ -115,24 +134,51 @@ class EventLedger:
     def _read_events(self) -> tuple[list[LifecycleEvent], list[str]]:
         with exclusive_lock(self.lock_path):
             if not private_exists(self.path):
+                self._reset_cache()
                 return [], []
-            lines = read_private_text(self.path).splitlines()
+            try:
+                tail, offset, identity, reset = read_private_text_incremental(
+                    self.path,
+                    offset=self._read_offset,
+                    expected_identity=self._file_identity,
+                    max_bytes=MAX_LEDGER_BYTES,
+                )
+            except (UnicodeDecodeError, ValueError):
+                return [], ["lifecycle ledger exceeds bounds or is unreadable"]
 
-        events: list[LifecycleEvent] = []
-        warnings: list[str] = []
-        for line_number, line in enumerate(lines, start=1):
+        if reset:
+            self._reset_cache()
+        lines = tail.splitlines()
+        if tail and not tail.endswith("\n"):
+            self._cached_warnings.append("lifecycle ledger has a partial final line")
+        for line_number, line in enumerate(lines, start=self._line_count + 1):
             if not line.strip():
                 continue
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
-                warnings.append(f"line {line_number}: invalid JSON")
+                self._cached_warnings.append(f"line {line_number}: invalid JSON")
                 continue
             try:
-                events.append(LifecycleEvent.model_validate(payload))
+                self._cached_events.append(LifecycleEvent.model_validate(payload))
             except ValidationError:
-                warnings.append(f"line {line_number}: invalid lifecycle event")
-        return events, warnings
+                self._cached_warnings.append(
+                    f"line {line_number}: invalid lifecycle event"
+                )
+            if len(self._cached_events) > MAX_LEDGER_EVENTS:
+                self._cached_warnings.append("lifecycle ledger exceeds event limit")
+                break
+        self._line_count += len(lines)
+        self._read_offset = offset
+        self._file_identity = identity
+        return list(self._cached_events), list(self._cached_warnings)
+
+    def _reset_cache(self) -> None:
+        self._file_identity = None
+        self._read_offset = 0
+        self._line_count = 0
+        self._cached_events.clear()
+        self._cached_warnings.clear()
 
     @staticmethod
     def _quiescence(

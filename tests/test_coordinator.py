@@ -96,3 +96,36 @@ def test_adapter_state_contains_only_fencing_identity(tmp_path) -> None:
         "task_fingerprint",
         "owner_session_id",
     }
+
+
+def test_corrupt_latest_claim_record_blocks_a_competing_owner(tmp_path) -> None:
+    harness, _coordinator = _modules()
+    path = tmp_path / "claims.jsonl"
+    first = harness.CoordinatorAdapter.from_path(path)
+    first.claim(
+        task_type="linear",
+        task_id="BOU-2195",
+        fingerprint="task-fingerprint",
+        owner_session_id="conversation-0",
+        owner_pid=1234,
+        runtime="codex",
+        worktree_path=str(tmp_path),
+        lease_seconds=60,
+        now=NOW,
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"truncated":\n')
+
+    competitor = harness.CoordinatorAdapter.from_path(path)
+    with pytest.raises(RuntimeError, match="claim ledger line 2"):
+        competitor.claim(
+            task_type="linear",
+            task_id="BOU-2195",
+            fingerprint="task-fingerprint",
+            owner_session_id="conversation-1",
+            owner_pid=5678,
+            runtime="claude",
+            worktree_path=str(tmp_path),
+            lease_seconds=60,
+            now=NOW + timedelta(seconds=61),
+        )

@@ -21,7 +21,7 @@ from .checkpoint import CheckpointManager as DurableCheckpointManager
 from .config import load_config
 from .coordinator import CoordinatorAdapter
 from .guardian import WATCHDOG_SHUTDOWN_MARGIN_SECONDS
-from .hooks.command import run_hook
+from .hooks.command import SUCCESSOR_ACK_TIMEOUT_SECONDS, run_hook
 from .hooks.install import HookInstaller
 from .ledger import EventLedger
 from .models import Runtime
@@ -38,6 +38,9 @@ from .supervisor import (
     VerifiedCheckpoint,
     write_acknowledgement,
 )
+
+
+SYNCHRONOUS_ADAPTER_BUDGET_FRACTION = 0.8
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -79,6 +82,7 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--state-path")
     doctor.add_argument("--log-root")
     doctor.add_argument("--hook-manifest")
+    doctor.add_argument("--required-capabilities-known", action="store_true")
     doctor.add_argument(
         "--adapter",
         action="append",
@@ -196,6 +200,7 @@ def _parser() -> argparse.ArgumentParser:
         )
         action_parser.add_argument("--path", required=True)
         action_parser.add_argument("--harness-command")
+        action_parser.add_argument("--expected-command")
         action_parser.add_argument("--dry-run", action="store_true")
         _add_json(action_parser)
         action_parser.set_defaults(handler=_run_hooks)
@@ -236,6 +241,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
         state_path=args.state_path,
         log_root=args.log_root,
         hook_manifest=args.hook_manifest,
+        required_capabilities_known=args.required_capabilities_known,
         adapter_commands=adapter_commands,
         adapter_inherit_env=_parse_named_environment(
             args.adapter_env,
@@ -306,7 +312,6 @@ def _run_supervise(args: argparse.Namespace) -> int:
         raise ValueError(
             "managed supervision requires known capabilities and observe_only=false"
         )
-    _validate_supervise_intervals(args)
     if args.usage_adapter is None:
         raise ValueError("managed supervision requires --usage-adapter")
     if args.capsule_adapter is None:
@@ -316,6 +321,11 @@ def _run_supervise(args: argparse.Namespace) -> int:
     if not required_specs:
         raise ValueError("managed supervision requires a --required-adapter")
     mirror_specs = _parse_named_argv(args.mirror_adapter)
+    _validate_supervise_intervals(
+        args,
+        required_adapter_count=len(required_specs),
+        mirror_adapter_count=len(mirror_specs),
+    )
     adapter_names = set(required_specs) | set(mirror_specs)
     adapter_inherit_env = _parse_named_environment(
         args.adapter_env,
@@ -412,6 +422,7 @@ def _run_supervise(args: argparse.Namespace) -> int:
         stop_timeout_seconds=args.stop_timeout_seconds,
     )
     ticks = 0
+    activity_ledger = EventLedger(managed.lifecycle_path)
     interrupted = False
     mirror_replay_error: str | None = None
     try:
@@ -426,7 +437,7 @@ def _run_supervise(args: argparse.Namespace) -> int:
             )
         while args.max_ticks == 0 or ticks < args.max_ticks:
             time.sleep(args.poll_seconds)
-            activity = EventLedger(managed.lifecycle_path).materialize(
+            activity = activity_ledger.materialize(
                 now=datetime.now(tz=timezone.utc),
                 stale_after_seconds=(
                     args.stale_after_seconds
@@ -515,6 +526,7 @@ def _run_hooks(args: argparse.Namespace) -> int:
         runtime=args.runtime,
         path=args.path,
         harness_command=args.harness_command,
+        expected_command=args.expected_command,
     )
     if args.hook_action == "install":
         result = installer.install(dry_run=args.dry_run)
@@ -526,6 +538,8 @@ def _run_hooks(args: argparse.Namespace) -> int:
         {"changed": result.changed, "installed": result.installed},
         json_output=args.json_output,
     )
+    if args.hook_action == "check" and not result.installed:
+        return 1
     return 0
 
 
@@ -736,7 +750,12 @@ def _resolve_executable(executable: str) -> str:
     return resolved
 
 
-def _validate_supervise_intervals(args: argparse.Namespace) -> None:
+def _validate_supervise_intervals(
+    args: argparse.Namespace,
+    *,
+    required_adapter_count: int,
+    mirror_adapter_count: int,
+) -> None:
     if args.poll_seconds <= 0:
         raise ValueError("poll seconds must be positive")
     if args.lease_seconds <= 0:
@@ -754,6 +773,22 @@ def _validate_supervise_intervals(args: argparse.Namespace) -> None:
         raise ValueError(
             "adapter timeout and poll interval must leave at least half the "
             "watchdog lease for supervision"
+        )
+    checkpoint_seconds = (
+        1 + (2 * required_adapter_count) + mirror_adapter_count
+    ) * args.adapter_timeout_seconds
+    if checkpoint_seconds >= (watchdog_seconds * SYNCHRONOUS_ADAPTER_BUDGET_FRACTION):
+        raise ValueError(
+            "cumulative checkpoint adapter budget must leave watchdog headroom"
+        )
+    acknowledgement_seconds = (
+        required_adapter_count + mirror_adapter_count
+    ) * args.adapter_timeout_seconds
+    if acknowledgement_seconds >= (
+        SUCCESSOR_ACK_TIMEOUT_SECONDS * SYNCHRONOUS_ADAPTER_BUDGET_FRACTION
+    ):
+        raise ValueError(
+            "cumulative acknowledgement adapter budget must leave SessionStart headroom"
         )
     if (
         args.heartbeat_interval_seconds is not None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timezone
 import json
 import os
@@ -37,6 +38,72 @@ def test_doctor_json_is_deterministic_and_never_launches_a_model(capsys) -> None
     assert payload["ok"] is True
     assert payload["checks"]["package"] == "0.1.0"
     assert "summary" not in payload
+
+
+def test_doctor_reports_managed_policy_only_when_capabilities_are_known(
+    tmp_path: Path, capsys
+) -> None:
+    config = tmp_path / ".agent-session-harness.toml"
+    config.write_text("observe_only = false\n", encoding="utf-8")
+
+    assert cli.main(["doctor", "--config", str(config), "--json"]) == 0
+    unknown = _json_stdout(capsys)
+    assert unknown["checks"]["observe_only"] is True
+
+    assert (
+        cli.main(
+            [
+                "doctor",
+                "--config",
+                str(config),
+                "--required-capabilities-known",
+                "--json",
+            ]
+        )
+        == 0
+    )
+    known = _json_stdout(capsys)
+    assert known["checks"]["observe_only"] is False
+
+
+def _interval_args(
+    *, adapter_timeout_seconds: float = 5.0, lease_seconds: int = 60
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        poll_seconds=1.0,
+        lease_seconds=lease_seconds,
+        stop_timeout_seconds=10.0,
+        stale_after_seconds=None,
+        max_ticks=0,
+        adapter_timeout_seconds=adapter_timeout_seconds,
+        heartbeat_interval_seconds=None,
+    )
+
+
+def test_supervise_rejects_cumulative_checkpoint_adapter_budget() -> None:
+    with pytest.raises(ValueError, match="checkpoint adapter budget"):
+        cli._validate_supervise_intervals(
+            _interval_args(),
+            required_adapter_count=6,
+            mirror_adapter_count=0,
+        )
+
+
+def test_supervise_rejects_cumulative_acknowledgement_adapter_budget() -> None:
+    with pytest.raises(ValueError, match="acknowledgement adapter budget"):
+        cli._validate_supervise_intervals(
+            _interval_args(adapter_timeout_seconds=20.0, lease_seconds=120),
+            required_adapter_count=1,
+            mirror_adapter_count=1,
+        )
+
+
+def test_supervise_accepts_bounded_multi_adapter_budget() -> None:
+    cli._validate_supervise_intervals(
+        _interval_args(adapter_timeout_seconds=10.0),
+        required_adapter_count=1,
+        mirror_adapter_count=1,
+    )
 
 
 def test_inspect_reads_native_usage_as_stable_json(capsys) -> None:
@@ -172,6 +239,21 @@ def test_hook_and_hook_installer_commands_round_trip(
             ]
         )
         == 0
+    )
+    assert _json_stdout(capsys)["installed"] is False
+    assert (
+        cli.main(
+            [
+                "hooks",
+                "check",
+                "--runtime",
+                "codex",
+                "--path",
+                str(manifest),
+                "--json",
+            ]
+        )
+        == 1
     )
     assert _json_stdout(capsys)["installed"] is False
 

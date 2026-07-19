@@ -25,6 +25,9 @@ from .secure_files import (
 )
 
 
+MAX_CLAIM_LEDGER_BYTES = 16 * 1_048_576
+
+
 class StaleOwnerError(RuntimeError):
     """The caller no longer owns the current fenced task generation."""
 
@@ -78,15 +81,26 @@ class _SecureJsonlClaimStore(JsonlClaimStore):
         if not private_exists(self.path):
             return []
         events: list[dict[str, Any]] = []
-        for line in read_private_text(self.path).splitlines():
+        for line_number, line in enumerate(
+            read_private_text(
+                self.path,
+                max_bytes=MAX_CLAIM_LEDGER_BYTES,
+            ).splitlines(),
+            start=1,
+        ):
             if not line.strip():
                 continue
             try:
                 payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                events.append(payload)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"claim ledger line {line_number} is invalid JSON"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"claim ledger line {line_number} is not an event object"
+                )
+            events.append(payload)
         return events
 
 

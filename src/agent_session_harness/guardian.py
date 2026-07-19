@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import termios
 import time
 from typing import Mapping
 
@@ -34,6 +35,55 @@ WATCHDOG_SHUTDOWN_MARGIN_SECONDS = (
 )
 
 
+class _TerminalLease:
+    """Temporarily hand the controlling terminal to one runtime process group."""
+
+    def __init__(self, fd: int, supervisor_pgid: int, attributes: list[object]):
+        self.fd = fd
+        self.supervisor_pgid = supervisor_pgid
+        self.attributes = attributes
+        self.restored = False
+
+    @classmethod
+    def capture(cls) -> _TerminalLease | None:
+        fd = 0
+        if not os.isatty(fd):
+            return None
+        try:
+            return cls(fd, os.tcgetpgrp(fd), termios.tcgetattr(fd))
+        except OSError as exc:
+            raise RuntimeError(
+                "interactive guardian cannot inspect its terminal"
+            ) from exc
+
+    def foreground(self, process_group_id: int) -> None:
+        previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(self.fd, process_group_id)
+            os.killpg(process_group_id, signal.SIGCONT)
+        except OSError as exc:
+            raise RuntimeError(
+                "interactive guardian cannot transfer terminal ownership"
+            ) from exc
+        finally:
+            signal.signal(signal.SIGTTOU, previous)
+
+    def restore(self) -> None:
+        if self.restored:
+            return
+        previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        try:
+            os.tcsetpgrp(self.fd, self.supervisor_pgid)
+            termios.tcsetattr(self.fd, termios.TCSANOW, self.attributes)
+        except OSError as exc:
+            raise RuntimeError(
+                "interactive guardian cannot restore terminal ownership"
+            ) from exc
+        finally:
+            signal.signal(signal.SIGTTOU, previous)
+        self.restored = True
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="agent-session-harness-guardian")
     parser.add_argument("--registry", required=True)
@@ -54,15 +104,20 @@ def main(argv: list[str] | None = None) -> int:
     guardian_pid = os.getpid()
     child_environment = dict(os.environ)
     child_environment["AGENT_SESSION_HARNESS_OWNER_PID"] = str(guardian_pid)
-    child = subprocess.Popen(
-        command,
-        cwd=args.cwd,
-        env=child_environment,
-        start_new_session=True,
-    )
-
+    terminal_lease = _TerminalLease.capture()
+    child: subprocess.Popen[bytes] | None = None
+    child_session_id: int | None = None
     process = None
     try:
+        child = subprocess.Popen(
+            command,
+            cwd=args.cwd,
+            env=child_environment,
+            process_group=0,
+        )
+        child_session_id = os.getsid(child.pid)
+        if terminal_lease is not None:
+            terminal_lease.foreground(child.pid)
         process = register_guarded_process(
             registry_path=Path(args.registry),
             intent_path=Path(args.intent),
@@ -71,29 +126,40 @@ def main(argv: list[str] | None = None) -> int:
             launch_nonce=args.launch_nonce,
             process_group_id=child.pid,
         )
-        terminal = _watch_child(
+        terminal_exit = _watch_child(
             child,
             process_pid=guardian_pid,
             chain_id=_required_environment("AGENT_SESSION_HARNESS_CHAIN_ID"),
             generation=int(_required_environment("AGENT_SESSION_HARNESS_GENERATION")),
             state_path=_state_path(os.environ),
             timeout_seconds=timeout,
+            process_group_session_id=child_session_id,
         )
+        if terminal_lease is not None:
+            terminal_lease.restore()
         record_guarded_exit(
             registry_path=Path(args.registry),
             process=process,
-            terminal=terminal,
+            terminal=terminal_exit,
         )
-        return terminal.return_code
+        return terminal_exit.return_code
     finally:
-        if child.poll() is None:
+        if child is not None and child.poll() is None:
             _terminate_child(child)
-        _drain_process_group(child.pid)
-        if process is not None:
-            unregister_guarded_process(
-                registry_path=Path(args.registry),
-                process=process,
+        if child is not None:
+            _drain_process_group(
+                child.pid,
+                expected_session_id=child_session_id,
             )
+        try:
+            if terminal_lease is not None:
+                terminal_lease.restore()
+        finally:
+            if process is not None:
+                unregister_guarded_process(
+                    registry_path=Path(args.registry),
+                    process=process,
+                )
 
 
 def _watch_child(
@@ -104,12 +170,21 @@ def _watch_child(
     generation: int,
     state_path: Path | None,
     timeout_seconds: float,
+    process_group_session_id: int | None = None,
 ) -> ProcessExit:
     deadline = time.monotonic() + timeout_seconds
     parent_pid = os.getppid()
     interval = min(WATCHDOG_POLL_MAX_SECONDS, timeout_seconds / 4)
     reason = ExitReason.NATURAL
     while child.poll() is None:
+        if _child_was_stopped(child.pid):
+            # A nested managed runtime cannot safely hand shell job control back
+            # without also suspending the outer supervisor and its lease. Keep
+            # terminal input live instead of leaving both layers deadlocked.
+            try:
+                os.killpg(child.pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
         if state_path is None:
             if os.getppid() == parent_pid:
                 deadline = time.monotonic() + timeout_seconds
@@ -143,9 +218,22 @@ def _watch_child(
         )
         if isinstance(final_status, ExitReason):
             reason = final_status
-    if not _drain_process_group(child.pid):
+    if not _drain_process_group(
+        child.pid,
+        expected_session_id=process_group_session_id,
+    ):
         reason = ExitReason.PROCESS_GROUP_UNVERIFIED
     return ProcessExit(return_code=return_code, reason=reason)
+
+
+def _child_was_stopped(pid: int) -> bool:
+    """Consume a child stop notification without reaping terminal exit state."""
+
+    try:
+        status = os.waitid(os.P_PID, pid, os.WSTOPPED | os.WNOHANG)
+    except (AttributeError, ChildProcessError, OSError):
+        return False
+    return status is not None and status.si_code == os.CLD_STOPPED
 
 
 def _read_watchdog_state(
@@ -198,10 +286,20 @@ def _terminate_child(child: subprocess.Popen[bytes]) -> None:
     child.wait(timeout=KILL_WAIT_SECONDS)
 
 
-def _drain_process_group(process_group_id: int) -> bool:
+def _drain_process_group(
+    process_group_id: int,
+    *,
+    expected_session_id: int | None = None,
+) -> bool:
     """Drain only descendants that still belong to the child's original session."""
 
-    members = _verified_process_group_members(process_group_id)
+    required_session_id = (
+        process_group_id if expected_session_id is None else expected_session_id
+    )
+    members = _verified_process_group_members(
+        process_group_id,
+        expected_session_id=required_session_id,
+    )
     if members is None:
         return False
     if not members:
@@ -213,9 +311,13 @@ def _drain_process_group(process_group_id: int) -> bool:
     if _await_empty_process_group(
         process_group_id,
         timeout_seconds=TERMINATE_GRACE_SECONDS,
+        expected_session_id=required_session_id,
     ):
         return True
-    members = _verified_process_group_members(process_group_id)
+    members = _verified_process_group_members(
+        process_group_id,
+        expected_session_id=required_session_id,
+    )
     if members is None:
         return False
     if not members:
@@ -227,6 +329,7 @@ def _drain_process_group(process_group_id: int) -> bool:
     return _await_empty_process_group(
         process_group_id,
         timeout_seconds=KILL_WAIT_SECONDS,
+        expected_session_id=required_session_id,
     )
 
 
@@ -234,10 +337,17 @@ def _await_empty_process_group(
     process_group_id: int,
     *,
     timeout_seconds: float,
+    expected_session_id: int | None = None,
 ) -> bool:
+    required_session_id = (
+        process_group_id if expected_session_id is None else expected_session_id
+    )
     deadline = time.monotonic() + timeout_seconds
     while True:
-        members = _verified_process_group_members(process_group_id)
+        members = _verified_process_group_members(
+            process_group_id,
+            expected_session_id=required_session_id,
+        )
         if members is None:
             return False
         if not members:
@@ -249,7 +359,12 @@ def _await_empty_process_group(
 
 def _verified_process_group_members(
     process_group_id: int,
+    *,
+    expected_session_id: int | None = None,
 ) -> set[int] | None:
+    required_session_id = (
+        process_group_id if expected_session_id is None else expected_session_id
+    )
     try:
         completed = subprocess.run(
             ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
@@ -276,12 +391,12 @@ def _verified_process_group_members(
         if pgid != process_group_id:
             continue
         try:
-            session_id = os.getsid(pid)
+            actual_session_id = os.getsid(pid)
         except ProcessLookupError:
             continue
         except (OSError, PermissionError):
             return None
-        if session_id != process_group_id:
+        if actual_session_id != required_session_id:
             return None
         state = fields[2] if len(fields) == 3 else ""
         if not state.startswith("Z"):

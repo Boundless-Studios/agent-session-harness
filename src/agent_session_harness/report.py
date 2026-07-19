@@ -114,6 +114,7 @@ def doctor_report(
     state_path: str | os.PathLike[str] | None = None,
     log_root: str | os.PathLike[str] | None = None,
     hook_manifest: str | os.PathLike[str] | None = None,
+    required_capabilities_known: bool | None = None,
     adapter_commands: Mapping[str, Sequence[str]] | None = None,
     adapter_inherit_env: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, object]:
@@ -131,9 +132,10 @@ def doctor_report(
     config = load_config(
         explicit_path=config_path,
         project_dir=project_dir,
-        required_capabilities_known=None,
+        required_capabilities_known=required_capabilities_known,
     )
     checks["config"] = str(resolved) if resolved else "defaults"
+    checks["required_capabilities_known"] = required_capabilities_known is True
     checks["observe_only"] = config.observe_only
     if runtime is not None:
         runtime_value = Runtime(runtime)

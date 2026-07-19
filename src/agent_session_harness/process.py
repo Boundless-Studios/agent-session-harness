@@ -329,7 +329,7 @@ class PosixProcessDriver:
                 guardian_argv,
                 cwd=request.cwd,
                 env=environment,
-                start_new_session=True,
+                process_group=0,
             )
         if managed is None:
             managed = self._await_registry(registry_path, key, nonce)

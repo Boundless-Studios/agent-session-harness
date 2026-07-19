@@ -31,7 +31,8 @@ ProcessState = Literal[
 ]
 
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:api[-_]?key|authorization|credential|password|secret|token)"
+    r"(?i)\b(?:[a-z0-9]+[-_])*(?:api[-_]?key|authorization|credential|password|secret|token)"
+    r"(?:[-_][a-z0-9]+)*"
     r"\s*[:=]\s*\S+"
 )
 
@@ -136,7 +137,11 @@ class HandoffCapsule(BaseModel):
         if isinstance(value, (str, Path)):
             candidates = (str(value),)
         elif isinstance(value, dict):
-            candidates = tuple(str(item) for pair in value.items() for item in pair)
+            candidates = tuple(
+                candidate
+                for key, item in value.items()
+                for candidate in (str(key), str(item), f"{key}={item}")
+            )
         elif isinstance(value, (list, tuple)):
             candidates = tuple(str(item) for item in value)
         else:

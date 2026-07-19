@@ -109,6 +109,8 @@ agent-session-harness supervise \
 
 The supervisor runs until interrupted. `--max-ticks` exists for bounded automation and tests. Only a status-zero exit recorded by the guardian as natural, after its descendant process group is drained and verified, fences its claim and persists `completed`; forced, nonzero, unverified, or premature successor exits fail closed as `blocked`. Interrupting the supervisor records an explicit supervisor-stop reason, stops the managed child, fences its claim, and also persists `blocked` rather than leaving an unowned agent running. `blocked` is terminal for that run specification: after resolving retained ownership, start a new chain and state path instead of reusing or resuming it.
 
+Interactive managed runtimes retain the caller's controlling terminal. Terminal input, Ctrl-C, and resize signals reach the active runtime process group, and terminal ownership/attributes are restored after exit. Ctrl-Z is resumed immediately instead of suspending a nested runtime: leaving only the inner process group stopped would strand the outer supervisor and its durable lease.
+
 Managed runtimes inherit a deliberately small base environment. A host can preserve an audited operational key without placing its value in argv, logs, or supervisor state by repeating `--runtime-env KEY`; unrelated ambient variables remain absent. Harness-control keys are reserved, and opaque value digests bind the immutable run and process specifications without persisting their plaintext values.
 
 The long-lived integration surface is `agent_session_harness.supervisor.Supervisor`. A host supplies four small protocols: native usage reader, checkpoint manager, fenced coordinator, and process driver. This keeps Linear, beads, PR dashboards, worktree launchers, and project safety policy outside the reusable package. The deterministic E2E test uses a real child process and proves root → checkpoint → stop while still claimed → fence/release → fresh successor → acknowledgement with no overlap.
@@ -279,7 +281,7 @@ Consumers should project this record; they should not infer lifecycle ownership 
 
 ## Privacy and recovery
 
-Usage parsers whitelist only accounting metadata. Capsules reject unknown fields and credential-shaped assignments, adapter diagnostics are bounded and redacted, ledgers/outboxes/state files use `0600`, and corrupt records fail closed. Harness-controlled state, lock, registry, outbox, claim, and hook-manifest operations reject symlink targets and symlinked parent directories.
+Usage parsers whitelist only accounting metadata. Capsules reject unknown fields and credential-shaped assignments, adapter diagnostics are bounded and redacted, ledgers/outboxes/state files use `0600`, and corrupt records fail closed. Lifecycle ledgers are bounded to 16 MiB/50,000 events and are materialized incrementally during supervision. Harness-controlled state, lock, registry, outbox, claim, and hook-manifest operations reject symlink targets and symlinked parent directories.
 
 On restart, the supervisor resumes from the last non-terminal durable phase. Checkpoints, fencing, stopping, same-owner claims, and launch keys are idempotent. If a crash occurs after a child starts but before completion is recorded, the process registry finds the existing chain/generation instead of launching a duplicate. The persistent guardian also watches the supervisor heartbeat and terminates the runtime process group even when no cleanup handler runs.
 

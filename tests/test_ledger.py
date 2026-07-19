@@ -115,3 +115,55 @@ def test_corrupt_line_is_retained_as_integrity_warning(tmp_path) -> None:
 
     assert snapshot.quiescence is activity.Quiescence.UNKNOWN
     assert any("invalid JSON" in item for item in snapshot.integrity_warnings)
+
+
+def test_repeated_materialization_reads_only_the_new_ledger_tail(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    offsets: list[int] = []
+    original = ledger_module.read_private_text_incremental
+
+    def tracking_read(path, **kwargs):
+        offsets.append(kwargs["offset"])
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(ledger_module, "read_private_text_incremental", tracking_read)
+    ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+    ledger.materialize(now=NOW, stale_after_seconds=30)
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "event-2",
+            "tool.finished",
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    )
+
+    assert offsets[0] == 0
+    assert offsets[1] > 0
+    assert snapshot.quiescence.value == "idle"
+
+
+def test_ledger_refuses_to_append_past_its_byte_bound(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+    monkeypatch.setattr(
+        ledger_module,
+        "MAX_LEDGER_BYTES",
+        ledger.path.stat().st_size + 1,
+    )
+
+    with pytest.raises(ValueError, match="byte limit"):
+        ledger.append(_event(events, tmp_path, "event-2", "tool.finished"))

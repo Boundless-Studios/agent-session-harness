@@ -91,6 +91,38 @@ def test_native_events_normalize_to_sanitized_lifecycle(
     assert "/private/value" not in event.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    "hook_name",
+    [
+        "PreToolUse",
+        "PostToolUse",
+        "PostToolUseFailure",
+        "SubagentStart",
+        "SubagentStop",
+    ],
+)
+def test_concurrent_native_activity_without_an_opaque_id_fails_closed(
+    tmp_path,
+    hook_name,
+) -> None:
+    native, _command = _modules()
+    payload = {
+        "hook_event_name": hook_name,
+        "session_id": "conversation-1",
+        "cwd": str(tmp_path),
+        "timestamp": NOW.isoformat(),
+    }
+
+    with pytest.raises(ValueError, match="activity ID"):
+        native.normalize_native_event(
+            runtime="codex",
+            payload=payload,
+            chain_id="chain-1",
+            generation=0,
+            owner_pid=1234,
+        )
+
+
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
 def test_stop_handshake_encodes_runtime_native_block_response(runtime) -> None:
     native, _command = _modules()
