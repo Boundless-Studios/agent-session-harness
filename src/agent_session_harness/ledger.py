@@ -1,0 +1,197 @@
+"""Append-only local lifecycle event ledger."""
+
+from __future__ import annotations
+
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+
+from pydantic import ValidationError
+
+from .activity import ActivitySnapshot, Quiescence
+from .events import LifecycleEvent
+from .models import EventType
+from .secure_files import (
+    append_private_text,
+    exclusive_lock,
+    private_file_size,
+    private_exists,
+    read_private_text_incremental,
+)
+
+
+MAX_LEDGER_BYTES = 16 * 1_048_576
+MAX_LEDGER_EVENTS = 50_000
+MAX_EVENT_BYTES = 64 * 1024
+
+
+class EventLedger:
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = Path(path)
+        self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self._file_identity: tuple[int, int] | None = None
+        self._read_offset = 0
+        self._line_count = 0
+        self._cached_events: list[LifecycleEvent] = []
+        self._cached_warnings: list[str] = []
+
+    def append(self, event: LifecycleEvent) -> None:
+        encoded = json.dumps(
+            event.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        encoded_bytes = (encoded + "\n").encode("utf-8")
+        if len(encoded_bytes) > MAX_EVENT_BYTES:
+            raise ValueError("lifecycle event exceeds byte limit")
+        with exclusive_lock(self.lock_path):
+            current_size = (
+                private_file_size(self.path) if private_exists(self.path) else 0
+            )
+            if current_size + len(encoded_bytes) > MAX_LEDGER_BYTES:
+                raise ValueError("lifecycle ledger exceeds byte limit")
+            append_private_text(self.path, encoded_bytes.decode("utf-8"))
+
+    def materialize(
+        self,
+        *,
+        now: datetime,
+        stale_after_seconds: float,
+    ) -> ActivitySnapshot:
+        events, warnings = self._read_events()
+        seen: set[str] = set()
+        active_turns: set[str] = set()
+        active_tools: set[str] = set()
+        active_subagents: set[str] = set()
+        active_critical_sections: set[str] = set()
+        handoff_requested_generations: set[int] = set()
+        last_event_at: datetime | None = None
+        processed = 0
+
+        starts = {
+            EventType.TURN_STARTED: (active_turns, "turn"),
+            EventType.TOOL_STARTED: (active_tools, "tool"),
+            EventType.SUBAGENT_STARTED: (active_subagents, "subagent"),
+            EventType.CRITICAL_ENTERED: (active_critical_sections, "critical section"),
+        }
+        finishes = {
+            EventType.TURN_IDLE: (active_turns, "turn"),
+            EventType.TOOL_FINISHED: (active_tools, "tool"),
+            EventType.TOOL_FAILED: (active_tools, "tool"),
+            EventType.SUBAGENT_FINISHED: (active_subagents, "subagent"),
+            EventType.CRITICAL_EXITED: (active_critical_sections, "critical section"),
+        }
+
+        for event in events:
+            if event.event_id in seen:
+                continue
+            seen.add(event.event_id)
+            processed += 1
+            if last_event_at is None or event.timestamp > last_event_at:
+                last_event_at = event.timestamp
+
+            if event.event_type in starts:
+                target, _label = starts[event.event_type]
+                target.add(event.activity_id or "")
+            elif event.event_type in finishes:
+                target, label = finishes[event.event_type]
+                activity_id = event.activity_id or ""
+                if activity_id not in target:
+                    warnings.append(
+                        f"{label} finish without start: {activity_id or 'missing'}"
+                    )
+                else:
+                    target.remove(activity_id)
+            elif event.event_type is EventType.HANDOFF_REQUESTED:
+                handoff_requested_generations.add(event.generation)
+
+        active_groups = (
+            active_turns,
+            active_tools,
+            active_subagents,
+            active_critical_sections,
+        )
+        quiescence = self._quiescence(
+            warnings=warnings,
+            last_event_at=last_event_at,
+            now=now,
+            stale_after_seconds=stale_after_seconds,
+            has_active=any(active_groups),
+        )
+        return ActivitySnapshot(
+            quiescence=quiescence,
+            active_turn_ids=frozenset(active_turns),
+            active_tool_ids=frozenset(active_tools),
+            active_subagent_ids=frozenset(active_subagents),
+            active_critical_section_ids=frozenset(active_critical_sections),
+            processed_event_count=processed,
+            last_event_at=last_event_at,
+            integrity_warnings=tuple(warnings),
+            handoff_requested_generations=frozenset(handoff_requested_generations),
+        )
+
+    def _read_events(self) -> tuple[list[LifecycleEvent], list[str]]:
+        with exclusive_lock(self.lock_path):
+            if not private_exists(self.path):
+                self._reset_cache()
+                return [], []
+            try:
+                tail, offset, identity, reset = read_private_text_incremental(
+                    self.path,
+                    offset=self._read_offset,
+                    expected_identity=self._file_identity,
+                    max_bytes=MAX_LEDGER_BYTES,
+                )
+            except (UnicodeDecodeError, ValueError):
+                return [], ["lifecycle ledger exceeds bounds or is unreadable"]
+
+        if reset:
+            self._reset_cache()
+        lines = tail.splitlines()
+        if tail and not tail.endswith("\n"):
+            self._cached_warnings.append("lifecycle ledger has a partial final line")
+        for line_number, line in enumerate(lines, start=self._line_count + 1):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                self._cached_warnings.append(f"line {line_number}: invalid JSON")
+                continue
+            try:
+                self._cached_events.append(LifecycleEvent.model_validate(payload))
+            except ValidationError:
+                self._cached_warnings.append(
+                    f"line {line_number}: invalid lifecycle event"
+                )
+            if len(self._cached_events) > MAX_LEDGER_EVENTS:
+                self._cached_warnings.append("lifecycle ledger exceeds event limit")
+                break
+        self._line_count += len(lines)
+        self._read_offset = offset
+        self._file_identity = identity
+        return list(self._cached_events), list(self._cached_warnings)
+
+    def _reset_cache(self) -> None:
+        self._file_identity = None
+        self._read_offset = 0
+        self._line_count = 0
+        self._cached_events.clear()
+        self._cached_warnings.clear()
+
+    @staticmethod
+    def _quiescence(
+        *,
+        warnings: list[str],
+        last_event_at: datetime | None,
+        now: datetime,
+        stale_after_seconds: float,
+        has_active: bool,
+    ) -> Quiescence:
+        if warnings or last_event_at is None:
+            return Quiescence.UNKNOWN
+        age_seconds = (now - last_event_at).total_seconds()
+        if age_seconds < 0 or age_seconds > stale_after_seconds:
+            return Quiescence.UNKNOWN
+        return Quiescence.BUSY if has_active else Quiescence.IDLE

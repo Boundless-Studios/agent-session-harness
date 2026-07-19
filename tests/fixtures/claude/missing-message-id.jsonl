@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-07-19T03:00:00Z","sessionId":"claude-missing","cwd":"/tmp/project","message":{"model":"claude-opus-4-6","usage":{"input_tokens":10000,"output_tokens":1000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[]}}
+{"type":"assistant","timestamp":"2026-07-19T03:00:01Z","sessionId":"claude-missing","cwd":"/tmp/project","message":{"model":"claude-opus-4-6","usage":{"input_tokens":20000,"output_tokens":2000,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[]}}
