@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from pathlib import Path
+from typing import Any, Callable
 
 from agent_coordinator import (
     JsonlClaimStore,
@@ -15,6 +17,12 @@ from agent_coordinator import (
 from pydantic import BaseModel, ConfigDict, Field
 
 from .models import Runtime
+from .secure_files import (
+    append_private_text,
+    exclusive_lock,
+    private_exists,
+    read_private_text,
+)
 
 
 class StaleOwnerError(RuntimeError):
@@ -40,13 +48,64 @@ class FenceResult(BaseModel):
     release_reason: str
 
 
+class _SecureJsonlClaimStore(JsonlClaimStore):
+    """Use the coordinator contract without following state or lock symlinks."""
+
+    def append_event(self, event: dict[str, Any]) -> None:
+        with exclusive_lock(self.lock_path):
+            self._append_secure(event)
+
+    def read_events(self) -> list[dict[str, Any]]:
+        with exclusive_lock(self.lock_path):
+            return self._read_secure()
+
+    def transact_event(
+        self,
+        build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
+    ) -> dict[str, Any]:
+        with exclusive_lock(self.lock_path):
+            event = build_event(self._read_secure())
+            self._append_secure(event)
+            return event
+
+    def _append_secure(self, event: dict[str, Any]) -> None:
+        append_private_text(
+            self.path,
+            json.dumps(event, sort_keys=True) + "\n",
+        )
+
+    def _read_secure(self) -> list[dict[str, Any]]:
+        if not private_exists(self.path):
+            return []
+        events: list[dict[str, Any]] = []
+        for line in read_private_text(self.path).splitlines():
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                events.append(payload)
+        return events
+
+
 class CoordinatorAdapter:
     def __init__(self, coordinator: TaskCoordinator):
         self.coordinator = coordinator
 
     @classmethod
     def from_path(cls, path: str | Path) -> CoordinatorAdapter:
-        return cls(TaskCoordinator(JsonlClaimStore(path)))
+        # The managed runtime is owned by a guardian process and can outlive the
+        # supervisor PID briefly after a crash.  Treat the lease as the fencing
+        # boundary so a dead supervisor cannot make the task reclaimable while
+        # its guardian is still shutting the runtime down.
+        return cls(
+            TaskCoordinator(
+                _SecureJsonlClaimStore(path),
+                pid_is_live=lambda _pid: True,
+            )
+        )
 
     def claim(
         self,

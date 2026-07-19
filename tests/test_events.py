@@ -110,6 +110,58 @@ def test_activity_events_require_an_opaque_activity_id(tmp_path, event_type) -> 
         events.LifecycleEvent.model_validate(payload)
 
 
+ALLOWED_CRITICAL_SECTION_NAMES = frozenset(
+    {
+        "checkpoint",
+        "git-write",
+        "database-migration",
+        "deployment",
+        "external-effect",
+        "process-launch",
+    }
+)
+
+
+def test_critical_section_vocabulary_is_explicit() -> None:
+    _models, events = _modules()
+
+    assert (
+        getattr(events, "ALLOWED_CRITICAL_SECTION_NAMES", frozenset())
+        == ALLOWED_CRITICAL_SECTION_NAMES
+    )
+
+
+@pytest.mark.parametrize(
+    "event_type", ["critical_section.entered", "critical_section.exited"]
+)
+@pytest.mark.parametrize("name", sorted(ALLOWED_CRITICAL_SECTION_NAMES))
+def test_critical_section_events_accept_only_portable_names(
+    tmp_path, event_type, name
+) -> None:
+    _models, events = _modules()
+    payload = _payload(tmp_path)
+    payload.update(event_type=event_type, activity_id=f"{name}-1", name=name)
+
+    event = events.LifecycleEvent.model_validate(payload)
+
+    assert event.name == name
+
+
+@pytest.mark.parametrize(
+    "event_type", ["critical_section.entered", "critical_section.exited"]
+)
+@pytest.mark.parametrize("name", [None, "arbitrary-lock", "Checkpoint"])
+def test_critical_section_events_reject_missing_or_unportable_names(
+    tmp_path, event_type, name
+) -> None:
+    _models, events = _modules()
+    payload = _payload(tmp_path)
+    payload.update(event_type=event_type, activity_id="critical-1", name=name)
+
+    with pytest.raises(ValidationError, match="critical section name"):
+        events.LifecycleEvent.model_validate(payload)
+
+
 def test_lifecycle_event_rejects_naive_timestamp_and_relative_cwd(tmp_path) -> None:
     _models, events = _modules()
     naive = _payload(tmp_path)

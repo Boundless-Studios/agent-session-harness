@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import tempfile
-from typing import Iterator, Literal, Mapping
+from typing import Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -18,26 +16,13 @@ from agent_session_harness.adapters.command import (
     CheckpointAdapter,
     sanitize_error,
 )
-
-
-@contextmanager
-def _exclusive_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.chmod(path, 0o600)
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        try:
-            import fcntl
-        except ImportError as exc:
-            raise RuntimeError("exclusive file locking is unavailable") from exc
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+from agent_session_harness.secure_files import (
+    append_private_text,
+    atomic_write_private_text,
+    exclusive_lock,
+    private_exists,
+    read_private_text,
+)
 
 
 class OutboxEntry(BaseModel):
@@ -95,7 +80,7 @@ class MirrorOutbox:
         return len(self.pending())
 
     def enqueue(self, adapter: str, request: AdapterRequest) -> bool:
-        with _exclusive_lock(self.lock_path):
+        with exclusive_lock(self.lock_path):
             entries = self._read(self.path, OutboxEntry)
             pair = (adapter, request.idempotency_key)
             if any(
@@ -113,18 +98,18 @@ class MirrorOutbox:
             return True
 
     def pending(self) -> tuple[OutboxEntry, ...]:
-        with _exclusive_lock(self.lock_path):
+        with exclusive_lock(self.lock_path):
             return tuple(self._read(self.path, OutboxEntry))
 
     def dead_letters(self) -> tuple[DeadLetterEntry, ...]:
-        with _exclusive_lock(self.lock_path):
+        with exclusive_lock(self.lock_path):
             return tuple(self._read(self.dead_letter_path, DeadLetterEntry))
 
     def replay(
         self,
         adapters: Mapping[str, CheckpointAdapter],
     ) -> ReplayResult:
-        with _exclusive_lock(self.lock_path):
+        with exclusive_lock(self.lock_path):
             entries = self._read(self.path, OutboxEntry)
             retained: list[OutboxEntry] = []
             dead_letters: list[DeadLetterEntry] = []
@@ -192,21 +177,15 @@ class MirrorOutbox:
 
     @classmethod
     def _append(cls, path: Path, model: BaseModel) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.chmod(path, 0o600)
-        with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-            handle.write(cls._encoded(model) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        append_private_text(path, cls._encoded(model) + "\n")
 
     @staticmethod
     def _read(path: Path, model_type: type[BaseModel]) -> list:
-        if not path.exists():
+        if not private_exists(path):
             return []
         result = []
         for line_number, line in enumerate(
-            path.read_text(encoding="utf-8").splitlines(),
+            read_private_text(path).splitlines(),
             start=1,
         ):
             if not line.strip():
@@ -219,21 +198,5 @@ class MirrorOutbox:
 
     @classmethod
     def _replace(cls, path: Path, entries: list[OutboxEntry]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=path.parent,
-            prefix=f".{path.name}.",
-        )
-        temporary_path = Path(temporary_name)
-        try:
-            os.chmod(temporary_path, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                for entry in entries:
-                    handle.write(cls._encoded(entry) + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_path, path)
-            os.chmod(path, 0o600)
-        finally:
-            if temporary_path.exists():
-                temporary_path.unlink()
+        encoded = "".join(cls._encoded(entry) + "\n" for entry in entries)
+        atomic_write_private_text(path, encoded)

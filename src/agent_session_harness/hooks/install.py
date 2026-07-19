@@ -7,14 +7,21 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
-import shutil
-import tempfile
+import shlex
+import stat
 from typing import Any
 
 from ..models import Runtime
+from ..secure_files import (
+    atomic_write_private_text,
+    private_exists,
+    private_file_mode,
+    read_private_text,
+)
 
 
-OWNED_MARKER = "AGENT_SESSION_HARNESS_OWNED=v1"
+OWNED_MARKER_PREFIX = "AGENT_SESSION_HARNESS_OWNED="
+OWNED_MARKER = f"{OWNED_MARKER_PREFIX}v1"
 HOOK_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
@@ -36,9 +43,16 @@ class HookInstallResult:
 
 
 class HookInstaller:
-    def __init__(self, *, runtime: str | Runtime, path: str | os.PathLike[str]):
+    def __init__(
+        self,
+        *,
+        runtime: str | Runtime,
+        path: str | os.PathLike[str],
+        harness_command: str | os.PathLike[str] | None = None,
+    ):
         self.runtime = Runtime(runtime)
         self.path = Path(path)
+        self.harness_command = self._harness_command(harness_command)
         self.backup_path = self.path.with_suffix(
             self.path.suffix + ".agent-session-harness.bak"
         )
@@ -54,7 +68,8 @@ class HookInstaller:
         if not isinstance(hooks, dict):
             raise ValueError("hook manifest 'hooks' value must be an object")
         command = (
-            f"{OWNED_MARKER} agent-session-harness hook --runtime {self.runtime.value}"
+            f"{OWNED_MARKER} {shlex.quote(self.harness_command)} "
+            f"hook --runtime {self.runtime.value}"
         )
         for event_name in HOOK_EVENTS:
             groups = hooks.setdefault(event_name, [])
@@ -80,10 +95,10 @@ class HookInstaller:
         return HookInstallResult(changed=changed, installed=False)
 
     def _read(self) -> dict[str, Any]:
-        if not self.path.exists():
+        if not private_exists(self.path):
             return {}
         try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            payload = json.loads(read_private_text(self.path))
         except json.JSONDecodeError as exc:
             raise ValueError("hook manifest contains invalid JSON") from exc
         if not isinstance(payload, dict):
@@ -126,6 +141,14 @@ class HookInstaller:
         return (
             isinstance(entry, dict)
             and isinstance(entry.get("command"), str)
+            and OWNED_MARKER_PREFIX in entry["command"]
+        )
+
+    @staticmethod
+    def _current_entry(entry: object) -> bool:
+        return (
+            isinstance(entry, dict)
+            and isinstance(entry.get("command"), str)
             and OWNED_MARKER in entry["command"]
         )
 
@@ -143,27 +166,35 @@ class HookInstaller:
                     group.get("hooks"), list
                 ):
                     continue
-                if any(HookInstaller._owned_entry(entry) for entry in group["hooks"]):
+                if any(HookInstaller._current_entry(entry) for entry in group["hooks"]):
                     found.add(event_name)
         return found == set(HOOK_EVENTS)
 
-    def _write(self, manifest: dict[str, Any]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        mode = self.path.stat().st_mode & 0o777 if self.path.exists() else 0o600
-        if self.path.exists() and not self.backup_path.exists():
-            shutil.copy2(self.path, self.backup_path)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=self.path.parent, prefix=f".{self.path.name}.", text=True
-        )
-        temporary_path = Path(temporary_name)
+    @staticmethod
+    def _harness_command(value: str | os.PathLike[str] | None) -> str:
+        if value is None:
+            return "agent-session-harness"
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            raise ValueError("harness command must be an absolute path")
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(manifest, handle, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.chmod(temporary_path, mode)
-            os.replace(temporary_path, self.path)
-        finally:
-            if temporary_path.exists():
-                temporary_path.unlink()
+            metadata = path.lstat()
+        except FileNotFoundError as exc:
+            raise ValueError("harness command does not exist") from exc
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("harness command must be a regular file")
+        if not os.access(path, os.X_OK):
+            raise ValueError("harness command is not executable")
+        return str(path)
+
+    def _write(self, manifest: dict[str, Any]) -> None:
+        exists = private_exists(self.path)
+        mode = private_file_mode(self.path) if exists else 0o600
+        if exists and not private_exists(self.backup_path):
+            atomic_write_private_text(
+                self.backup_path,
+                read_private_text(self.path),
+                mode=mode,
+            )
+        encoded = json.dumps(manifest, indent=2) + "\n"
+        atomic_write_private_text(self.path, encoded, mode=mode)

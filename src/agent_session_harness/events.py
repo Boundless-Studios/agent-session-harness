@@ -25,6 +25,24 @@ ACTIVITY_EVENT_TYPES = frozenset(
     }
 )
 
+# Portable mutation boundaries understood by every supported runtime. Critical
+# lifecycle records must use this shared vocabulary so arbitrary tool metadata
+# cannot hold the supervisor in a permanently busy state.
+ALLOWED_CRITICAL_SECTION_NAMES = frozenset(
+    {
+        "checkpoint",
+        "git-write",
+        "database-migration",
+        "deployment",
+        "external-effect",
+        "process-launch",
+    }
+)
+
+_CRITICAL_SECTION_EVENT_TYPES = frozenset(
+    {EventType.CRITICAL_ENTERED, EventType.CRITICAL_EXITED}
+)
+
 
 class LifecycleEvent(BaseModel):
     """One privacy-preserving runtime lifecycle transition."""
@@ -73,4 +91,10 @@ class LifecycleEvent(BaseModel):
     def require_activity_identity(self) -> "LifecycleEvent":
         if self.event_type in ACTIVITY_EVENT_TYPES and self.activity_id is None:
             raise ValueError("activity_id is required for activity events")
+        if (
+            self.event_type in _CRITICAL_SECTION_EVENT_TYPES
+            and self.name not in ALLOWED_CRITICAL_SECTION_NAMES
+        ):
+            allowed = ", ".join(sorted(ALLOWED_CRITICAL_SECTION_NAMES))
+            raise ValueError(f"critical section name must be one of: {allowed}")
         return self

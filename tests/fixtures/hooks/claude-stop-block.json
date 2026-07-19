@@ -1,0 +1,8 @@
+{
+  "exit_code": 0,
+  "stdout": {
+    "decision": "block",
+    "reason": "Context rotation is draining. Persist the exact next action and acceptance state to: beads, local-ledger. Do not start new work."
+  },
+  "stderr": ""
+}

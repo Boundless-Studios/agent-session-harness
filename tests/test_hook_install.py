@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
+import shlex
 import stat
 
 import pytest
@@ -72,3 +73,59 @@ def test_invalid_manifest_refuses_mutation(tmp_path) -> None:
 
     assert path.read_text() == original
     assert not path.with_suffix(path.suffix + ".agent-session-harness.bak").exists()
+
+
+def test_upgrade_replaces_older_owned_marker_without_duplicates(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": (
+                                        "AGENT_SESSION_HARNESS_OWNED=v0 "
+                                        "agent-session-harness hook --runtime codex"
+                                    ),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    installer = _installer("codex", path)
+    assert installer.install().changed is True
+    encoded = path.read_text(encoding="utf-8")
+
+    assert "AGENT_SESSION_HARNESS_OWNED=v0" not in encoded
+    assert encoded.count("AGENT_SESSION_HARNESS_OWNED=v1") == 10
+    assert installer.install().changed is False
+
+
+def test_installer_can_pin_an_absolute_harness_entrypoint(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    executable = tmp_path / "bin with spaces" / "agent-session-harness"
+    executable.parent.mkdir()
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    executable.chmod(0o700)
+
+    module = importlib.import_module("agent_session_harness.hooks.install")
+    installer = module.HookInstaller(
+        runtime="codex",
+        path=path,
+        harness_command=executable,
+    )
+    installer.install()
+
+    encoded = path.read_text(encoding="utf-8")
+    assert (
+        f"AGENT_SESSION_HARNESS_OWNED=v1 {shlex.quote(str(executable))} "
+        "hook --runtime codex"
+    ) in encoded

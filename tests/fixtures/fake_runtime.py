@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
 import signal
 import time
 
+from agent_session_harness.hooks.command import run_hook
 from agent_session_harness.hooks.native import normalize_native_event
 from agent_session_harness.ledger import EventLedger
 from agent_session_harness.supervisor import write_acknowledgement
@@ -28,23 +30,64 @@ def main() -> int:
     root = Path(args.root)
     generation = int(os.environ["AGENT_SESSION_HARNESS_GENERATION"])
     chain_id = os.environ["AGENT_SESSION_HARNESS_CHAIN_ID"]
+    owner_pid = int(os.environ["AGENT_SESSION_HARNESS_OWNER_PID"])
+    if owner_pid <= 0:
+        raise RuntimeError("managed owner PID is invalid")
     conversation_id = f"native-conversation-{generation}"
     now = datetime.now(tz=timezone.utc).isoformat()
     ledger = EventLedger(os.environ["AGENT_SESSION_HARNESS_LEDGER"])
-    ledger.append(
-        normalize_native_event(
-            runtime="codex",
-            payload={
-                "hook_event_name": "SessionStart",
-                "session_id": conversation_id,
-                "cwd": str(Path.cwd()),
-                "timestamp": now,
-            },
-            chain_id=chain_id,
-            generation=generation,
-            owner_pid=os.getpid(),
+
+    def emit(hook_event_name: str, **metadata: object) -> None:
+        ledger.append(
+            normalize_native_event(
+                runtime="codex",
+                payload={
+                    "hook_event_name": hook_event_name,
+                    "session_id": conversation_id,
+                    "cwd": str(Path.cwd()),
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    **metadata,
+                },
+                chain_id=chain_id,
+                generation=generation,
+                owner_pid=os.getpid(),
+            )
         )
-    )
+
+    def stop_hook() -> int:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        exit_code = run_hook(
+            runtime="codex",
+            stdin=io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "Stop",
+                        "session_id": conversation_id,
+                        "cwd": str(Path.cwd()),
+                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                        "turn_id": "turn-0",
+                    }
+                )
+            ),
+            stdout=stdout,
+            stderr=stderr,
+            environ=os.environ,
+        )
+        append(
+            root / "stop-responses.jsonl",
+            {
+                "exit_code": exit_code,
+                "stdout": stdout.getvalue(),
+                "stderr": stderr.getvalue(),
+            },
+        )
+        return exit_code
+
+    emit("SessionStart")
+    if generation == 0:
+        emit("UserPromptSubmit", turn_id="turn-0")
+        emit("PreToolUse", tool_use_id="tool-0", tool_name="fake-tool")
     append(
         root / "history.jsonl",
         {
@@ -83,8 +126,8 @@ def main() -> int:
             "subagent": {"thread_spawn": {"parent_thread_id": "native-conversation-0"}}
         }
     rows.append({"timestamp": now, "type": "session_meta", "payload": meta})
-    total = 150 if generation == 0 else 180
-    latest = 150 if generation == 0 else 30
+    total = 130 if generation == 0 else 180
+    latest = 130 if generation == 0 else 30
     rows.append(
         {
             "timestamp": datetime.now(tz=timezone.utc).isoformat(),
@@ -116,6 +159,7 @@ def main() -> int:
                     generation=generation,
                     fingerprint=fingerprint,
                     conversation_id=conversation_id,
+                    owner_pid=owner_pid,
                 )
                 break
             except (FileNotFoundError, ValueError):
@@ -147,7 +191,16 @@ def main() -> int:
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, stop)
+    activity_finished = generation > 0
+    finish_path = root / f"finish-activity-{generation}"
     while True:
+        if not activity_finished and finish_path.exists():
+            emit("PostToolUse", tool_use_id="tool-0", tool_name="fake-tool")
+            if stop_hook() != 2:
+                raise RuntimeError("first draining Stop was not blocked")
+            if stop_hook() != 0:
+                raise RuntimeError("recursive Stop was not allowed")
+            activity_finished = True
         time.sleep(0.05)
 
 

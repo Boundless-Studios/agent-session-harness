@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -44,6 +45,10 @@ if mode == "oversized":
         "error": "x" * 4096,
     }))
     raise SystemExit(0)
+if mode == "stderr-flood":
+    sys.stderr.write("x" * (2 * 1024 * 1024))
+    sys.stderr.flush()
+    time.sleep(2)
 
 fingerprint = request["capsule"]["fingerprint"]
 if request["operation"] == "write":
@@ -97,6 +102,7 @@ def _command_adapter(command, tmp_path: Path, mode: str = "success"):
         argv=(sys.executable, str(script), mode, str(state_path), str(log_path)),
         timeout_seconds=0.05 if mode == "timeout" else 2.0,
         max_response_bytes=1024,
+        max_stderr_bytes=1024,
     )
     return adapter, log_path
 
@@ -138,6 +144,68 @@ def test_command_adapter_writes_reads_and_acknowledges_by_argv(tmp_path) -> None
     )
 
 
+def test_json_command_inherits_only_controlled_adapter_environment(
+    tmp_path, monkeypatch
+) -> None:
+    _capsule_module, command, _checkpoint, _outbox = _modules()
+    script = tmp_path / "echo_env.py"
+    script.write_text(
+        """
+import json
+import os
+import sys
+
+json.load(sys.stdin)
+print(json.dumps({
+    "home": os.environ.get("HOME"),
+    "path": os.environ.get("PATH"),
+    "linear": os.environ.get("LINEAR_API_KEY"),
+    "beads": os.environ.get("BEADS_DB"),
+    "beads_secret": os.environ.get("BEADS_REMOTE_TOKEN"),
+    "bd_secret": os.environ.get("BD_PASSWORD"),
+    "xdg_secret": os.environ.get("XDG_PRIVATE_SECRET"),
+    "unrelated": os.environ.get("UNRELATED_PRIVATE_SECRET"),
+    "override": os.environ.get("HARNESS_EXPLICIT_OVERRIDE"),
+}))
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path / "controlled-home"))
+    monkeypatch.setenv("PATH", os.environ["PATH"])
+    monkeypatch.setenv("LINEAR_API_KEY", "linear-test-key")
+    monkeypatch.setenv("BEADS_DB", str(tmp_path / "beads.db"))
+    monkeypatch.setenv("BEADS_REMOTE_TOKEN", "must-not-leak")
+    monkeypatch.setenv("BD_PASSWORD", "must-not-leak")
+    monkeypatch.setenv("XDG_PRIVATE_SECRET", "must-not-leak")
+    monkeypatch.setenv("UNRELATED_PRIVATE_SECRET", "must-not-leak")
+
+    response = command.JsonCommand(
+        name="environment echo",
+        argv=(sys.executable, str(script)),
+        env={"HARNESS_EXPLICIT_OVERRIDE": "explicit-value"},
+    ).execute({"schema_version": 1})
+
+    assert response == {
+        "home": str(tmp_path / "controlled-home"),
+        "path": os.environ["PATH"],
+        "linear": None,
+        "beads": str(tmp_path / "beads.db"),
+        "beads_secret": None,
+        "bd_secret": None,
+        "xdg_secret": None,
+        "unrelated": None,
+        "override": "explicit-value",
+    }
+
+    privileged = command.JsonCommand(
+        name="environment echo with explicit inheritance",
+        argv=(sys.executable, str(script)),
+        inherit_env=("LINEAR_API_KEY",),
+    ).execute({"schema_version": 1})
+    assert privileged["linear"] == "linear-test-key"
+    assert privileged["unrelated"] is None
+
+
 @pytest.mark.parametrize(
     ("mode", "retryable", "message"),
     [
@@ -146,6 +214,11 @@ def test_command_adapter_writes_reads_and_acknowledges_by_argv(tmp_path) -> None
         ("malformed", False, "adapter returned malformed JSON"),
         ("oversized", False, "adapter response exceeded 1024 bytes"),
         ("wrong-fingerprint", False, "adapter returned the wrong fingerprint"),
+        (
+            "stderr-flood",
+            False,
+            "adapter diagnostic output exceeded 1024 bytes",
+        ),
     ],
 )
 def test_command_adapter_normalizes_transport_and_contract_failures(

@@ -206,6 +206,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Local code-intelligence cache
+.serena/
+
 # PyPI configuration file
 .pypirc
 

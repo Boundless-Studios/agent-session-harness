@@ -2,38 +2,22 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from datetime import datetime
 import json
 import os
 from pathlib import Path
-from typing import Iterator
 
 from pydantic import ValidationError
 
 from .activity import ActivitySnapshot, Quiescence
 from .events import LifecycleEvent
 from .models import EventType
-
-
-@contextmanager
-def _exclusive_lock(path: Path) -> Iterator[None]:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-    os.chmod(path, 0o600)
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        try:
-            import fcntl
-        except ImportError as exc:
-            raise RuntimeError("exclusive file locking is unavailable") from exc
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+from .secure_files import (
+    append_private_text,
+    exclusive_lock,
+    private_exists,
+    read_private_text,
+)
 
 
 class EventLedger:
@@ -47,18 +31,8 @@ class EventLedger:
             sort_keys=True,
             separators=(",", ":"),
         )
-        with _exclusive_lock(self.lock_path):
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor = os.open(
-                self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-                0o600,
-            )
-            os.chmod(self.path, 0o600)
-            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
-                handle.write(encoded + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+        with exclusive_lock(self.lock_path):
+            append_private_text(self.path, encoded + "\n")
 
     def materialize(
         self,
@@ -135,10 +109,10 @@ class EventLedger:
         )
 
     def _read_events(self) -> tuple[list[LifecycleEvent], list[str]]:
-        with _exclusive_lock(self.lock_path):
-            if not self.path.exists():
+        with exclusive_lock(self.lock_path):
+            if not private_exists(self.path):
                 return [], []
-            lines = self.path.read_text(encoding="utf-8").splitlines()
+            lines = read_private_text(self.path).splitlines()
 
         events: list[LifecycleEvent] = []
         warnings: list[str] = []

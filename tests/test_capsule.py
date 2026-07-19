@@ -139,3 +139,55 @@ def test_capsule_round_trips_canonical_json_with_verified_fingerprint(tmp_path) 
 
     assert restored == original
     assert restored.canonical_bytes() == original.canonical_bytes()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("objective", "Continue with api_key=must-not-persist"),
+        ("exact_next_action", "Use password:must-not-persist"),
+        ("decisions", ["Keep token=must-not-persist"]),
+        ("task_ids", {"linear": "token=must-not-persist"}),
+        ("dirty_paths", ["secret=must-not-persist"]),
+        ("test_results", {"pytest": "secret=must-not-persist"}),
+        ("process_summaries", {"worker": "credential=must-not-persist"}),
+    ],
+)
+def test_capsule_rejects_credential_shaped_text(tmp_path, field, value) -> None:
+    capsule = _module()
+    payload = capsule_payload(tmp_path)
+    payload[field] = value
+
+    with pytest.raises(ValidationError, match="credential-shaped"):
+        capsule.HandoffCapsule.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("task_ids", {f"task-{index}": "value" for index in range(17)}),
+        ("dirty_paths", ["x" * 1025]),
+        ("repository_path", "/" + "x" * 4096),
+        ("decisions", [f"decision-{index}" for index in range(33)]),
+        ("test_results", {f"test-{index}": "passed" for index in range(65)}),
+        ("process_summaries", {f"worker-{index}": "idle" for index in range(17)}),
+    ],
+)
+def test_capsule_rejects_unbounded_operational_collections(
+    tmp_path, field, value
+) -> None:
+    capsule = _module()
+    payload = capsule_payload(tmp_path)
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        capsule.HandoffCapsule.model_validate(payload)
+
+
+def test_capsule_process_summaries_use_an_allowlisted_state(tmp_path) -> None:
+    capsule = _module()
+    payload = capsule_payload(tmp_path)
+    payload["process_summaries"] = {"pytest": "printing arbitrary output"}
+
+    with pytest.raises(ValidationError):
+        capsule.HandoffCapsule.model_validate(payload)

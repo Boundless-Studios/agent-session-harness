@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
@@ -23,6 +24,15 @@ _EVENT_TYPES = {
     "Stop": EventType.TURN_IDLE,
     "PreCompact": EventType.PRE_COMPACT,
 }
+
+
+@dataclass(frozen=True, slots=True)
+class NativeHookResponse:
+    """One runtime-native hook result, separated by output channel."""
+
+    exit_code: int
+    stdout: dict[str, object] | None = None
+    stderr: str = ""
 
 
 def normalize_native_event(
@@ -109,29 +119,107 @@ def stop_handshake(
     runtime: str | Runtime,
     draining: bool,
     checkpoint_verified: bool,
-    recursion_active: bool,
     already_requested: bool,
     required_fields: Sequence[str],
-) -> dict[str, object]:
+) -> NativeHookResponse:
     """Return one native-compatible continuation request at a drain boundary."""
 
-    Runtime(runtime)
+    runtime_value = Runtime(runtime)
     if not draining or checkpoint_verified:
-        return {"continue": True}
-    if recursion_active or already_requested:
-        return {
-            "continue": True,
-            "systemMessage": "Durable checkpoint was already requested for this generation.",
-        }
-    fields = ", ".join(required_fields) if required_fields else "configured adapters"
-    return {
-        "decision": "block",
-        "continue": True,
-        "reason": (
-            "Context rotation is draining. Persist the exact next action and "
-            f"acceptance state to: {fields}. Do not start new work."
-        ),
-    }
+        return _allow_response(runtime_value)
+    if already_requested:
+        return _repeat_response(runtime_value)
+    fields = _checkpoint_fields(required_fields)
+    reason = (
+        "Context rotation is draining. Persist the exact next action and "
+        f"acceptance state to: {fields}. Do not start new work."
+    )
+    if runtime_value is Runtime.CLAUDE:
+        return NativeHookResponse(
+            exit_code=0,
+            stdout={"decision": "block", "reason": reason},
+        )
+    return NativeHookResponse(exit_code=2, stderr=reason + "\n")
+
+
+def handoff_requested_event(stop_event: LifecycleEvent) -> LifecycleEvent:
+    """Derive one sanitized, generation-stable handoff request event."""
+
+    if stop_event.event_type is not EventType.TURN_IDLE:
+        raise ValueError("handoff request must derive from a Stop event")
+    identity = "|".join(
+        (
+            stop_event.runtime.value,
+            stop_event.chain_id,
+            stop_event.conversation_id,
+            str(stop_event.generation),
+            EventType.HANDOFF_REQUESTED.value,
+        )
+    )
+    return LifecycleEvent(
+        schema_version=stop_event.schema_version,
+        event_id=hashlib.sha256(identity.encode("utf-8")).hexdigest(),
+        runtime=stop_event.runtime,
+        chain_id=stop_event.chain_id,
+        conversation_id=stop_event.conversation_id,
+        generation=stop_event.generation,
+        event_type=EventType.HANDOFF_REQUESTED,
+        timestamp=stop_event.timestamp,
+        cwd=stop_event.cwd,
+        owner_pid=stop_event.owner_pid,
+    )
+
+
+def repeated_stop_idle_event(stop_event: LifecycleEvent) -> LifecycleEvent:
+    """Give recursive Stop idles a stable identity so retries stay idempotent."""
+
+    if stop_event.event_type is not EventType.TURN_IDLE:
+        raise ValueError("recursive Stop idle must derive from a Stop event")
+    identity = "|".join(
+        (
+            stop_event.runtime.value,
+            stop_event.chain_id,
+            stop_event.conversation_id,
+            str(stop_event.generation),
+            EventType.TURN_IDLE.value,
+            stop_event.activity_id or "",
+            "recursive",
+        )
+    )
+    return stop_event.model_copy(
+        update={"event_id": hashlib.sha256(identity.encode("utf-8")).hexdigest()}
+    )
+
+
+def _allow_response(runtime: Runtime) -> NativeHookResponse:
+    if runtime is Runtime.CLAUDE:
+        return NativeHookResponse(exit_code=0, stdout={"continue": True})
+    return NativeHookResponse(exit_code=0)
+
+
+def _repeat_response(runtime: Runtime) -> NativeHookResponse:
+    message = "Durable checkpoint was already requested for this generation."
+    if runtime is Runtime.CLAUDE:
+        return NativeHookResponse(
+            exit_code=0,
+            stdout={"continue": True, "systemMessage": message},
+        )
+    return NativeHookResponse(exit_code=0, stderr=message + "\n")
+
+
+def _checkpoint_fields(values: Sequence[str]) -> str:
+    safe_values = []
+    for value in values:
+        normalized = " ".join(str(value).split())
+        if (
+            normalized
+            and len(normalized) <= 64
+            and all(
+                character.isalnum() or character in "-_." for character in normalized
+            )
+        ):
+            safe_values.append(normalized)
+    return ", ".join(safe_values) if safe_values else "configured adapters"
 
 
 def _activity_id(
