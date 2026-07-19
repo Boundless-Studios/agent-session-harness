@@ -832,6 +832,13 @@ def test_supervisor_watchdog_preempts_claim_lease_with_shutdown_margin(
 
 def test_supervisor_warns_drains_waits_then_rotates_without_overlap(tmp_path) -> None:
     managed, _kwargs, driver, coordinator, checkpoints = _supervisor(tmp_path)
+    original_stop = driver.graceful_stop
+
+    def stop_while_claim_is_still_held(process, timeout_seconds):
+        assert coordinator.active is not None
+        return original_stop(process, timeout_seconds)
+
+    driver.graceful_stop = stop_while_claim_is_still_held
     managed.start()
     managed.usage_reader.percent = 65.0
     assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "warning"

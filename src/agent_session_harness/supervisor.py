@@ -630,20 +630,6 @@ class Supervisor:
                 self._heartbeat_if_due()
                 continue
             if phase is SupervisorPhase.CHECKPOINTED:
-                self._set_phase(SupervisorPhase.FENCING)
-                continue
-            if phase is SupervisorPhase.FENCING:
-                claim = self._required_claim()
-                self._effect("fence", "started", generation=self.snapshot.generation)
-                try:
-                    self.coordinator.fence(claim)
-                except StaleOwnerError:
-                    self._fail_closed_for_stale_owner()
-                    raise
-                self._effect("fence", "completed", generation=self.snapshot.generation)
-                self._set_phase(SupervisorPhase.FENCED)
-                continue
-            if phase is SupervisorPhase.FENCED:
                 self._set_phase(SupervisorPhase.STOPPING)
                 continue
             if phase is SupervisorPhase.STOPPING:
@@ -669,6 +655,20 @@ class Supervisor:
                 self._persist()
                 continue
             if phase is SupervisorPhase.STOPPED:
+                self._set_phase(SupervisorPhase.FENCING)
+                continue
+            if phase is SupervisorPhase.FENCING:
+                claim = self._required_claim()
+                self._effect("fence", "started", generation=self.snapshot.generation)
+                try:
+                    self.coordinator.fence(claim)
+                except StaleOwnerError:
+                    self._fail_closed_for_stale_owner()
+                    raise
+                self._effect("fence", "completed", generation=self.snapshot.generation)
+                self._set_phase(SupervisorPhase.FENCED)
+                continue
+            if phase is SupervisorPhase.FENCED:
                 self._set_phase(SupervisorPhase.CLAIMING)
                 continue
             if phase is SupervisorPhase.CLAIMING:
@@ -838,8 +838,6 @@ class Supervisor:
             SupervisorPhase.DRAINING,
             SupervisorPhase.CHECKPOINTING,
             SupervisorPhase.CHECKPOINTED,
-            SupervisorPhase.FENCING,
-            SupervisorPhase.FENCED,
             SupervisorPhase.AWAITING_ACK,
         }:
             return

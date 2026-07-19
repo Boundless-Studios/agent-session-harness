@@ -111,7 +111,7 @@ The supervisor runs until interrupted. `--max-ticks` exists for bounded automati
 
 Managed runtimes inherit a deliberately small base environment. A host can preserve an audited operational key without placing its value in argv, logs, or supervisor state by repeating `--runtime-env KEY`; unrelated ambient variables remain absent. Harness-control keys are reserved, and opaque value digests bind the immutable run and process specifications without persisting their plaintext values.
 
-The long-lived integration surface is `agent_session_harness.supervisor.Supervisor`. A host supplies four small protocols: native usage reader, checkpoint manager, fenced coordinator, and process driver. This keeps Linear, beads, PR dashboards, worktree launchers, and project safety policy outside the reusable package. The deterministic E2E test uses a real child process and proves root → checkpoint → fence → stop → fresh successor → acknowledgement with no overlap.
+The long-lived integration surface is `agent_session_harness.supervisor.Supervisor`. A host supplies four small protocols: native usage reader, checkpoint manager, fenced coordinator, and process driver. This keeps Linear, beads, PR dashboards, worktree launchers, and project safety policy outside the reusable package. The deterministic E2E test uses a real child process and proves root → checkpoint → stop while still claimed → fence/release → fresh successor → acknowledgement with no overlap.
 
 ## Durable handoff capsule
 
