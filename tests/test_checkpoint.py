@@ -1,0 +1,370 @@
+from __future__ import annotations
+
+import importlib
+import json
+from pathlib import Path
+import stat
+import sys
+from typing import Callable
+
+import pytest
+
+from test_capsule import capsule_payload
+
+
+FAKE_ADAPTER = r"""
+import json
+from pathlib import Path
+import sys
+import time
+
+mode, state_name, log_name = sys.argv[1:4]
+request = json.load(sys.stdin)
+state_path = Path(state_name)
+log_path = Path(log_name)
+log_path.parent.mkdir(parents=True, exist_ok=True)
+with log_path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n")
+
+if set(request) != {"schema_version", "operation", "idempotency_key", "capsule"}:
+    raise SystemExit(9)
+if mode == "timeout":
+    time.sleep(2)
+if mode == "nonzero":
+    print("sensitive=do-not-copy", file=sys.stderr)
+    raise SystemExit(7)
+if mode == "malformed":
+    print("{broken")
+    raise SystemExit(0)
+if mode == "oversized":
+    print(json.dumps({
+        "ok": False,
+        "fingerprint": None,
+        "retryable": False,
+        "error": "x" * 4096,
+    }))
+    raise SystemExit(0)
+
+fingerprint = request["capsule"]["fingerprint"]
+if request["operation"] == "write":
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(request["capsule"]), encoding="utf-8")
+elif request["operation"] == "read":
+    stored = json.loads(state_path.read_text(encoding="utf-8"))
+    fingerprint = stored["fingerprint"]
+elif request["operation"] != "acknowledge":
+    raise SystemExit(8)
+
+if mode == "wrong-fingerprint":
+    fingerprint = "0" * 64
+print(json.dumps({
+    "ok": True,
+    "fingerprint": fingerprint,
+    "retryable": False,
+    "error": None,
+}))
+"""
+
+
+def _modules():
+    try:
+        return (
+            importlib.import_module("agent_session_harness.capsule"),
+            importlib.import_module("agent_session_harness.adapters.command"),
+            importlib.import_module("agent_session_harness.checkpoint"),
+            importlib.import_module("agent_session_harness.outbox"),
+        )
+    except ModuleNotFoundError:
+        pytest.fail("checkpoint adapters and orchestration are not implemented")
+
+
+def _capsule(capsule_module, tmp_path: Path):
+    return capsule_module.HandoffCapsule.model_validate(capsule_payload(tmp_path))
+
+
+def _write_fake_adapter(tmp_path: Path) -> Path:
+    script = tmp_path / "fake adapter.py"
+    script.write_text(FAKE_ADAPTER, encoding="utf-8")
+    return script
+
+
+def _command_adapter(command, tmp_path: Path, mode: str = "success"):
+    script = _write_fake_adapter(tmp_path)
+    state_path = tmp_path / "state dir" / "capsule.json"
+    log_path = tmp_path / "state dir" / "requests.jsonl"
+    adapter = command.CommandAdapter(
+        name="fake",
+        argv=(sys.executable, str(script), mode, str(state_path), str(log_path)),
+        timeout_seconds=0.05 if mode == "timeout" else 2.0,
+        max_response_bytes=1024,
+    )
+    return adapter, log_path
+
+
+def _request(command, handoff, operation: str, key: str = "handoff-8"):
+    return command.AdapterRequest(
+        schema_version=1,
+        operation=operation,
+        idempotency_key=key,
+        capsule=handoff,
+    )
+
+
+def test_command_adapter_writes_reads_and_acknowledges_by_argv(tmp_path) -> None:
+    capsule, command, _checkpoint, _outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    adapter, log_path = _command_adapter(command, tmp_path)
+
+    responses = [
+        adapter.execute(_request(command, handoff, operation))
+        for operation in ("write", "read", "acknowledge")
+    ]
+
+    assert all(response.ok for response in responses)
+    assert [response.fingerprint for response in responses] == [
+        handoff.fingerprint,
+        handoff.fingerprint,
+        handoff.fingerprint,
+    ]
+    requests = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [request["operation"] for request in requests] == [
+        "write",
+        "read",
+        "acknowledge",
+    ]
+    assert all(
+        set(request) == {"schema_version", "operation", "idempotency_key", "capsule"}
+        for request in requests
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "retryable", "message"),
+    [
+        ("timeout", True, "adapter timed out"),
+        ("nonzero", True, "adapter exited with status 7"),
+        ("malformed", False, "adapter returned malformed JSON"),
+        ("oversized", False, "adapter response exceeded 1024 bytes"),
+        ("wrong-fingerprint", False, "adapter returned the wrong fingerprint"),
+    ],
+)
+def test_command_adapter_normalizes_transport_and_contract_failures(
+    tmp_path,
+    mode,
+    retryable,
+    message,
+) -> None:
+    capsule, command, _checkpoint, _outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    adapter, _log_path = _command_adapter(command, tmp_path, mode)
+
+    response = adapter.execute(_request(command, handoff, "write"))
+
+    assert response.ok is False
+    assert response.fingerprint is None
+    assert response.retryable is retryable
+    assert response.error == message
+    assert "do-not-copy" not in response.error
+
+
+class RecordingAdapter:
+    def __init__(
+        self,
+        name: str,
+        calls: list[tuple[str, str, str]],
+        respond: Callable,
+    ) -> None:
+        self.name = name
+        self.calls = calls
+        self.respond = respond
+
+    def execute(self, request):
+        self.calls.append((self.name, request.operation.value, request.idempotency_key))
+        return self.respond(request)
+
+
+def _success(command, request):
+    return command.AdapterResponse(
+        ok=True,
+        fingerprint=request.capsule.fingerprint,
+        retryable=False,
+        error=None,
+    )
+
+
+def test_checkpoint_writes_every_required_adapter_before_exact_readback(
+    tmp_path,
+) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    local = RecordingAdapter("local", calls, lambda request: _success(command, request))
+    beads = RecordingAdapter("beads", calls, lambda request: _success(command, request))
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(local, beads),
+        mirror_adapters=(),
+        outbox=outbox.MirrorOutbox(tmp_path / "mirror.jsonl"),
+    )
+
+    result = manager.checkpoint(handoff, idempotency_key="handoff-8")
+
+    assert result.verified is True
+    assert result.fingerprint == handoff.fingerprint
+    assert calls == [
+        ("local", "write", "handoff-8"),
+        ("beads", "write", "handoff-8"),
+        ("local", "read", "handoff-8"),
+        ("beads", "read", "handoff-8"),
+    ]
+
+
+def test_required_readback_mismatch_prevents_verification(tmp_path) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+
+    def respond(request):
+        if request.operation.value == "read":
+            return command.AdapterResponse(
+                ok=True,
+                fingerprint="0" * 64,
+                retryable=False,
+                error=None,
+            )
+        return _success(command, request)
+
+    required = RecordingAdapter("required", calls, respond)
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(required,),
+        mirror_adapters=(),
+        outbox=outbox.MirrorOutbox(tmp_path / "mirror.jsonl"),
+    )
+
+    result = manager.checkpoint(handoff, idempotency_key="handoff-8")
+
+    assert result.verified is False
+    assert result.fingerprint == handoff.fingerprint
+
+
+def test_mirror_failure_is_deduplicated_without_changing_required_verification(
+    tmp_path,
+) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    required = RecordingAdapter(
+        "required", calls, lambda request: _success(command, request)
+    )
+    mirror = RecordingAdapter(
+        "linear",
+        calls,
+        lambda _request: command.AdapterResponse(
+            ok=False,
+            fingerprint=None,
+            retryable=True,
+            error="temporarily unavailable",
+        ),
+    )
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(required,),
+        mirror_adapters=(mirror,),
+        outbox=queue,
+    )
+
+    first = manager.checkpoint(handoff, idempotency_key="handoff-8")
+    second = manager.checkpoint(handoff, idempotency_key="handoff-8")
+
+    assert first.verified is True
+    assert second.verified is True
+    assert queue.depth == 1
+    assert stat.S_IMODE(queue.path.stat().st_mode) == 0o600
+    pending = queue.pending()
+    assert pending[0].adapter == "linear"
+    assert pending[0].request.operation.value == "write"
+    assert pending[0].request.idempotency_key == "handoff-8"
+    encoded = queue.path.read_text(encoding="utf-8").strip()
+    assert encoded == json.dumps(
+        json.loads(encoded), sort_keys=True, separators=(",", ":")
+    )
+
+
+def test_outbox_deduplicates_only_the_adapter_and_idempotency_pair(tmp_path) -> None:
+    capsule, command, _checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    request = _request(command, handoff, "write", key="handoff-8")
+
+    assert queue.enqueue("linear", request) is True
+    assert queue.enqueue("linear", request) is False
+    assert queue.enqueue("audit", request) is True
+    assert queue.depth == 2
+
+
+def test_outbox_replays_oldest_first_and_dead_letters_nonretryable_failures(
+    tmp_path,
+) -> None:
+    capsule, command, _checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    for key in ("first", "second", "third"):
+        queue.enqueue("linear", _request(command, handoff, "write", key=key))
+
+    calls: list[tuple[str, str, str]] = []
+
+    def respond(request):
+        if request.idempotency_key == "first":
+            return command.AdapterResponse(
+                ok=False,
+                fingerprint=None,
+                retryable=True,
+                error="try again",
+            )
+        if request.idempotency_key == "third":
+            return command.AdapterResponse(
+                ok=False,
+                fingerprint=None,
+                retryable=False,
+                error="  permanent\nfailure\x00  ",
+            )
+        return _success(command, request)
+
+    adapter = RecordingAdapter("linear", calls, respond)
+
+    result = queue.replay({"linear": adapter})
+
+    assert [call[2] for call in calls] == ["first", "second", "third"]
+    assert result.attempted == 3
+    assert result.succeeded == 1
+    assert result.retained == 1
+    assert result.dead_lettered == 1
+    assert [entry.request.idempotency_key for entry in queue.pending()] == ["first"]
+    dead_letters = queue.dead_letters()
+    assert len(dead_letters) == 1
+    assert dead_letters[0].request.idempotency_key == "third"
+    assert dead_letters[0].error == "permanent failure"
+    assert stat.S_IMODE(queue.dead_letter_path.stat().st_mode) == 0o600
+
+
+def test_outbox_treats_a_successful_wrong_fingerprint_as_nonretryable(tmp_path) -> None:
+    capsule, command, _checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    queue.enqueue("linear", _request(command, handoff, "write"))
+    calls: list[tuple[str, str, str]] = []
+    adapter = RecordingAdapter(
+        "linear",
+        calls,
+        lambda _request: command.AdapterResponse(
+            ok=True,
+            fingerprint="0" * 64,
+            retryable=False,
+            error=None,
+        ),
+    )
+
+    result = queue.replay({"linear": adapter})
+
+    assert result.dead_lettered == 1
+    assert queue.depth == 0
+    assert queue.dead_letters()[0].error == "adapter returned the wrong fingerprint"
