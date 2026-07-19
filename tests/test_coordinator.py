@@ -86,7 +86,7 @@ def test_adapter_state_contains_only_fencing_identity(tmp_path) -> None:
         now=NOW,
     )
 
-    assert set(handle.model_fields) == {
+    assert set(type(handle).model_fields) == {
         "claim_id",
         "lease_epoch",
         "task_type",
