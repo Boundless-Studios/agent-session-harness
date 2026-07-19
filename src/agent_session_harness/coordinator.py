@@ -114,6 +114,19 @@ class CoordinatorAdapter:
         *,
         now: datetime | None = None,
     ) -> FenceResult:
+        decision = self.coordinator.status(self._task(handle), now=now)
+        current = decision.claim
+        if (
+            current is not None
+            and current.claim_id == handle.claim_id
+            and current.lease_epoch == handle.lease_epoch
+            and current.release_reason == "context-rotation"
+        ):
+            return FenceResult(
+                claim_id=current.claim_id,
+                lease_epoch=current.lease_epoch,
+                release_reason="context-rotation",
+            )
         self._assert_current(handle, now=now)
         try:
             record = self.coordinator.release_claim(

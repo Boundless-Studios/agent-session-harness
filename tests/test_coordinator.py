@@ -43,6 +43,7 @@ def test_rotation_fences_predecessor_and_advances_lease_epoch(tmp_path) -> None:
         now=NOW + timedelta(seconds=10),
     )
     fenced = adapter.fence(first, now=NOW + timedelta(seconds=20))
+    repeated_fence = adapter.fence(first, now=NOW + timedelta(seconds=20))
     successor = adapter.claim(
         task_type="linear",
         task_id="BOU-2195",
@@ -58,6 +59,7 @@ def test_rotation_fences_predecessor_and_advances_lease_epoch(tmp_path) -> None:
     assert heartbeat.claim_id == first.claim_id
     assert heartbeat.lease_epoch == first.lease_epoch
     assert fenced.release_reason == "context-rotation"
+    assert repeated_fence == fenced
     assert successor.lease_epoch > first.lease_epoch
     with pytest.raises(harness.StaleOwnerError, match="stale"):
         adapter.heartbeat(
