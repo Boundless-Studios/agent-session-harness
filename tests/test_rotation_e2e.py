@@ -382,10 +382,13 @@ def test_successor_cannot_run_when_required_ack_adapter_is_unavailable(
         _wait_for(acknowledgement_path(state_path))
 
         assert not (tmp_path / "continuations.jsonl").exists()
-        with pytest.raises(RuntimeError, match="required checkpoint acknowledgement"):
+        retried = supervisor.tick(idle)
+        assert retried.phase.value == "awaiting_ack"
+        assert retried.successor_attempt == 1
+        _wait_for(acknowledgement_path(state_path))
+        with pytest.raises(RuntimeError, match="retry budget"):
             supervisor.tick(idle)
-        time.sleep(0.1)
-        assert supervisor.snapshot.phase.value == "awaiting_ack"
+        assert supervisor.snapshot.phase.value == "blocked"
         assert not (tmp_path / "continuations.jsonl").exists()
     finally:
         supervisor.shutdown()

@@ -11,11 +11,12 @@ import signal
 import subprocess
 import termios
 import time
-from typing import Mapping
+from typing import Callable, Mapping
 
 from .process import (
     ExitReason,
     ProcessExit,
+    read_runtime_abort,
     record_guarded_exit,
     register_guarded_process,
     unregister_guarded_process,
@@ -108,6 +109,16 @@ def main(argv: list[str] | None = None) -> int:
     child: subprocess.Popen[bytes] | None = None
     child_session_id: int | None = None
     process = None
+    acknowledgement_abort_requested = False
+
+    def request_acknowledgement_abort(_signum, _frame) -> None:
+        nonlocal acknowledgement_abort_requested
+        acknowledgement_abort_requested = True
+
+    previous_abort_handler = signal.signal(
+        signal.SIGUSR1,
+        request_acknowledgement_abort,
+    )
     try:
         child = subprocess.Popen(
             command,
@@ -134,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
             state_path=_state_path(os.environ),
             timeout_seconds=timeout,
             process_group_session_id=child_session_id,
+            acknowledgement_abort_requested=(lambda: acknowledgement_abort_requested),
         )
         if terminal_lease is not None:
             terminal_lease.restore()
@@ -155,11 +167,14 @@ def main(argv: list[str] | None = None) -> int:
             if terminal_lease is not None:
                 terminal_lease.restore()
         finally:
-            if process is not None:
-                unregister_guarded_process(
-                    registry_path=Path(args.registry),
-                    process=process,
-                )
+            try:
+                if process is not None:
+                    unregister_guarded_process(
+                        registry_path=Path(args.registry),
+                        process=process,
+                    )
+            finally:
+                signal.signal(signal.SIGUSR1, previous_abort_handler)
 
 
 def _watch_child(
@@ -171,12 +186,20 @@ def _watch_child(
     state_path: Path | None,
     timeout_seconds: float,
     process_group_session_id: int | None = None,
+    acknowledgement_abort_requested: Callable[[], bool] | None = None,
 ) -> ProcessExit:
     deadline = time.monotonic() + timeout_seconds
     parent_pid = os.getppid()
     interval = min(WATCHDOG_POLL_MAX_SECONDS, timeout_seconds / 4)
     reason = ExitReason.NATURAL
     while child.poll() is None:
+        if (
+            acknowledgement_abort_requested is not None
+            and acknowledgement_abort_requested()
+        ):
+            reason = ExitReason.ACKNOWLEDGEMENT_FAILED
+            _terminate_child(child)
+            break
         if _child_was_stopped(child.pid):
             # A nested managed runtime cannot safely hand shell job control back
             # without also suspending the outer supervisor and its lease. Keep
@@ -189,6 +212,16 @@ def _watch_child(
             if os.getppid() == parent_pid:
                 deadline = time.monotonic() + timeout_seconds
         else:
+            abort_request = read_runtime_abort(state_path)
+            if (
+                abort_request is not None
+                and abort_request.chain_id == chain_id
+                and abort_request.generation == generation
+                and abort_request.owner_pid == process_pid
+            ):
+                reason = ExitReason.ACKNOWLEDGEMENT_FAILED
+                _terminate_child(child)
+                break
             status = _read_watchdog_state(
                 state_path,
                 process_pid=process_pid,
@@ -355,6 +388,21 @@ def _await_empty_process_group(
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.02)
+
+
+def verified_process_group_members(process_group_id: int) -> set[int] | None:
+    """Return live members only when the kernel still binds the group to one session."""
+
+    if isinstance(process_group_id, bool) or process_group_id <= 0:
+        return None
+    try:
+        session_id = os.getsid(process_group_id)
+    except (OSError, PermissionError, ProcessLookupError):
+        return None
+    return _verified_process_group_members(
+        process_group_id,
+        expected_session_id=session_id,
+    )
 
 
 def _verified_process_group_members(

@@ -21,6 +21,7 @@ from .guardian import WATCHDOG_SHUTDOWN_MARGIN_SECONDS
 from .ledger import EventLedger
 from .models import Confidence, EventType, Runtime
 from .process import (
+    clear_runtime_abort,
     ExitReason,
     LaunchRequest,
     ManagedProcess,
@@ -115,6 +116,7 @@ class SupervisorSnapshot(BaseModel):
     runtime: Runtime
     chain_id: str
     generation: int = Field(default=0, ge=0)
+    successor_attempt: int = Field(default=0, ge=0)
     phase: SupervisorPhase = SupervisorPhase.INITIAL
     owner_session_id: str | None = None
     conversation_id: str | None = None
@@ -132,6 +134,7 @@ class SupervisorSnapshot(BaseModel):
     window_tokens: int | None = Field(default=None, gt=0)
     cumulative_tokens: int | None = Field(default=None, ge=0)
     last_heartbeat_at: datetime | None = None
+    successor_ack_deadline_at: datetime | None = None
     checkpoint_fingerprint: str | None = None
     checkpoint_path: Path | None = None
     warning_emitted: bool = False
@@ -160,11 +163,17 @@ class Supervisor:
         lease_seconds: int = 60,
         heartbeat_interval_seconds: float = 20.0,
         stop_timeout_seconds: float = 10.0,
+        successor_retry_limit: int = 1,
+        successor_ack_timeout_seconds: float = 30.0,
     ):
         if not 0 < warn_percent < rotate_percent <= 100:
             raise ValueError("thresholds must satisfy 0 < warn < rotate <= 100")
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        if successor_retry_limit < 0:
+            raise ValueError("successor retry limit must be non-negative")
+        if successor_ack_timeout_seconds <= 0:
+            raise ValueError("successor acknowledgement timeout must be positive")
         if not 0 <= heartbeat_interval_seconds < lease_seconds:
             raise ValueError(
                 "heartbeat interval must satisfy 0 <= interval < lease seconds"
@@ -217,6 +226,8 @@ class Supervisor:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.watchdog_timeout_seconds = watchdog_timeout_seconds
         self.stop_timeout_seconds = stop_timeout_seconds
+        self.successor_retry_limit = successor_retry_limit
+        self.successor_ack_timeout_seconds = successor_ack_timeout_seconds
         self.run_spec_fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -236,6 +247,10 @@ class Supervisor:
                             separators=(",", ":"),
                         ).encode("utf-8")
                     ).hexdigest(),
+                    "successor_retry_limit": self.successor_retry_limit,
+                    "successor_ack_timeout_seconds": (
+                        self.successor_ack_timeout_seconds
+                    ),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -243,6 +258,17 @@ class Supervisor:
         ).hexdigest()
         self.snapshot = self._load()
         self.current_process = self._restore_process(self.snapshot)
+        if (
+            self.snapshot.phase is SupervisorPhase.AWAITING_ACK
+            and self.snapshot.successor_ack_deadline_at is None
+        ):
+            self.snapshot = self.snapshot.model_copy(
+                update={
+                    "successor_ack_deadline_at": self._now()
+                    + timedelta(seconds=self.successor_ack_timeout_seconds)
+                }
+            )
+            self._persist()
 
     @property
     def can_dispatch(self) -> bool:
@@ -447,6 +473,11 @@ class Supervisor:
         if self.snapshot.phase is SupervisorPhase.AWAITING_ACK:
             acknowledgement = read_acknowledgement(self.state_path)
             if acknowledgement is None:
+                deadline = self.snapshot.successor_ack_deadline_at
+                if deadline is None or self._now() >= deadline:
+                    return self._retry_successor_unlocked(
+                        cause=RuntimeError("successor acknowledgement deadline expired")
+                    )
                 return self.snapshot
             snapshot = self._acknowledge_unlocked(
                 generation=acknowledgement.generation,
@@ -509,11 +540,19 @@ class Supervisor:
         capsule = self._verified_capsule(fingerprint)
         self._heartbeat_if_due(force=True)
         self._effect("acknowledge", "started", generation=generation)
-        if not self.checkpoint_manager.acknowledge(
-            capsule,
-            idempotency_key=f"{self.chain_id}:{generation}:ack",
-        ):
-            raise RuntimeError("required checkpoint acknowledgement was not verified")
+        try:
+            verified = self.checkpoint_manager.acknowledge(
+                capsule,
+                idempotency_key=f"{self.chain_id}:{generation}:ack",
+            )
+        except Exception as exc:
+            return self._retry_successor_unlocked(cause=exc)
+        if not verified:
+            return self._retry_successor_unlocked(
+                cause=RuntimeError(
+                    "required checkpoint acknowledgement was not verified"
+                )
+            )
         EventLedger(self.lifecycle_path).append(
             LifecycleEvent(
                 schema_version=1,
@@ -539,11 +578,79 @@ class Supervisor:
                 "window_tokens": None,
                 "cumulative_tokens": None,
                 "warning_emitted": False,
+                "successor_ack_deadline_at": None,
             }
         )
         self._persist()
         self._effect("acknowledge", "completed", generation=generation)
         return self.snapshot
+
+    def _retry_successor_unlocked(
+        self,
+        *,
+        cause: Exception,
+    ) -> SupervisorSnapshot:
+        if self.snapshot.generation <= 0 or self.snapshot.phase not in {
+            SupervisorPhase.AWAITING_ACK,
+            SupervisorPhase.LAUNCHING,
+        }:
+            raise RuntimeError("successor retry requested outside a launch") from cause
+
+        self._effect(
+            "successor-attempt",
+            "failed",
+            generation=self.snapshot.generation,
+        )
+        process = self.current_process
+        failed_owner_pid = self.snapshot.process_pid
+        if process is not None:
+            try:
+                if self.process_driver.is_alive(process):
+                    self.process_driver.graceful_stop(
+                        process,
+                        self.stop_timeout_seconds,
+                    )
+                if self.process_driver.is_alive(process):
+                    raise RuntimeError("failed successor remains live")
+                self.process_driver.clear_exit_status(process)
+            except Exception as stop_error:
+                self._persist_blocked()
+                raise RuntimeError(
+                    "failed successor could not be terminated safely"
+                ) from stop_error
+        self.current_process = None
+        clear_acknowledgement(self.state_path)
+        if failed_owner_pid is not None:
+            clear_runtime_abort(
+                self.state_path,
+                expected_owner_pid=failed_owner_pid,
+            )
+        cleared = {
+            **self._cleared_process_fields(),
+            "conversation_id": None,
+            "successor_ack_deadline_at": None,
+        }
+        if self.snapshot.successor_attempt >= self.successor_retry_limit:
+            self.snapshot = self.snapshot.model_copy(
+                update={"phase": SupervisorPhase.BLOCKED, **cleared}
+            )
+            self._persist()
+            raise RuntimeError("successor retry budget exhausted") from cause
+
+        self.snapshot = self.snapshot.model_copy(
+            update={
+                "phase": SupervisorPhase.LAUNCHING,
+                "successor_attempt": self.snapshot.successor_attempt + 1,
+                **cleared,
+            }
+        )
+        self._persist()
+        self._effect(
+            "successor-retry",
+            "scheduled",
+            generation=self.snapshot.generation,
+        )
+        return self._advance_rotation()
 
     def _observe_usage(self) -> None:
         if self.current_process is None:
@@ -685,6 +792,7 @@ class Supervisor:
                 self.snapshot = self.snapshot.model_copy(
                     update={
                         "generation": target,
+                        "successor_attempt": 0,
                         "phase": SupervisorPhase.LAUNCHING,
                         "owner_session_id": owner_session_id,
                         "conversation_id": None,
@@ -698,11 +806,23 @@ class Supervisor:
             if phase is SupervisorPhase.LAUNCHING:
                 request = self._launch_request(generation=self.snapshot.generation)
                 self._effect("launch", "started", generation=self.snapshot.generation)
-                process = self.process_driver.start_fresh(request)
+                try:
+                    process = self.process_driver.start_fresh(request)
+                except Exception as exc:
+                    self._effect(
+                        "launch",
+                        "failed",
+                        generation=self.snapshot.generation,
+                    )
+                    if self.snapshot.generation == 0:
+                        raise
+                    return self._retry_successor_unlocked(cause=exc)
                 self.current_process = process
                 self.snapshot = self.snapshot.model_copy(
                     update={
                         "phase": SupervisorPhase.AWAITING_ACK,
+                        "successor_ack_deadline_at": self._now()
+                        + timedelta(seconds=self.successor_ack_timeout_seconds),
                         **self._process_fields(process),
                     }
                 )
@@ -863,6 +983,16 @@ class Supervisor:
         except (OSError, RuntimeError, ValueError):
             self._persist_blocked()
             raise
+        if self.snapshot.phase is SupervisorPhase.AWAITING_ACK:
+            detail = (
+                f"status {terminal.return_code} ({terminal.reason.value})"
+                if terminal is not None
+                else "missing process"
+            )
+            self._retry_successor_unlocked(
+                cause=RuntimeError(f"successor exited before acknowledgement: {detail}")
+            )
+            return
         if (
             terminal is not None
             and terminal.return_code == 0

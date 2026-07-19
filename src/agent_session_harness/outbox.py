@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -22,6 +23,7 @@ from agent_session_harness.secure_files import (
     exclusive_lock,
     private_exists,
     read_private_text,
+    try_exclusive_lock,
 )
 
 
@@ -151,41 +153,75 @@ class MirrorOutbox:
                 max_bytes=self.max_queue_bytes,
             )
             batch = entries[:max_attempts]
-            retained: list[OutboxEntry] = []
-            dead_letters: list[DeadLetterEntry] = []
-            succeeded = 0
-            for entry in batch:
+        outcomes: list[tuple[OutboxEntry, str, DeadLetterEntry | None]] = []
+        succeeded = 0
+        for entry in batch:
+            with try_exclusive_lock(self._entry_lock_path(entry)) as claimed:
+                if not claimed:
+                    outcomes.append((entry, "retain", None))
+                    continue
                 adapter = adapters.get(entry.adapter)
                 if adapter is None:
-                    retained.append(entry)
+                    outcomes.append((entry, "retain", None))
                     continue
                 try:
                     response = adapter.execute(entry.request)
                 except Exception:
-                    retained.append(entry)
+                    outcomes.append((entry, "retain", None))
                     continue
 
                 expected = entry.request.capsule.fingerprint
                 if response.ok and response.fingerprint == expected:
                     succeeded += 1
+                    outcomes.append((entry, "success", None))
                 elif response.ok:
-                    dead_letters.append(
-                        self._dead_letter(
+                    outcomes.append(
+                        (
                             entry,
-                            "adapter returned the wrong fingerprint",
+                            "dead-letter",
+                            self._dead_letter(
+                                entry,
+                                "adapter returned the wrong fingerprint",
+                            ),
                         )
                     )
                 elif response.retryable:
-                    retained.append(entry)
+                    outcomes.append((entry, "retain", None))
                 else:
-                    dead_letters.append(
-                        self._dead_letter(
+                    outcomes.append(
+                        (
                             entry,
-                            response.error or "adapter reported failure",
+                            "dead-letter",
+                            self._dead_letter(
+                                entry,
+                                response.error or "adapter reported failure",
+                            ),
                         )
                     )
 
-            retained.extend(entries[len(batch) :])
+        # External adapters can block or perform network I/O. Reconcile their
+        # idempotent outcomes only after reacquiring the queue lock so live
+        # supervisors can enqueue and inspect the outbox in the meantime.
+        with exclusive_lock(self.lock_path):
+            retained = self._read(
+                self.path,
+                OutboxEntry,
+                max_bytes=self.max_queue_bytes,
+            )
+            dead_letters: list[DeadLetterEntry] = []
+            for original, outcome, dead_letter in outcomes:
+                if outcome == "retain":
+                    continue
+                try:
+                    index = retained.index(original)
+                except ValueError:
+                    # Another replay already reconciled this exact entry. A
+                    # newly enqueued request with the same idempotency key has
+                    # a different timestamp and must remain untouched.
+                    continue
+                if outcome == "dead-letter" and dead_letter is not None:
+                    dead_letters.append(dead_letter)
+                del retained[index]
 
             existing_dead_letters = self._read(
                 self.dead_letter_path,
@@ -224,6 +260,13 @@ class MirrorOutbox:
             failed_at=datetime.now(timezone.utc),
             error=error,
         )
+
+    def _entry_lock_path(self, entry: OutboxEntry) -> Path:
+        identity = hashlib.sha256(self._encoded(entry).encode("utf-8")).hexdigest()
+        # A fixed stripe count bounds lock-file growth while ensuring the same
+        # entry can only be executed by one replay worker at a time.
+        stripe = identity[:2]
+        return self.path.with_suffix(self.path.suffix + f".replay-{stripe}.lock")
 
     @staticmethod
     def _encoded(model: BaseModel) -> str:

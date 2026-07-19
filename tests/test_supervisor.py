@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import os
@@ -59,6 +59,35 @@ def _handoff_activity(quiescence: Quiescence = Quiescence.IDLE) -> ActivitySnaps
         quiescence,
         handoff_requested_generations=frozenset({0}),
     )
+
+
+def test_public_process_group_probe_uses_the_live_group_session(monkeypatch) -> None:
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    observed: list[tuple[int, int]] = []
+    monkeypatch.setattr(guardian.os, "getsid", lambda process_group_id: 9001)
+    monkeypatch.setattr(
+        guardian,
+        "_verified_process_group_members",
+        lambda process_group_id, *, expected_session_id: (
+            observed.append((process_group_id, expected_session_id)) or {4242, 4243}
+        ),
+    )
+
+    assert guardian.verified_process_group_members(4242) == {4242, 4243}
+    assert observed == [(4242, 9001)]
+
+
+def test_public_process_group_probe_fails_closed_when_group_is_gone(
+    monkeypatch,
+) -> None:
+    guardian = importlib.import_module("agent_session_harness.guardian")
+
+    def missing(_process_group_id: int) -> int:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(guardian.os, "getsid", missing)
+
+    assert guardian.verified_process_group_members(4242) is None
 
 
 class FakeUsageReader:
@@ -216,13 +245,16 @@ class FakeProcessDriver:
         self.exit_records = {}
         self.exit_status_error = None
         self.cleared_exit_records = []
+        self.attempts = {}
 
     def start_fresh(self, request):
         self.requests.append(request)
         self.calls.append(("start", request.generation, request.runtime_args))
         process = self.processes.get(request.generation)
-        if process is None:
-            pid = 1000 + request.generation
+        if process is None or process.pid not in self.active_pids:
+            attempt = self.attempts.get(request.generation, 0)
+            self.attempts[request.generation] = attempt + 1
+            pid = 1000 + request.generation + (attempt * 100)
             process = self.process_module.ManagedProcess(
                 pid=pid,
                 process_group_id=pid,
@@ -588,6 +620,59 @@ def test_guardian_marks_an_intentional_supervisor_stop(tmp_path) -> None:
 
     assert terminal.return_code == 0
     assert terminal.reason is process.ExitReason.SUPERVISOR_STOP
+
+
+def test_guardian_terminates_unacknowledged_runtime_before_prompt_dispatch(
+    tmp_path,
+) -> None:
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    state_path = tmp_path / "supervisor.json"
+    dispatch_path = tmp_path / "prompt-dispatched"
+    state_path.write_text(
+        json.dumps(
+            {
+                "claim": {"owner_session_id": "chain-ack:1"},
+                "chain_id": "chain-ack",
+                "generation": 1,
+                "phase": "awaiting_ack",
+                "process_pid": os.getpid(),
+                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,time; "
+                "time.sleep(2); "
+                f"pathlib.Path({str(dispatch_path)!r}).write_text('dispatched')"
+            ),
+        ],
+        start_new_session=True,
+    )
+    process.write_runtime_abort(
+        state_path=state_path,
+        chain_id="chain-ack",
+        generation=1,
+        owner_pid=os.getpid(),
+    )
+
+    terminal = guardian._watch_child(
+        child,
+        process_pid=os.getpid(),
+        chain_id="chain-ack",
+        generation=1,
+        state_path=state_path,
+        timeout_seconds=3,
+    )
+
+    assert terminal.reason is process.ExitReason.ACKNOWLEDGEMENT_FAILED
+    assert not dispatch_path.exists()
 
 
 def test_guardian_drains_descendants_before_recording_natural_exit(tmp_path) -> None:
@@ -983,21 +1068,68 @@ def test_successor_acknowledgement_requires_expected_generation_and_fingerprint(
 def test_required_checkpoint_acknowledgement_blocks_running_transition(
     tmp_path,
 ) -> None:
+    process, _supervisor_module = _modules()
     managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(tmp_path)
     checkpoints.acknowledge_verified = False
     managed.start()
     snapshot = managed.tick(_handoff_activity())
+    process.write_runtime_abort(
+        state_path=managed.state_path,
+        chain_id=managed.chain_id,
+        generation=1,
+        owner_pid=1001,
+    )
 
-    with pytest.raises(RuntimeError, match="required checkpoint acknowledgement"):
+    retried = managed.acknowledge(
+        generation=1,
+        fingerprint=snapshot.checkpoint_fingerprint,
+        conversation_id="native-conversation-1",
+        owner_pid=1001,
+    )
+
+    assert retried.phase.value == "awaiting_ack"
+    assert retried.generation == 1
+    assert retried.successor_attempt == 1
+    assert retried.process_pid == 1101
+    assert process.read_runtime_abort(managed.state_path) is None
+    assert [call[0] for call in _driver.calls][-2:] == ["stop", "start"]
+    assert managed.can_dispatch is False
+
+    with pytest.raises(RuntimeError, match="retry budget"):
         managed.acknowledge(
             generation=1,
             fingerprint=snapshot.checkpoint_fingerprint,
-            conversation_id="native-conversation-1",
-            owner_pid=1001,
+            conversation_id="native-conversation-1-retry",
+            owner_pid=1101,
         )
 
-    assert managed.snapshot.phase.value == "awaiting_ack"
-    assert managed.can_dispatch is False
+    assert managed.snapshot.phase.value == "blocked"
+    assert _driver.active_pids == set()
+
+
+def test_successor_ack_deadline_terminates_and_retries_same_generation(
+    tmp_path,
+) -> None:
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    awaiting = managed.tick(_handoff_activity())
+    managed.snapshot = awaiting.model_copy(
+        update={
+            "successor_ack_deadline_at": datetime.now(tz=timezone.utc)
+            - timedelta(seconds=1)
+        }
+    )
+    managed._persist()
+
+    retried = managed.tick(_activity(Quiescence.UNKNOWN))
+
+    assert retried.phase.value == "awaiting_ack"
+    assert retried.generation == 1
+    assert retried.successor_attempt == 1
+    assert retried.process_pid == 1101
+    assert retried.successor_ack_deadline_at is not None
+    assert retried.successor_ack_deadline_at > datetime.now(tz=timezone.utc)
+    assert [call[0] for call in driver.calls][-2:] == ["stop", "start"]
 
 
 def test_successor_acknowledgement_is_bound_to_child_pid_and_heartbeats_claim(
@@ -1139,7 +1271,17 @@ def test_clean_exit_before_successor_acknowledgement_fails_closed(tmp_path) -> N
         reason=process.ExitReason.NATURAL,
     )
 
-    with pytest.raises(RuntimeError, match="status 0"):
+    retried = managed.tick(_handoff_activity())
+    assert retried.phase.value == "awaiting_ack"
+    assert retried.successor_attempt == 1
+    assert retried.process_pid is not None
+    driver.active_pids.clear()
+    driver.exit_records[retried.process_pid] = process.ProcessExit(
+        return_code=0,
+        reason=process.ExitReason.NATURAL,
+    )
+
+    with pytest.raises(RuntimeError, match="retry budget"):
         managed.tick(_handoff_activity())
 
     assert managed.snapshot.phase.value == "blocked"
@@ -1505,6 +1647,16 @@ def test_rotation_recovers_idempotently_after_each_effect_crash(
         checkpoint_crash=checkpoint_crash,
     )
     managed.start()
+    if crash_effect == "start-successor":
+        snapshot = managed.tick(_handoff_activity())
+        assert snapshot.phase.value == "awaiting_ack"
+        assert snapshot.successor_attempt == 1
+        assert driver.max_active == 1
+        assert len(checkpoints.receipts) == 1
+        assert len(coordinator.released) == 1
+        assert len(driver.processes) == 2
+        return
+
     with pytest.raises(RuntimeError, match="crash"):
         managed.tick(_handoff_activity())
 

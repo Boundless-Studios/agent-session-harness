@@ -13,7 +13,8 @@ from .activity import ActivitySnapshot, Quiescence
 
 
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:api[-_]?key|authorization|credential|password|secret|token)"
+    r"(?i)\b(?:[a-z0-9]+[-_])*(?:api[-_]?key|authorization|credential|password|secret|token)"
+    r"(?:[-_][a-z0-9]+)*"
     r"\s*[:=]\s*\S+"
 )
 
@@ -64,10 +65,17 @@ def sample_project_safety(
     cwd: Path,
     chain_id: str,
     generation: int,
+    process_group_id: int | None,
 ) -> ProjectSafetyObservation:
     """Invoke a project probe and convert every adapter failure to unknown."""
 
     try:
+        if (
+            process_group_id is None
+            or isinstance(process_group_id, bool)
+            or process_group_id <= 0
+        ):
+            raise ValueError("managed runtime process group is unavailable")
         payload = command.execute(
             {
                 "schema_version": 1,
@@ -75,6 +83,7 @@ def sample_project_safety(
                 "cwd": str(cwd),
                 "chain_id": chain_id,
                 "generation": generation,
+                "process_group_id": process_group_id,
             }
         )
         return ProjectSafetyObservation.model_validate(payload)

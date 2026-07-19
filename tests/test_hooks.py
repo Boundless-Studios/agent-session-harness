@@ -571,7 +571,12 @@ def test_session_start_blocks_when_durable_acknowledgement_never_completes(
     )
     monkeypatch.setattr(command, "SUCCESSOR_ACK_TIMEOUT_SECONDS", 0.02)
 
-    with pytest.raises(RuntimeError, match="durable acknowledgement"):
+    def abort_successor(**_kwargs) -> None:
+        raise RuntimeError("unacknowledged successor was terminated")
+
+    monkeypatch.setattr(command, "_abort_unacknowledged_successor", abort_successor)
+
+    with pytest.raises(RuntimeError, match="successor was terminated"):
         command.run_hook(
             runtime="codex",
             stdin=io.StringIO(
@@ -587,6 +592,126 @@ def test_session_start_blocks_when_durable_acknowledgement_never_completes(
             stdout=io.StringIO(),
             environ=environ,
         )
+
+
+def test_failed_successor_session_start_requests_abort_and_never_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _native, command = _modules()
+    process = importlib.import_module("agent_session_harness.process")
+    state_path = tmp_path / "supervisor.json"
+    environ = _stop_environment(tmp_path, state_path, generation=1)
+    events = importlib.import_module("agent_session_harness.events")
+    event = events.LifecycleEvent(
+        schema_version=1,
+        event_id="session-start:chain-1:1",
+        runtime="claude",
+        chain_id="chain-1",
+        conversation_id="conversation-1",
+        generation=1,
+        event_type="session.started",
+        timestamp=NOW,
+        cwd=tmp_path,
+        owner_pid=1234,
+    )
+
+    class AbortWaitObserved(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        command.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(AbortWaitObserved("waiting")),
+    )
+
+    with pytest.raises(AbortWaitObserved, match="waiting"):
+        command._abort_unacknowledged_successor(event=event, environment=environ)
+
+    marker = process.read_runtime_abort(state_path)
+    assert marker is not None
+    assert marker.chain_id == "chain-1"
+    assert marker.generation == 1
+    assert marker.owner_pid == 1234
+
+
+def test_abort_never_returns_when_durable_marker_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _native, command = _modules()
+    events = importlib.import_module("agent_session_harness.events")
+    event = events.LifecycleEvent(
+        schema_version=1,
+        event_id="session-start:chain-1:1:disk-full",
+        runtime="claude",
+        chain_id="chain-1",
+        conversation_id="conversation-1",
+        generation=1,
+        event_type="session.started",
+        timestamp=NOW,
+        cwd=tmp_path,
+        owner_pid=1234,
+    )
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        command,
+        "write_runtime_abort",
+        lambda **_kwargs: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(command.os, "kill", lambda pid, sig: signals.append((pid, sig)))
+    monkeypatch.setattr(
+        command.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(RuntimeError("still blocked")),
+    )
+
+    with pytest.raises(RuntimeError, match="still blocked"):
+        command._abort_unacknowledged_successor(
+            event=event,
+            environment=_stop_environment(
+                tmp_path, tmp_path / "state.json", generation=1
+            ),
+        )
+
+    assert signals == [(1234, command.signal.SIGUSR1)]
+
+
+def test_successor_user_prompt_is_blocked_until_durable_ack(tmp_path: Path) -> None:
+    _native, command = _modules()
+    state_path = tmp_path / "supervisor.json"
+    _write_supervisor_state(
+        state_path,
+        runtime="claude",
+        phase="awaiting_ack",
+        generation=1,
+    )
+    environ = _stop_environment(tmp_path, state_path, generation=1)
+    environ["AGENT_SESSION_HARNESS_CAPSULE_PATH"] = str(tmp_path / "capsule.json")
+    environ["AGENT_SESSION_HARNESS_CAPSULE_FINGERPRINT"] = "f" * 64
+    environ["AGENT_SESSION_HARNESS_TARGET_GENERATION"] = "1"
+    stdout = io.StringIO()
+
+    exit_code = command.run_hook(
+        runtime="claude",
+        stdin=io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "session_id": "conversation-1",
+                    "cwd": str(tmp_path),
+                    "timestamp": NOW.isoformat(),
+                    "prompt": "must not persist",
+                }
+            )
+        ),
+        stdout=stdout,
+        environ=environ,
+    )
+
+    assert exit_code == 0
+    assert json.loads(stdout.getvalue())["decision"] == "block"
+    assert not (tmp_path / "events.jsonl").exists()
 
 
 def test_hook_command_rejects_oversized_input(tmp_path) -> None:

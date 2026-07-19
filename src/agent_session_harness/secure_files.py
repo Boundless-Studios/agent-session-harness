@@ -305,3 +305,27 @@ def exclusive_lock(path: str | os.PathLike[str]) -> Iterator[None]:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
             except OSError:
                 pass
+
+
+@contextmanager
+def try_exclusive_lock(path: str | os.PathLike[str]) -> Iterator[bool]:
+    """Acquire one private lock without waiting, yielding whether it was claimed."""
+
+    descriptor = _open_private(Path(path), os.O_RDWR, create=True)
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
+        try:
+            import fcntl
+        except ImportError as exc:
+            raise RuntimeError("exclusive file locking is unavailable") from exc
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass

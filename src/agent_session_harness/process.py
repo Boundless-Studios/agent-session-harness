@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
@@ -14,7 +15,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Protocol
+from typing import Literal, Protocol
 import uuid
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -64,6 +65,7 @@ class ExitReason(str, Enum):
     WATCHDOG_EXPIRED = "watchdog_expired"
     STATE_INVALID = "state_invalid"
     PROCESS_GROUP_UNVERIFIED = "process_group_unverified"
+    ACKNOWLEDGEMENT_FAILED = "acknowledgement_failed"
     UNKNOWN = "unknown"
 
 
@@ -72,6 +74,75 @@ class ProcessExit(BaseModel):
 
     return_code: int
     reason: ExitReason
+
+
+class RuntimeAbortRequest(BaseModel):
+    """Durable request for the guardian to kill an unacknowledged runtime."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    chain_id: str = Field(min_length=1, max_length=160)
+    generation: int = Field(ge=1)
+    owner_pid: int = Field(gt=0)
+    requested_at: datetime
+
+
+def runtime_abort_path(state_path: str | os.PathLike[str]) -> Path:
+    state = lexical_absolute(state_path)
+    return state.with_suffix(state.suffix + ".runtime-abort.json")
+
+
+def write_runtime_abort(
+    *,
+    state_path: str | os.PathLike[str],
+    chain_id: str,
+    generation: int,
+    owner_pid: int,
+) -> Path:
+    path = runtime_abort_path(state_path)
+    marker = RuntimeAbortRequest(
+        chain_id=chain_id,
+        generation=generation,
+        owner_pid=owner_pid,
+        requested_at=datetime.now(tz=timezone.utc),
+    )
+    with exclusive_lock(path.with_suffix(path.suffix + ".lock")):
+        atomic_write_private_text(path, marker.model_dump_json() + "\n")
+    return path
+
+
+def read_runtime_abort(
+    state_path: str | os.PathLike[str],
+) -> RuntimeAbortRequest | None:
+    path = runtime_abort_path(state_path)
+    if not private_exists(path):
+        return None
+    try:
+        return RuntimeAbortRequest.model_validate_json(
+            read_private_text(path, max_bytes=16 * 1024)
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def clear_runtime_abort(
+    state_path: str | os.PathLike[str],
+    *,
+    expected_owner_pid: int,
+) -> None:
+    path = runtime_abort_path(state_path)
+    with exclusive_lock(path.with_suffix(path.suffix + ".lock")):
+        if not private_exists(path):
+            return
+        try:
+            marker = RuntimeAbortRequest.model_validate_json(
+                read_private_text(path, max_bytes=16 * 1024)
+            )
+        except (OSError, ValueError):
+            return
+        if marker.owner_pid == expected_owner_pid:
+            private_unlink(path)
 
 
 class _DarwinProcessInfo(ctypes.Structure):

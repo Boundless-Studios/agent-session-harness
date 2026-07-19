@@ -6,14 +6,16 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import signal
 import time
-from typing import Literal, Mapping, TextIO
+from typing import Literal, Mapping, NoReturn, TextIO
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..events import LifecycleEvent
 from ..ledger import EventLedger
 from ..models import EventType, Runtime
+from ..process import write_runtime_abort
 from ..secure_files import (
     atomic_write_private_text,
     exclusive_lock,
@@ -90,12 +92,27 @@ def run_hook(
     ledger = EventLedger(Path(ledger_path))
 
     if event.event_type is EventType.SESSION_STARTED:
-        ledger.append(event)
-        _acknowledge_verified_successor(event=event, environment=environment)
+        try:
+            ledger.append(event)
+            _acknowledge_verified_successor(event=event, environment=environment)
+        except Exception:
+            if _successor_ack_required(environment):
+                _abort_unacknowledged_successor(
+                    event=event,
+                    environment=environment,
+                )
+            raise
         response = NativeHookResponse(exit_code=0, stdout={"ok": True})
     elif event.event_type is not EventType.TURN_IDLE:
-        ledger.append(event)
-        response = NativeHookResponse(exit_code=0, stdout={"ok": True})
+        if (
+            event.event_type is EventType.TURN_STARTED
+            and _successor_ack_required(environment)
+            and not _successor_dispatch_allowed(event, environment)
+        ):
+            response = _blocked_successor_prompt(event.runtime)
+        else:
+            ledger.append(event)
+            response = NativeHookResponse(exit_code=0, stdout={"ok": True})
     else:
         response = _handle_stop(
             runtime=Runtime(runtime),
@@ -105,6 +122,90 @@ def run_hook(
         )
     _write_response(response, stdout=stdout, stderr=stderr)
     return response.exit_code
+
+
+def _successor_ack_required(environment: Mapping[str, str]) -> bool:
+    return any(
+        environment.get(key, "")
+        for key in (
+            "AGENT_SESSION_HARNESS_CAPSULE_PATH",
+            "AGENT_SESSION_HARNESS_CAPSULE_FINGERPRINT",
+            "AGENT_SESSION_HARNESS_TARGET_GENERATION",
+        )
+    )
+
+
+def _abort_unacknowledged_successor(
+    *,
+    event: LifecycleEvent,
+    environment: Mapping[str, str],
+) -> NoReturn:
+    """Request guardian termination and never release the queued first prompt."""
+
+    state_path: Path | None = None
+    try:
+        state_path = _state_path(environment, event.cwd)
+        write_runtime_abort(
+            state_path=state_path,
+            chain_id=event.chain_id,
+            generation=event.generation,
+            owner_pid=event.owner_pid,
+        )
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    # The guardian is a separate process group, so SIGUSR1 is an independent
+    # fail-closed channel when the state filesystem is unavailable.
+    try:
+        os.kill(event.owner_pid, signal.SIGUSR1)
+    except OSError:
+        pass
+
+    # Hooks normally inherit the managed runtime's process group. Kill it
+    # immediately only after binding that group to the exact supervisor state;
+    # the durable guardian marker above remains the fallback for runtimes that
+    # isolate hooks into their own process group.
+    try:
+        if state_path is not None:
+            snapshot = _read_snapshot(state_path)
+            _validate_snapshot(snapshot, event=event, runtime=event.runtime)
+            current_group = os.getpgrp()
+            if snapshot.process_group_id == current_group:
+                os.killpg(current_group, signal.SIGKILL)
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    while True:
+        time.sleep(SUCCESSOR_READY_POLL_SECONDS)
+
+
+def _successor_dispatch_allowed(
+    event: LifecycleEvent,
+    environment: Mapping[str, str],
+) -> bool:
+    try:
+        snapshot = _read_snapshot(_state_path(environment, event.cwd))
+        _validate_snapshot(snapshot, event=event, runtime=event.runtime)
+        return (
+            snapshot.phase is SupervisorPhase.RUNNING
+            and snapshot.conversation_id == event.conversation_id
+            and snapshot.checkpoint_fingerprint
+            == environment.get("AGENT_SESSION_HARNESS_CAPSULE_FINGERPRINT")
+            and str(snapshot.checkpoint_path)
+            == environment.get("AGENT_SESSION_HARNESS_CAPSULE_PATH")
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _blocked_successor_prompt(runtime: Runtime) -> NativeHookResponse:
+    reason = "Verified handoff acknowledgement is not complete; prompt blocked."
+    if runtime is Runtime.CLAUDE:
+        return NativeHookResponse(
+            exit_code=0,
+            stdout={"decision": "block", "reason": reason},
+        )
+    return NativeHookResponse(exit_code=2, stderr=reason + "\n")
 
 
 def _acknowledge_verified_successor(

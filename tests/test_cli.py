@@ -67,16 +67,20 @@ def test_doctor_reports_managed_policy_only_when_capabilities_are_known(
 
 
 def _interval_args(
-    *, adapter_timeout_seconds: float = 5.0, lease_seconds: int = 60
+    *,
+    adapter_timeout_seconds: float = 5.0,
+    lease_seconds: int = 60,
+    poll_seconds: float = 1.0,
 ) -> argparse.Namespace:
     return argparse.Namespace(
-        poll_seconds=1.0,
+        poll_seconds=poll_seconds,
         lease_seconds=lease_seconds,
         stop_timeout_seconds=10.0,
         stale_after_seconds=None,
         max_ticks=0,
         adapter_timeout_seconds=adapter_timeout_seconds,
         heartbeat_interval_seconds=None,
+        successor_retry_limit=1,
     )
 
 
@@ -104,6 +108,15 @@ def test_supervise_accepts_bounded_multi_adapter_budget() -> None:
         required_adapter_count=1,
         mirror_adapter_count=1,
     )
+
+
+def test_supervise_acknowledgement_budget_includes_successor_readiness() -> None:
+    with pytest.raises(ValueError, match="acknowledgement adapter budget"):
+        cli._validate_supervise_intervals(
+            _interval_args(adapter_timeout_seconds=11.0),
+            required_adapter_count=1,
+            mirror_adapter_count=1,
+        )
 
 
 def test_inspect_reads_native_usage_as_stable_json(capsys) -> None:
@@ -681,7 +694,10 @@ def test_non_check_supervise_runs_a_real_bounded_supervisor_loop(
         "cwd": str(tmp_path),
         "chain_id": "chain-1",
         "generation": 0,
+        "process_group_id": observed_safety["process_group_id"],
     }
+    assert isinstance(observed_safety["process_group_id"], int)
+    assert observed_safety["process_group_id"] > 0
 
     assert cli.main(arguments) == 2
     blocked = _json_stdout(capsys)
@@ -818,6 +834,7 @@ def test_supervise_merges_busy_project_safety_before_tick(
                 chain_id=self.chain_id,
                 phase="running",
                 run_spec_fingerprint="a" * 64,
+                process_group_id=4242,
             )
             self.activity = None
             instances.append(self)
@@ -881,6 +898,90 @@ def test_supervise_merges_busy_project_safety_before_tick(
     assert instances[0].activity.active_critical_section_ids == frozenset(
         {"git-index-lock"}
     )
+
+
+def test_supervise_prioritizes_successor_ack_before_sleep_safety_or_replay(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    state_path = tmp_path / "supervisor.json"
+    lifecycle_path = state_path.with_suffix(state_path.suffix + ".lifecycle")
+    replay_calls: list[object] = []
+    sleep_calls: list[float] = []
+
+    class FakeSupervisor:
+        def __init__(self, **kwargs) -> None:
+            self.chain_id = kwargs["chain_id"]
+            self.lifecycle_path = lifecycle_path
+            self.snapshot = SupervisorSnapshot(
+                runtime="claude",
+                chain_id=self.chain_id,
+                generation=1,
+                phase="awaiting_ack",
+                run_spec_fingerprint="a" * 64,
+            )
+
+        def start(self):
+            return self.snapshot
+
+        def tick(self, _activity):
+            return self.snapshot
+
+        def shutdown(self) -> None:
+            self.snapshot = self.snapshot.model_copy(
+                update={"phase": SupervisorPhase.BLOCKED}
+            )
+
+    monkeypatch.setattr(cli, "Supervisor", FakeSupervisor)
+    monkeypatch.setattr(
+        cli,
+        "_replay_mirrors_fail_open",
+        lambda manager: replay_calls.append(manager),
+    )
+    monkeypatch.setattr(cli.time, "sleep", sleep_calls.append)
+    inert = json.dumps([sys.executable, "-c", "pass"])
+
+    assert (
+        cli.main(
+            [
+                "supervise",
+                "--runtime",
+                "claude",
+                "--cwd",
+                str(tmp_path),
+                "--chain-id",
+                "chain-ack-priority",
+                "--task-type",
+                "linear",
+                "--task-id",
+                "BOU-2195",
+                "--task-fingerprint",
+                "fingerprint",
+                "--state",
+                str(state_path),
+                "--executable",
+                sys.executable,
+                "--usage-adapter",
+                inert,
+                "--capsule-adapter",
+                inert,
+                "--safety-adapter",
+                inert,
+                "--required-adapter",
+                "local=" + inert,
+                "--poll-seconds",
+                "10",
+                "--max-ticks",
+                "1",
+                "--required-capabilities-known",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    _json_stdout(capsys)
+    assert len(replay_calls) == 1
+    assert 10.0 not in sleep_calls
 
 
 def test_json_mode_emits_a_stable_error_object(tmp_path, capsys) -> None:

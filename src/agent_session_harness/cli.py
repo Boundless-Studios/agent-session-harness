@@ -21,7 +21,12 @@ from .checkpoint import CheckpointManager as DurableCheckpointManager
 from .config import load_config
 from .coordinator import CoordinatorAdapter
 from .guardian import WATCHDOG_SHUTDOWN_MARGIN_SECONDS
-from .hooks.command import SUCCESSOR_ACK_TIMEOUT_SECONDS, run_hook
+from .hooks.command import (
+    SUCCESSOR_ACK_TIMEOUT_SECONDS,
+    SUCCESSOR_READY_POLL_SECONDS,
+    SUCCESSOR_READY_TIMEOUT_SECONDS,
+    run_hook,
+)
 from .hooks.install import HookInstaller
 from .ledger import EventLedger
 from .models import Runtime
@@ -171,6 +176,7 @@ def _parser() -> argparse.ArgumentParser:
     supervise.add_argument("--stale-after-seconds", type=float)
     supervise.add_argument("--max-ticks", type=int, default=0)
     supervise.add_argument("--adapter-timeout-seconds", type=float, default=5.0)
+    supervise.add_argument("--successor-retry-limit", type=int, default=1)
     _add_json(supervise)
     supervise.set_defaults(handler=_run_supervise)
 
@@ -420,6 +426,8 @@ def _run_supervise(args: argparse.Namespace) -> int:
         lease_seconds=args.lease_seconds,
         heartbeat_interval_seconds=heartbeat_interval,
         stop_timeout_seconds=args.stop_timeout_seconds,
+        successor_retry_limit=args.successor_retry_limit,
+        successor_ack_timeout_seconds=SUCCESSOR_ACK_TIMEOUT_SECONDS,
     )
     ticks = 0
     activity_ledger = EventLedger(managed.lifecycle_path)
@@ -436,6 +444,28 @@ def _run_supervise(args: argparse.Namespace) -> int:
                 "a new chain/state path for a new managed run"
             )
         while args.max_ticks == 0 or ticks < args.max_ticks:
+            if managed.snapshot.phase is SupervisorPhase.AWAITING_ACK:
+                # SessionStart runs before the first prompt, so service its
+                # durable acknowledgement ahead of normal cadence. Do not put
+                # the hook behind a project probe, mirror replay, or the
+                # operator-configured poll interval.
+                activity = activity_ledger.materialize(
+                    now=datetime.now(tz=timezone.utc),
+                    stale_after_seconds=(
+                        args.stale_after_seconds
+                        if args.stale_after_seconds is not None
+                        else config.governor.stale_event_timeout_seconds
+                    ),
+                )
+                snapshot = managed.tick(activity)
+                ticks += 1
+                if snapshot.phase is SupervisorPhase.COMPLETED:
+                    break
+                if snapshot.phase is SupervisorPhase.AWAITING_ACK and (
+                    args.max_ticks == 0 or ticks < args.max_ticks
+                ):
+                    time.sleep(SUCCESSOR_READY_POLL_SECONDS)
+                continue
             time.sleep(args.poll_seconds)
             activity = activity_ledger.materialize(
                 now=datetime.now(tz=timezone.utc),
@@ -453,12 +483,15 @@ def _run_supervise(args: argparse.Namespace) -> int:
                         cwd=cwd,
                         chain_id=managed.chain_id,
                         generation=managed.snapshot.generation,
+                        process_group_id=managed.snapshot.process_group_id,
                     ),
                 )
             snapshot = managed.tick(activity)
             ticks += 1
             if snapshot.phase is SupervisorPhase.COMPLETED:
                 break
+            if snapshot.phase is SupervisorPhase.AWAITING_ACK:
+                continue
             replay_error = _replay_mirrors_fail_open(checkpoint_manager.durable_manager)
             if replay_error is not None:
                 mirror_replay_error = replay_error
@@ -768,6 +801,8 @@ def _validate_supervise_intervals(
         raise ValueError("max ticks must be non-negative")
     if args.adapter_timeout_seconds <= 0:
         raise ValueError("adapter timeout seconds must be positive")
+    if args.successor_retry_limit < 0:
+        raise ValueError("successor retry limit must be non-negative")
     watchdog_seconds = args.lease_seconds - WATCHDOG_SHUTDOWN_MARGIN_SECONDS
     if 2 * (args.adapter_timeout_seconds + args.poll_seconds) >= watchdog_seconds:
         raise ValueError(
@@ -782,8 +817,13 @@ def _validate_supervise_intervals(
             "cumulative checkpoint adapter budget must leave watchdog headroom"
         )
     acknowledgement_seconds = (
-        required_adapter_count + mirror_adapter_count
-    ) * args.adapter_timeout_seconds
+        SUCCESSOR_READY_TIMEOUT_SECONDS
+        + SUCCESSOR_READY_POLL_SECONDS
+        + (
+            (required_adapter_count + mirror_adapter_count)
+            * args.adapter_timeout_seconds
+        )
+    )
     if acknowledgement_seconds >= (
         SUCCESSOR_ACK_TIMEOUT_SECONDS * SYNCHRONOUS_ADAPTER_BUDGET_FRACTION
     ):

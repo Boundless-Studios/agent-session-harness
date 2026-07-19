@@ -37,3 +37,20 @@ jobs:
           cache: pip
       - run: python -m pip install build
       - run: python -m build
+
+  macos-runtime:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - name: Exercise Darwin process groups and interactive PTY ownership
+        run: >-
+          python -m pytest -q
+          tests/test_interactive_pty.py
+          tests/test_supervisor.py::test_public_process_group_probe_uses_the_live_group_session
+          tests/test_supervisor.py::test_public_process_group_probe_fails_closed_when_group_is_gone

@@ -119,6 +119,24 @@ def test_unknown_runtime_or_project_safety_fails_closed(
         },
         {
             "schema_version": 1,
+            "status": "unknown",
+            "active_critical_sections": (),
+            "warnings": ("aws_secret_access_key=must-not-persist",),
+        },
+        {
+            "schema_version": 1,
+            "status": "busy",
+            "active_critical_sections": ("github_token_value=must-not-persist",),
+            "warnings": (),
+        },
+        {
+            "schema_version": 1,
+            "status": "busy",
+            "active_critical_sections": ("proxy_authorization=must-not-persist",),
+            "warnings": (),
+        },
+        {
+            "schema_version": 1,
             "status": "busy",
             "active_critical_sections": tuple(f"lock-{index}" for index in range(33)),
             "warnings": (),
@@ -151,6 +169,7 @@ def test_project_safety_command_receives_only_bounded_identity(tmp_path) -> None
         cwd=tmp_path,
         chain_id="chain-1",
         generation=3,
+        process_group_id=4242,
     )
 
     assert observation.status is ProjectSafetyStatus.QUIESCENT
@@ -160,6 +179,7 @@ def test_project_safety_command_receives_only_bounded_identity(tmp_path) -> None
         "cwd": str(tmp_path),
         "chain_id": "chain-1",
         "generation": 3,
+        "process_group_id": 4242,
     }
 
 
@@ -175,6 +195,7 @@ def test_project_safety_command_failure_becomes_unknown_without_diagnostics(
         cwd=tmp_path,
         chain_id="chain-1",
         generation=0,
+        process_group_id=4242,
     )
 
     assert observation.status is ProjectSafetyStatus.UNKNOWN

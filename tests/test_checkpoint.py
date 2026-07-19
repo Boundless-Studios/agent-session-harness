@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import stat
 import sys
+import threading
 from typing import Callable
 
 import pytest
@@ -142,6 +143,22 @@ def test_command_adapter_writes_reads_and_acknowledges_by_argv(tmp_path) -> None
         set(request) == {"schema_version", "operation", "idempotency_key", "capsule"}
         for request in requests
     )
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    (
+        "aws_secret_access_key=must-not-leak",
+        "github_token_value=must-not-leak",
+        "proxy_authorization=must-not-leak",
+    ),
+)
+def test_adapter_diagnostics_redact_prefixed_and_suffixed_credentials(
+    diagnostic: str,
+) -> None:
+    _capsule_module, command, _checkpoint, _outbox = _modules()
+
+    assert command.sanitize_error(diagnostic) == "credential=[redacted]"
 
 
 def test_json_command_inherits_only_controlled_adapter_environment(
@@ -615,6 +632,96 @@ def test_outbox_replay_bounds_each_batch_and_retains_the_remainder(tmp_path) -> 
     assert result.retained == 1
     assert calls == ["first", "second"]
     assert [entry.request.idempotency_key for entry in queue.pending()] == ["third"]
+
+
+def test_outbox_replay_does_not_hold_queue_lock_during_adapter_execution(
+    tmp_path,
+) -> None:
+    capsule, command, _checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    queue.enqueue("mirror", _request(command, handoff, "write", key="first"))
+    adapter_started = threading.Event()
+    release_adapter = threading.Event()
+    replay_finished = threading.Event()
+    enqueue_finished = threading.Event()
+
+    class BlockingAdapter:
+        name = "mirror"
+
+        def execute(self, request):
+            adapter_started.set()
+            assert release_adapter.wait(timeout=2)
+            return _success(command, request)
+
+    def replay() -> None:
+        queue.replay({"mirror": BlockingAdapter()}, max_attempts=1)
+        replay_finished.set()
+
+    replay_thread = threading.Thread(target=replay)
+    replay_thread.start()
+    assert adapter_started.wait(timeout=1)
+
+    def enqueue() -> None:
+        queue.enqueue("mirror", _request(command, handoff, "write", key="second"))
+        enqueue_finished.set()
+
+    enqueue_thread = threading.Thread(target=enqueue)
+    enqueue_thread.start()
+    try:
+        assert enqueue_finished.wait(timeout=0.5), (
+            "live supervision must be able to enqueue while a mirror call is blocked"
+        )
+    finally:
+        release_adapter.set()
+        replay_thread.join(timeout=2)
+        enqueue_thread.join(timeout=2)
+
+    assert replay_finished.is_set()
+    assert [entry.request.idempotency_key for entry in queue.pending()] == ["second"]
+
+
+def test_concurrent_outbox_replayers_claim_each_entry_once(tmp_path) -> None:
+    capsule, command, _checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    queue.enqueue("mirror", _request(command, handoff, "write", key="one-call"))
+    adapter_started = threading.Event()
+    release_adapter = threading.Event()
+    second_finished = threading.Event()
+    calls: list[str] = []
+
+    class BlockingAdapter:
+        name = "mirror"
+
+        def execute(self, request):
+            calls.append(request.idempotency_key)
+            adapter_started.set()
+            assert release_adapter.wait(timeout=2)
+            return _success(command, request)
+
+    adapter = BlockingAdapter()
+    first = threading.Thread(
+        target=lambda: queue.replay({"mirror": adapter}, max_attempts=1)
+    )
+
+    def second_replay() -> None:
+        queue.replay({"mirror": adapter}, max_attempts=1)
+        second_finished.set()
+
+    first.start()
+    assert adapter_started.wait(timeout=1)
+    second = threading.Thread(target=second_replay)
+    second.start()
+    try:
+        assert second_finished.wait(timeout=0.5)
+    finally:
+        release_adapter.set()
+        first.join(timeout=2)
+        second.join(timeout=2)
+
+    assert calls == ["one-call"]
+    assert queue.depth == 0
 
 
 def test_outbox_rejects_reads_larger_than_its_queue_bound(tmp_path) -> None:

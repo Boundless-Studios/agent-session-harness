@@ -107,7 +107,7 @@ agent-session-harness supervise \
   --json
 ```
 
-The supervisor runs until interrupted. `--max-ticks` exists for bounded automation and tests. Only a status-zero exit recorded by the guardian as natural, after its descendant process group is drained and verified, fences its claim and persists `completed`; forced, nonzero, unverified, or premature successor exits fail closed as `blocked`. Interrupting the supervisor records an explicit supervisor-stop reason, stops the managed child, fences its claim, and also persists `blocked` rather than leaving an unowned agent running. `blocked` is terminal for that run specification: after resolving retained ownership, start a new chain and state path instead of reusing or resuming it.
+The supervisor runs until interrupted. `--max-ticks` exists for bounded automation and tests. Only a status-zero exit recorded by the guardian as natural, after its descendant process group is drained and verified, fences its claim and persists `completed`; forced, nonzero, or unverified exits fail closed as `blocked`. A successor that exits or cannot durably acknowledge before dispatch gets one bounded same-generation retry by default (`--successor-retry-limit`), then blocks without advancing the generation. Interrupting the supervisor records an explicit supervisor-stop reason, stops the managed child, fences its claim, and also persists `blocked` rather than leaving an unowned agent running. `blocked` is terminal for that run specification: after resolving retained ownership, start a new chain and state path instead of reusing or resuming it.
 
 Interactive managed runtimes retain the caller's controlling terminal. Terminal input, Ctrl-C, and resize signals reach the active runtime process group, and terminal ownership/attributes are restored after exit. Ctrl-Z is resumed immediately instead of suspending a nested runtime: leaving only the inner process group stopped would strand the outer supervisor and its durable lease.
 
@@ -207,7 +207,7 @@ The capsule adapter receives:
 
 It returns either the complete `HandoffCapsule` or `{"capsule": <complete HandoffCapsule>}`. The harness validates the chain, predecessor, generation, bounded schema, credential exclusion, and canonical fingerprint before any durable adapter runs.
 
-An optional project safety adapter receives `schema_version`, `operation: "probe"`, `cwd`, `chain_id`, and `generation`. It returns a bounded status plus named critical sections:
+An optional project safety adapter receives `schema_version`, `operation: "probe"`, `cwd`, `chain_id`, `generation`, and the verified managed `process_group_id`. It returns a bounded status plus named critical sections:
 
 ```json
 {
@@ -237,7 +237,7 @@ agent-session-harness hooks check \
   --runtime codex --path .codex/hooks.json --json
 ```
 
-`--dry-run` and `hooks uninstall` are supported. Invalid JSON is never mutated. Unmanaged hook invocations are silent no-ops. Managed hook execution requires `AGENT_SESSION_HARNESS_MANAGED=1`, writes only local lifecycle/acknowledgement state, performs no network work, and applies a 1 MiB input bound. A successor's `SessionStart` hook remains blocked until the supervisor has durably acknowledged every required checkpoint adapter; it cannot continue the handed-off action on a merely local acknowledgement.
+`--dry-run` and `hooks uninstall` are supported. Invalid JSON is never mutated. Unmanaged hook invocations are silent no-ops. Managed hook execution requires `AGENT_SESSION_HARNESS_MANAGED=1`, writes only local lifecycle/acknowledgement state, performs no network work, and applies a 1 MiB input bound. A successor's `SessionStart` hook waits for every required checkpoint acknowledgement to become durable before returning. Because Claude treats `SessionStart` as context-only rather than a blocking decision hook, acknowledgement failure also writes a guardian abort request, signals the guardian through an independent channel, and never releases the queued first prompt. `UserPromptSubmit` independently blocks successor dispatch unless the exact generation, conversation, capsule path, and fingerprint are already in the durable `running` state.
 
 At a Stop event, normal sessions are allowed to stop. A draining session receives one continuation request listing the configured durable checkpoints. A recursion marker prevents repeated blocking. Once the capsule fingerprint is verified, Stop is allowed immediately.
 
