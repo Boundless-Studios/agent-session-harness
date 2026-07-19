@@ -20,7 +20,12 @@ from .events import LifecycleEvent
 from .guardian import WATCHDOG_SHUTDOWN_MARGIN_SECONDS
 from .ledger import EventLedger
 from .models import Confidence, EventType, Runtime
-from .process import LaunchRequest, ManagedProcess, ProcessDriver
+from .process import (
+    ExitReason,
+    LaunchRequest,
+    ManagedProcess,
+    ProcessDriver,
+)
 from .secure_files import (
     append_private_text,
     atomic_write_private_text,
@@ -46,6 +51,7 @@ class SupervisorPhase(str, Enum):
     CLAIMING = "claiming"
     LAUNCHING = "launching"
     AWAITING_ACK = "awaiting_ack"
+    COMPLETED = "completed"
     BLOCKED = "blocked"
 
 
@@ -94,6 +100,13 @@ class UsageReader(Protocol):
 class CheckpointManager(Protocol):
     def checkpoint(self, request: CheckpointRequest) -> VerifiedCheckpoint: ...
 
+    def acknowledge(
+        self,
+        capsule: HandoffCapsule,
+        *,
+        idempotency_key: str,
+    ) -> bool: ...
+
 
 class SupervisorSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -136,6 +149,7 @@ class Supervisor:
         task_fingerprint: str,
         executable: str,
         runtime_args: tuple[str, ...],
+        runtime_environment: dict[str, str] | None = None,
         state_path: str | os.PathLike[str],
         process_driver: ProcessDriver,
         usage_reader: UsageReader,
@@ -173,6 +187,16 @@ class Supervisor:
         self.task_fingerprint = task_fingerprint
         self.executable = executable
         self.runtime_args = runtime_args
+        self.runtime_environment = dict(runtime_environment or {})
+        reserved_environment_keys = sorted(
+            key
+            for key in self.runtime_environment
+            if key.startswith("AGENT_SESSION_HARNESS_")
+        )
+        if reserved_environment_keys:
+            raise ValueError(
+                f"reserved runtime environment key: {reserved_environment_keys[0]}"
+            )
         self.state_path = lexical_absolute(state_path)
         self.effect_path = self.state_path.with_suffix(
             self.state_path.suffix + ".events"
@@ -204,6 +228,14 @@ class Supervisor:
                     "task_fingerprint": self.task_fingerprint,
                     "executable": self.executable,
                     "runtime_args": self.runtime_args,
+                    "runtime_environment_keys": sorted(self.runtime_environment),
+                    "runtime_environment_fingerprint": hashlib.sha256(
+                        json.dumps(
+                            sorted(self.runtime_environment.items()),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest(),
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -225,6 +257,9 @@ class Supervisor:
             return self._start_unlocked()
 
     def _start_unlocked(self) -> SupervisorSnapshot:
+        if self.snapshot.phase is SupervisorPhase.COMPLETED:
+            self._finalize_completed_cleanup()
+            return self.snapshot
         if self.snapshot.phase is SupervisorPhase.INITIAL:
             self._persist()
             owner_session_id = self._owner_session_id(0)
@@ -308,9 +343,13 @@ class Supervisor:
             return snapshot
 
     def _shutdown_unlocked(self) -> SupervisorSnapshot:
+        if self.snapshot.phase is SupervisorPhase.COMPLETED:
+            self._finalize_completed_cleanup()
+            return self.snapshot
         process = self.current_process
         stop_error: Exception | None = None
         journal_error: Exception | None = None
+        exit_cleanup_error: Exception | None = None
 
         def record_effect(effect: str, status: str) -> None:
             nonlocal journal_error
@@ -324,6 +363,11 @@ class Supervisor:
                 if journal_error is None:
                     journal_error = exc
 
+        if process is not None:
+            self.snapshot = self.snapshot.model_copy(
+                update={"phase": SupervisorPhase.BLOCKED}
+            )
+            self._persist()
         if process is not None and self.process_driver.is_alive(process):
             record_effect("stop", "started")
             try:
@@ -343,7 +387,14 @@ class Supervisor:
                 ) from stop_error
             record_effect("stop", "completed")
 
-        self.current_process = None
+        if process is not None:
+            try:
+                self.process_driver.clear_exit_status(process)
+            except (OSError, RuntimeError, ValueError) as exc:
+                exit_cleanup_error = exc
+
+        if exit_cleanup_error is None:
+            self.current_process = None
         fence_error: Exception | None = None
         had_claim = self.snapshot.claim is not None
         claim_released = not had_claim
@@ -357,15 +408,9 @@ class Supervisor:
                 fence_error = exc
             else:
                 claim_released = True
-        update: dict[str, object] = {
-            "phase": SupervisorPhase.BLOCKED,
-            "process_pid": None,
-            "process_group_id": None,
-            "process_registry_key": None,
-            "process_identity": None,
-            "process_command_digest": None,
-            "process_launch_nonce": None,
-        }
+        update: dict[str, object] = {"phase": SupervisorPhase.BLOCKED}
+        if exit_cleanup_error is None:
+            update.update(self._cleared_process_fields())
         if claim_released:
             update.update(
                 {
@@ -386,12 +431,18 @@ class Supervisor:
             raise RuntimeError(
                 "terminal shutdown effect journaling failed after cleanup"
             ) from journal_error
+        if exit_cleanup_error is not None:
+            raise RuntimeError(
+                "terminal exit record cleanup failed"
+            ) from exit_cleanup_error
         return self.snapshot
 
     def _tick_unlocked(self, activity: ActivitySnapshot) -> SupervisorSnapshot:
         if self.snapshot.phase is SupervisorPhase.INITIAL:
             raise RuntimeError("supervisor must be started before ticking")
         self._ensure_active_process_is_live()
+        if self.snapshot.phase is SupervisorPhase.COMPLETED:
+            return self.snapshot
         self._heartbeat_if_due()
         if self.snapshot.phase is SupervisorPhase.AWAITING_ACK:
             acknowledgement = read_acknowledgement(self.state_path)
@@ -412,7 +463,12 @@ class Supervisor:
         }:
             self._observe_usage()
             if self.snapshot.phase is SupervisorPhase.DRAINING:
-                if activity.quiescence is not Quiescence.IDLE:
+                if (
+                    self.snapshot.context_confidence is not Confidence.CONFIDENT
+                    or self.snapshot.generation
+                    not in activity.handoff_requested_generations
+                    or activity.quiescence is not Quiescence.IDLE
+                ):
                     return self.snapshot
                 self._set_phase(SupervisorPhase.CHECKPOINTING)
         return self._advance_rotation()
@@ -453,6 +509,11 @@ class Supervisor:
         capsule = self._verified_capsule(fingerprint)
         self._heartbeat_if_due(force=True)
         self._effect("acknowledge", "started", generation=generation)
+        if not self.checkpoint_manager.acknowledge(
+            capsule,
+            idempotency_key=f"{self.chain_id}:{generation}:ack",
+        ):
+            raise RuntimeError("required checkpoint acknowledgement was not verified")
         EventLedger(self.lifecycle_path).append(
             LifecycleEvent(
                 schema_version=1,
@@ -488,6 +549,12 @@ class Supervisor:
         if self.current_process is None:
             raise RuntimeError("managed process metadata is unavailable")
         sample = self.usage_reader.sample(self.current_process)
+        if sample.confidence is not Confidence.CONFIDENT:
+            self.snapshot = self.snapshot.model_copy(
+                update={"context_confidence": sample.confidence}
+            )
+            self._persist()
+            return
         self.snapshot = self.snapshot.model_copy(
             update={
                 "conversation_id": sample.conversation_id,
@@ -498,9 +565,6 @@ class Supervisor:
                 "cumulative_tokens": sample.cumulative_tokens,
             }
         )
-        if sample.confidence is not Confidence.CONFIDENT:
-            self._persist()
-            return
         if (
             self.snapshot.phase is SupervisorPhase.RUNNING
             and sample.context_percent >= self.warn_percent
@@ -589,6 +653,7 @@ class Supervisor:
                 if self.process_driver.is_alive(process):
                     raise RuntimeError("predecessor process remains live after stop")
                 self._effect("stop", "completed", generation=self.snapshot.generation)
+                self.process_driver.clear_exit_status(process)
                 self.current_process = None
                 self.snapshot = self.snapshot.model_copy(
                     update={
@@ -656,18 +721,21 @@ class Supervisor:
         )
 
     def _launch_request(self, *, generation: int) -> LaunchRequest:
-        environment = {
-            "AGENT_SESSION_HARNESS_MANAGED": "1",
-            "AGENT_SESSION_HARNESS_CHAIN_ID": self.chain_id,
-            "AGENT_SESSION_HARNESS_GENERATION": str(generation),
-            "AGENT_SESSION_HARNESS_LEDGER": str(
-                self.state_path.with_suffix(self.state_path.suffix + ".lifecycle")
-            ),
-            "AGENT_SESSION_HARNESS_STATE_PATH": str(self.state_path),
-            "AGENT_SESSION_HARNESS_WATCHDOG_TIMEOUT_SECONDS": str(
-                self.watchdog_timeout_seconds
-            ),
-        }
+        environment = dict(self.runtime_environment)
+        environment.update(
+            {
+                "AGENT_SESSION_HARNESS_MANAGED": "1",
+                "AGENT_SESSION_HARNESS_CHAIN_ID": self.chain_id,
+                "AGENT_SESSION_HARNESS_GENERATION": str(generation),
+                "AGENT_SESSION_HARNESS_LEDGER": str(
+                    self.state_path.with_suffix(self.state_path.suffix + ".lifecycle")
+                ),
+                "AGENT_SESSION_HARNESS_STATE_PATH": str(self.state_path),
+                "AGENT_SESSION_HARNESS_WATCHDOG_TIMEOUT_SECONDS": str(
+                    self.watchdog_timeout_seconds
+                ),
+            }
+        )
         message = None
         if generation > 0:
             if (
@@ -698,6 +766,7 @@ class Supervisor:
             executable=self.executable,
             runtime_args=self.runtime_args,
             environment=environment,
+            allowed_environment_keys=frozenset(self.runtime_environment),
             capsule_path=self.snapshot.checkpoint_path,
             capsule_fingerprint=self.snapshot.checkpoint_fingerprint,
             handoff_message=message,
@@ -777,19 +846,89 @@ class Supervisor:
         process = self.current_process
         try:
             live = process is not None and self.process_driver.is_alive(process)
-        except RuntimeError:
-            self.snapshot = self.snapshot.model_copy(
-                update={"phase": SupervisorPhase.BLOCKED}
-            )
-            self._persist()
+        except (OSError, RuntimeError, ValueError):
+            self._persist_blocked()
             raise
         if live:
             return
+        try:
+            terminal = (
+                self.process_driver.exit_status(process)
+                if process is not None
+                else None
+            )
+        except (OSError, RuntimeError, ValueError):
+            self._persist_blocked()
+            raise
+        if (
+            terminal is not None
+            and terminal.return_code == 0
+            and terminal.reason is ExitReason.NATURAL
+            and process is not None
+            and self.snapshot.phase
+            in {SupervisorPhase.RUNNING, SupervisorPhase.WARNING}
+        ):
+            self._complete_clean_exit(process)
+            return
+        self._persist_blocked()
+        if terminal is not None:
+            raise RuntimeError(
+                "managed process exited with status "
+                f"{terminal.return_code} ({terminal.reason.value}); "
+                "supervisor blocked"
+            )
+        raise RuntimeError("managed process is not live; supervisor blocked")
+
+    def _complete_clean_exit(self, process: ManagedProcess) -> None:
+        self._effect(
+            "terminal-exit",
+            "started",
+            generation=self.snapshot.generation,
+        )
+        claim = self.snapshot.claim
+        if claim is not None:
+            try:
+                self.coordinator.fence(claim)
+            except StaleOwnerError:
+                pass
+            except (OSError, RuntimeError):
+                self.snapshot = self.snapshot.model_copy(
+                    update={"phase": SupervisorPhase.BLOCKED}
+                )
+                self._persist()
+                raise
+        # Persist completion while retaining the process identity. If exit-record
+        # cleanup or the final state write is interrupted, a restarted supervisor
+        # can safely retry cleanup without treating the generation as active.
         self.snapshot = self.snapshot.model_copy(
-            update={"phase": SupervisorPhase.BLOCKED}
+            update={
+                "phase": SupervisorPhase.COMPLETED,
+                "owner_session_id": None,
+                "claim": None,
+                "last_heartbeat_at": None,
+            }
         )
         self._persist()
-        raise RuntimeError("managed process is not live; supervisor blocked")
+        try:
+            self._finalize_completed_cleanup()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RuntimeError("completed process exit record cleanup failed") from exc
+        self._effect(
+            "terminal-exit",
+            "completed",
+            generation=self.snapshot.generation,
+        )
+
+    def _finalize_completed_cleanup(self) -> None:
+        if self.snapshot.phase is not SupervisorPhase.COMPLETED:
+            return
+        process = self.current_process
+        if process is None:
+            return
+        self.process_driver.clear_exit_status(process)
+        self.current_process = None
+        self.snapshot = self.snapshot.model_copy(update=self._cleared_process_fields())
+        self._persist()
 
     def _fail_closed_for_stale_owner(self) -> None:
         self.snapshot = self.snapshot.model_copy(
@@ -803,18 +942,23 @@ class Supervisor:
             self.process_driver.graceful_stop(process, self.stop_timeout_seconds)
         finally:
             if not self.process_driver.is_alive(process):
+                try:
+                    self.process_driver.clear_exit_status(process)
+                except (OSError, RuntimeError, ValueError):
+                    # Keep the process identity in the blocked snapshot so a
+                    # later shutdown can retry exact-record cleanup.
+                    return
                 self.current_process = None
                 self.snapshot = self.snapshot.model_copy(
-                    update={
-                        "process_pid": None,
-                        "process_group_id": None,
-                        "process_registry_key": None,
-                        "process_identity": None,
-                        "process_command_digest": None,
-                        "process_launch_nonce": None,
-                    }
+                    update=self._cleared_process_fields()
                 )
                 self._persist()
+
+    def _persist_blocked(self) -> None:
+        self.snapshot = self.snapshot.model_copy(
+            update={"phase": SupervisorPhase.BLOCKED}
+        )
+        self._persist()
 
     def _verified_capsule(self, fingerprint: str | None) -> HandoffCapsule:
         if self.snapshot.checkpoint_path is None or fingerprint is None:
@@ -907,6 +1051,17 @@ class Supervisor:
             "process_identity": process.identity,
             "process_command_digest": process.command_digest,
             "process_launch_nonce": process.launch_nonce,
+        }
+
+    @staticmethod
+    def _cleared_process_fields() -> dict[str, object]:
+        return {
+            "process_pid": None,
+            "process_group_id": None,
+            "process_registry_key": None,
+            "process_identity": None,
+            "process_command_digest": None,
+            "process_launch_nonce": None,
         }
 
     @staticmethod

@@ -19,7 +19,8 @@ from agent_session_harness.capsule import HandoffCapsule
 
 
 _SENSITIVE_ASSIGNMENT = re.compile(
-    r"(?i)\b(?:api[-_]?key|credential|password|secret|token)\s*[:=]\s*\S+"
+    r"(?i)\b(?:[a-z0-9]+[-_])*(?:api[-_]?key|credential|password|secret|token)"
+    r"\s*[:=]\s*\S+"
 )
 _INHERITED_ENVIRONMENT_KEYS = frozenset(
     {

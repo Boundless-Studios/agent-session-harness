@@ -118,4 +118,5 @@ def merge_project_safety(
         processed_event_count=activity.processed_event_count,
         last_event_at=activity.last_event_at,
         integrity_warnings=activity.integrity_warnings + observation.warnings,
+        handoff_requested_generations=activity.handoff_requested_generations,
     )

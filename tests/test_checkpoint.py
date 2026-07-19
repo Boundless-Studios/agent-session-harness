@@ -319,6 +319,143 @@ def test_required_readback_mismatch_prevents_verification(tmp_path) -> None:
     assert result.fingerprint == handoff.fingerprint
 
 
+def test_acknowledgement_is_required_and_mirror_failures_are_queued(tmp_path) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    required = RecordingAdapter(
+        "required", calls, lambda request: _success(command, request)
+    )
+    mirror = RecordingAdapter(
+        "linear",
+        calls,
+        lambda _request: command.AdapterResponse(
+            ok=False,
+            fingerprint=None,
+            retryable=True,
+            error="temporarily unavailable",
+        ),
+    )
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(required,),
+        mirror_adapters=(mirror,),
+        outbox=queue,
+    )
+
+    result = manager.acknowledge(handoff, idempotency_key="handoff-8:ack")
+
+    assert result.verified is True
+    assert calls == [
+        ("required", "acknowledge", "handoff-8:ack"),
+        ("linear", "acknowledge", "handoff-8:ack"),
+    ]
+    assert queue.depth == 1
+    pending = queue.pending()[0]
+    assert pending.request.operation.value == "acknowledge"
+    assert pending.request.idempotency_key == "handoff-8:ack"
+
+
+@pytest.mark.parametrize("operation", ["checkpoint", "acknowledge"])
+def test_raising_mirror_is_fail_open_and_queued(tmp_path, operation) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    required = RecordingAdapter(
+        "required", calls, lambda request: _success(command, request)
+    )
+
+    class RaisingMirror:
+        name = "linear"
+
+        def execute(self, _request):
+            raise RuntimeError("LINEAR_API_KEY=must-not-leak")
+
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(required,),
+        mirror_adapters=(RaisingMirror(),),
+        outbox=queue,
+    )
+
+    if operation == "checkpoint":
+        result = manager.checkpoint(handoff, idempotency_key="handoff-8")
+    else:
+        result = manager.acknowledge(handoff, idempotency_key="handoff-8:ack")
+
+    assert result.verified is True
+    assert len(result.mirror_attempts) == 1
+    assert result.mirror_attempts[0].response.retryable is True
+    assert result.mirror_attempts[0].response.error == "credential=[redacted]"
+    assert queue.depth == 1
+    assert queue.pending()[0].request.operation.value == operation.replace(
+        "checkpoint", "write"
+    )
+
+
+def test_mirror_enqueue_failure_is_fail_open_but_observable(tmp_path) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    required = RecordingAdapter(
+        "required", calls, lambda request: _success(command, request)
+    )
+    mirror = RecordingAdapter(
+        "linear",
+        calls,
+        lambda _request: command.AdapterResponse(
+            ok=False,
+            fingerprint=None,
+            retryable=True,
+            error="temporarily unavailable",
+        ),
+    )
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+
+    def fail_enqueue(_adapter, _request):
+        raise OSError("LINEAR_API_KEY=must-not-leak")
+
+    queue.enqueue = fail_enqueue
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(required,),
+        mirror_adapters=(mirror,),
+        outbox=queue,
+    )
+
+    result = manager.checkpoint(handoff, idempotency_key="handoff-8")
+
+    assert result.verified is True
+    assert result.mirror_attempts[0].enqueue_error == (
+        "mirror retry enqueue failed: credential=[redacted]"
+    )
+
+
+def test_required_acknowledgement_mismatch_prevents_completion(tmp_path) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    required = RecordingAdapter(
+        "required",
+        calls,
+        lambda _request: command.AdapterResponse(
+            ok=True,
+            fingerprint="0" * 64,
+            retryable=False,
+            error=None,
+        ),
+    )
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(required,),
+        mirror_adapters=(),
+        outbox=outbox.MirrorOutbox(tmp_path / "mirror.jsonl"),
+    )
+
+    result = manager.acknowledge(handoff, idempotency_key="handoff-8:ack")
+
+    assert result.verified is False
+    assert calls == [("required", "acknowledge", "handoff-8:ack")]
+
+
 def test_mirror_failure_is_deduplicated_without_changing_required_verification(
     tmp_path,
 ) -> None:
@@ -360,6 +497,43 @@ def test_mirror_failure_is_deduplicated_without_changing_required_verification(
     assert encoded == json.dumps(
         json.loads(encoded), sort_keys=True, separators=(",", ":")
     )
+
+
+def test_checkpoint_manager_replays_retained_mirror_work(tmp_path) -> None:
+    capsule, command, checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    calls: list[tuple[str, str, str]] = []
+    online = False
+
+    def mirror_response(request):
+        if online:
+            return _success(command, request)
+        return command.AdapterResponse(
+            ok=False,
+            fingerprint=None,
+            retryable=True,
+            error="temporarily unavailable",
+        )
+
+    required = RecordingAdapter(
+        "required", calls, lambda request: _success(command, request)
+    )
+    mirror = RecordingAdapter("linear", calls, mirror_response)
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    manager = checkpoint.CheckpointManager(
+        required_adapters=(required,),
+        mirror_adapters=(mirror,),
+        outbox=queue,
+    )
+    manager.checkpoint(handoff, idempotency_key="handoff-8")
+    assert queue.depth == 1
+
+    online = True
+    result = manager.replay_mirrors()
+
+    assert result.succeeded == 1
+    assert result.retained == 0
+    assert queue.depth == 0
 
 
 def test_outbox_deduplicates_only_the_adapter_and_idempotency_pair(tmp_path) -> None:
@@ -417,6 +591,41 @@ def test_outbox_replays_oldest_first_and_dead_letters_nonretryable_failures(
     assert dead_letters[0].request.idempotency_key == "third"
     assert dead_letters[0].error == "permanent failure"
     assert stat.S_IMODE(queue.dead_letter_path.stat().st_mode) == 0o600
+
+
+def test_outbox_replay_bounds_each_batch_and_retains_the_remainder(tmp_path) -> None:
+    capsule, command, _checkpoint, outbox = _modules()
+    handoff = _capsule(capsule, tmp_path)
+    queue = outbox.MirrorOutbox(tmp_path / "mirror.jsonl")
+    for key in ("first", "second", "third"):
+        queue.enqueue("mirror", _request(command, handoff, "write", key=key))
+    calls: list[str] = []
+
+    class SuccessfulAdapter:
+        name = "mirror"
+
+        def execute(self, request):
+            calls.append(request.idempotency_key)
+            return _success(command, request)
+
+    result = queue.replay({"mirror": SuccessfulAdapter()}, max_attempts=2)
+
+    assert result.attempted == 2
+    assert result.succeeded == 2
+    assert result.retained == 1
+    assert calls == ["first", "second"]
+    assert [entry.request.idempotency_key for entry in queue.pending()] == ["third"]
+
+
+def test_outbox_rejects_reads_larger_than_its_queue_bound(tmp_path) -> None:
+    _capsule_module, _command, _checkpoint, outbox = _modules()
+    path = tmp_path / "mirror.jsonl"
+    path.write_text("x" * 65, encoding="utf-8")
+    path.chmod(0o600)
+    queue = outbox.MirrorOutbox(path, max_queue_bytes=64)
+
+    with pytest.raises(ValueError, match="exceeds.*64"):
+        queue.pending()
 
 
 def test_outbox_treats_a_successful_wrong_fingerprint_as_nonretryable(tmp_path) -> None:

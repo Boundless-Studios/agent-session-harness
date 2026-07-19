@@ -23,6 +23,7 @@ class ActivitySnapshot:
     processed_event_count: int
     last_event_at: datetime | None
     integrity_warnings: tuple[str, ...]
+    handoff_requested_generations: frozenset[int] = frozenset()
 
     @property
     def active_count(self) -> int:

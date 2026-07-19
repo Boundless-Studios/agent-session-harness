@@ -12,7 +12,13 @@ import subprocess
 import time
 from typing import Mapping
 
-from .process import register_guarded_process, unregister_guarded_process
+from .process import (
+    ExitReason,
+    ProcessExit,
+    record_guarded_exit,
+    register_guarded_process,
+    unregister_guarded_process,
+)
 from .secure_files import lexical_absolute, read_private_text
 
 
@@ -65,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
             launch_nonce=args.launch_nonce,
             process_group_id=child.pid,
         )
-        return _watch_child(
+        terminal = _watch_child(
             child,
             process_pid=guardian_pid,
             chain_id=_required_environment("AGENT_SESSION_HARNESS_CHAIN_ID"),
@@ -73,9 +79,16 @@ def main(argv: list[str] | None = None) -> int:
             state_path=_state_path(os.environ),
             timeout_seconds=timeout,
         )
+        record_guarded_exit(
+            registry_path=Path(args.registry),
+            process=process,
+            terminal=terminal,
+        )
+        return terminal.return_code
     finally:
         if child.poll() is None:
             _terminate_child(child)
+        _drain_process_group(child.pid)
         if process is not None:
             unregister_guarded_process(
                 registry_path=Path(args.registry),
@@ -91,10 +104,11 @@ def _watch_child(
     generation: int,
     state_path: Path | None,
     timeout_seconds: float,
-) -> int:
+) -> ProcessExit:
     deadline = time.monotonic() + timeout_seconds
     parent_pid = os.getppid()
     interval = min(WATCHDOG_POLL_MAX_SECONDS, timeout_seconds / 4)
+    reason = ExitReason.NATURAL
     while child.poll() is None:
         if state_path is None:
             if os.getppid() == parent_pid:
@@ -107,16 +121,31 @@ def _watch_child(
                 generation=generation,
                 timeout_seconds=timeout_seconds,
             )
-            if status is False:
+            if isinstance(status, ExitReason):
+                reason = status
                 _terminate_child(child)
                 break
             if isinstance(status, float):
                 deadline = status
         if time.monotonic() >= deadline:
+            reason = ExitReason.WATCHDOG_EXPIRED
             _terminate_child(child)
             break
         time.sleep(interval)
-    return int(child.wait())
+    return_code = int(child.wait())
+    if reason is ExitReason.NATURAL and state_path is not None:
+        final_status = _read_watchdog_state(
+            state_path,
+            process_pid=process_pid,
+            chain_id=chain_id,
+            generation=generation,
+            timeout_seconds=timeout_seconds,
+        )
+        if isinstance(final_status, ExitReason):
+            reason = final_status
+    if not _drain_process_group(child.pid):
+        reason = ExitReason.PROCESS_GROUP_UNVERIFIED
+    return ProcessExit(return_code=return_code, reason=reason)
 
 
 def _read_watchdog_state(
@@ -126,7 +155,7 @@ def _read_watchdog_state(
     chain_id: str,
     generation: int,
     timeout_seconds: float,
-) -> float | bool | None:
+) -> float | ExitReason | None:
     try:
         payload = json.loads(read_private_text(path))
         claim = payload["claim"]
@@ -134,12 +163,13 @@ def _read_watchdog_state(
         if (
             payload.get("chain_id") != chain_id
             or payload.get("generation") != generation
-            or payload.get("phase") == "blocked"
             or not isinstance(claim, dict)
             or claim.get("owner_session_id") != owner_session_id
             or payload.get("process_pid") not in {None, process_pid}
         ):
-            return False
+            return ExitReason.STATE_INVALID
+        if payload.get("phase") in {"blocked", "stopping"}:
+            return ExitReason.SUPERVISOR_STOP
         heartbeat = datetime.fromisoformat(str(payload["last_heartbeat_at"]))
         if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
             return None
@@ -166,6 +196,97 @@ def _terminate_child(child: subprocess.Popen[bytes]) -> None:
     except ProcessLookupError:
         pass
     child.wait(timeout=KILL_WAIT_SECONDS)
+
+
+def _drain_process_group(process_group_id: int) -> bool:
+    """Drain only descendants that still belong to the child's original session."""
+
+    members = _verified_process_group_members(process_group_id)
+    if members is None:
+        return False
+    if not members:
+        return True
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if _await_empty_process_group(
+        process_group_id,
+        timeout_seconds=TERMINATE_GRACE_SECONDS,
+    ):
+        return True
+    members = _verified_process_group_members(process_group_id)
+    if members is None:
+        return False
+    if not members:
+        return True
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return _await_empty_process_group(
+        process_group_id,
+        timeout_seconds=KILL_WAIT_SECONDS,
+    )
+
+
+def _await_empty_process_group(
+    process_group_id: int,
+    *,
+    timeout_seconds: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        members = _verified_process_group_members(process_group_id)
+        if members is None:
+            return False
+        if not members:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+def _verified_process_group_members(
+    process_group_id: int,
+) -> set[int] | None:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    members: set[int] = set()
+    for line in completed.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2:
+            return None
+        try:
+            pid = int(fields[0])
+            pgid = int(fields[1])
+        except ValueError:
+            return None
+        if pgid != process_group_id:
+            continue
+        try:
+            session_id = os.getsid(pid)
+        except ProcessLookupError:
+            continue
+        except (OSError, PermissionError):
+            return None
+        if session_id != process_group_id:
+            return None
+        state = fields[2] if len(fields) == 3 else ""
+        if not state.startswith("Z"):
+            members.add(pid)
+    return members
 
 
 def _watchdog_timeout(environment: Mapping[str, str]) -> float:

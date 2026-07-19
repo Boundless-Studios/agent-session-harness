@@ -7,6 +7,8 @@ from pathlib import Path
 import stat
 import sys
 
+import pytest
+
 from agent_session_harness import cli
 from agent_session_harness.activity import Quiescence
 from agent_session_harness.capsule import HandoffCapsule
@@ -352,6 +354,27 @@ def test_empty_outbox_replay_and_supervise_preflight_are_safe(tmp_path, capsys) 
     assert preflight["observe_only"] is False
 
 
+def test_runtime_environment_rejects_harness_control_keys(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_SESSION_HARNESS_STATE_PATH", "/tmp/attacker-state")
+
+    with pytest.raises(ValueError, match="reserved"):
+        cli._runtime_environment(["AGENT_SESSION_HARNESS_STATE_PATH"])
+
+
+def test_automatic_mirror_replay_is_one_attempt_and_fail_open() -> None:
+    calls: list[int] = []
+
+    class BrokenManager:
+        def replay_mirrors(self, *, max_attempts):
+            calls.append(max_attempts)
+            raise ValueError("queue exceeds 64 bytes")
+
+    error = cli._replay_mirrors_fail_open(BrokenManager())
+
+    assert calls == [1]
+    assert error == "queue exceeds 64 bytes"
+
+
 def test_doctor_checks_versions_logs_permissions_hooks_and_adapter_contracts(
     tmp_path, monkeypatch, capsys
 ) -> None:
@@ -585,6 +608,96 @@ def test_non_check_supervise_runs_a_real_bounded_supervisor_loop(
     assert "blocked" in blocked["error"]["message"]
 
 
+def test_supervise_returns_success_when_runtime_exits_cleanly(
+    tmp_path, capsys, monkeypatch
+) -> None:
+    environment_marker = tmp_path / "runtime-environment.json"
+    runtime = tmp_path / "runtime.py"
+    runtime.write_text(
+        "import json, os, pathlib, sys, time\n"
+        "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
+        "'docker_host': os.environ.get('DOCKER_HOST'), "
+        "'unrelated': os.environ.get('UNRELATED_PRIVATE_VALUE')}))\n"
+        "time.sleep(0.2)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCKER_HOST", "ssh://docker.example")
+    monkeypatch.setenv("UNRELATED_PRIVATE_VALUE", "must-not-leak")
+    usage = tmp_path / "usage.py"
+    usage.write_text(
+        "import json, sys\n"
+        "json.load(sys.stdin)\n"
+        "print(json.dumps({'conversation_id': 'conversation-0', "
+        "'context_percent': 10.0, 'confidence': 'confident'}))\n",
+        encoding="utf-8",
+    )
+    inert = json.dumps([sys.executable, "-c", "print('{}')"])
+    state_path = tmp_path / "supervisor.json"
+
+    assert (
+        cli.main(
+            [
+                "supervise",
+                "--runtime",
+                "codex",
+                "--cwd",
+                str(tmp_path),
+                "--chain-id",
+                "chain-clean-exit",
+                "--task-type",
+                "linear",
+                "--task-id",
+                "BOU-2195",
+                "--task-fingerprint",
+                "task-fingerprint",
+                "--state",
+                str(state_path),
+                "--executable",
+                sys.executable,
+                "--runtime-arg",
+                str(runtime),
+                "--runtime-arg",
+                str(environment_marker),
+                "--runtime-env",
+                "DOCKER_HOST",
+                "--usage-adapter",
+                json.dumps([sys.executable, str(usage)]),
+                "--capsule-adapter",
+                inert,
+                "--required-adapter",
+                "local=" + inert,
+                "--poll-seconds",
+                "0.05",
+                "--max-ticks",
+                "10",
+                "--required-capabilities-known",
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    payload = _json_stdout(capsys)
+    assert payload["state"] == "completed"
+    assert payload["process_pid"] is None
+    persisted = SupervisorSnapshot.model_validate_json(
+        state_path.read_text(encoding="utf-8")
+    )
+    assert persisted.phase is SupervisorPhase.COMPLETED
+    assert persisted.claim is None
+    assert json.loads(environment_marker.read_text(encoding="utf-8")) == {
+        "docker_host": "ssh://docker.example",
+        "unrelated": None,
+    }
+    durable_files = "".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in tmp_path.rglob("*")
+        if path.is_file() and path != environment_marker
+    )
+    assert "ssh://docker.example" not in durable_files
+    assert "must-not-leak" not in durable_files
+
+
 def test_supervise_merges_busy_project_safety_before_tick(
     tmp_path, capsys, monkeypatch
 ) -> None:
@@ -632,6 +745,7 @@ def test_supervise_merges_busy_project_safety_before_tick(
 
         def tick(self, activity) -> None:
             self.activity = activity
+            return self.snapshot
 
         def shutdown(self) -> None:
             self.snapshot = self.snapshot.model_copy(
@@ -775,6 +889,20 @@ def test_supervise_routes_capsule_required_and_mirror_adapters(
             conversation_id="conversation-0",
             generation=0,
             event_type=EventType.SESSION_STARTED,
+            timestamp=datetime.now(tz=timezone.utc),
+            cwd=tmp_path,
+            owner_pid=os.getpid(),
+        )
+    )
+    EventLedger(lifecycle_path).append(
+        LifecycleEvent(
+            schema_version=1,
+            event_id="handoff-requested",
+            runtime="codex",
+            chain_id="chain-1",
+            conversation_id="conversation-0",
+            generation=0,
+            event_type=EventType.HANDOFF_REQUESTED,
             timestamp=datetime.now(tz=timezone.utc),
             cwd=tmp_path,
             owner_pid=os.getpid(),

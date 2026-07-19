@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass, field
+from enum import Enum
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -52,6 +54,24 @@ _BASE_ENVIRONMENT = frozenset(
         "XDG_STATE_HOME",
     }
 )
+_ENVIRONMENT_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_ENVIRONMENT_PREFIX = "AGENT_SESSION_HARNESS_"
+
+
+class ExitReason(str, Enum):
+    NATURAL = "natural"
+    SUPERVISOR_STOP = "supervisor_stop"
+    WATCHDOG_EXPIRED = "watchdog_expired"
+    STATE_INVALID = "state_invalid"
+    PROCESS_GROUP_UNVERIFIED = "process_group_unverified"
+    UNKNOWN = "unknown"
+
+
+class ProcessExit(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    return_code: int
+    reason: ExitReason
 
 
 class _DarwinProcessInfo(ctypes.Structure):
@@ -93,6 +113,7 @@ class LaunchRequest(BaseModel):
     executable: str = Field(min_length=1)
     runtime_args: tuple[str, ...] = ()
     environment: dict[str, str] = Field(default_factory=dict)
+    allowed_environment_keys: frozenset[str] = frozenset()
     capsule_path: Path | None = None
     capsule_fingerprint: str | None = None
     handoff_message: str | None = Field(default=None, max_length=500)
@@ -122,6 +143,26 @@ class LaunchRequest(BaseModel):
             )
         if rejected:
             raise ValueError("fresh successor launch cannot contain resume arguments")
+        invalid_keys = [
+            key
+            for key in self.allowed_environment_keys
+            if _ENVIRONMENT_KEY.fullmatch(key) is None
+        ]
+        if invalid_keys:
+            raise ValueError(
+                f"invalid allowed launch environment key: {invalid_keys[0]}"
+            )
+        reserved_keys = sorted(
+            key
+            for key in self.allowed_environment_keys
+            if key.startswith(_RESERVED_ENVIRONMENT_PREFIX)
+        )
+        if reserved_keys:
+            raise ValueError(
+                f"reserved allowed launch environment key: {reserved_keys[0]}"
+            )
+        if not self.allowed_environment_keys.issubset(self.environment):
+            raise ValueError("allowed launch environment keys must have values")
         return self
 
 
@@ -142,6 +183,10 @@ class ProcessDriver(Protocol):
     def graceful_stop(self, process: ManagedProcess, timeout_seconds: float) -> int: ...
 
     def is_alive(self, process: ManagedProcess) -> bool: ...
+
+    def exit_status(self, process: ManagedProcess) -> ProcessExit | None: ...
+
+    def clear_exit_status(self, process: ManagedProcess) -> None: ...
 
 
 class PosixProcessDriver:
@@ -166,19 +211,30 @@ class PosixProcessDriver:
         argv = [request.executable, *request.runtime_args]
         if request.handoff_message:
             argv.append(request.handoff_message)
+        request_environment = dict(request.environment)
+        request_environment.update(
+            {
+                "AGENT_SESSION_HARNESS_MANAGED": "1",
+                "AGENT_SESSION_HARNESS_CHAIN_ID": request.chain_id,
+                "AGENT_SESSION_HARNESS_GENERATION": str(request.generation),
+            }
+        )
         command_digest = hashlib.sha256(
             json.dumps(
-                {"argv": argv, "cwd": str(request.cwd)},
+                {
+                    "argv": argv,
+                    "cwd": str(request.cwd),
+                    "environment_fingerprint": self._environment_fingerprint(
+                        request_environment
+                    ),
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        environment = self._environment(request.environment)
-        environment.setdefault("AGENT_SESSION_HARNESS_MANAGED", "1")
-        environment.setdefault("AGENT_SESSION_HARNESS_CHAIN_ID", request.chain_id)
-        environment.setdefault(
-            "AGENT_SESSION_HARNESS_GENERATION",
-            str(request.generation),
+        environment = self._environment(
+            request_environment,
+            allowed_keys=request.allowed_environment_keys,
         )
         handle: subprocess.Popen[bytes] | None = None
 
@@ -358,6 +414,46 @@ class PosixProcessDriver:
             raise RuntimeError("restored process identity cannot be verified")
         return current_identity == process.identity
 
+    def exit_status(self, process: ManagedProcess) -> ProcessExit | None:
+        if process.handle is not None:
+            status = process.handle.poll()
+            if status is None:
+                return None
+        path = self._registry_path(process.registry_key).with_suffix(".exit.json")
+        if not private_exists(path):
+            return None
+        try:
+            payload = json.loads(read_private_text(path))
+            if (
+                payload.get("registry_key") != process.registry_key
+                or payload.get("identity") != process.identity
+                or payload.get("command_digest") != process.command_digest
+                or payload.get("launch_nonce") != process.launch_nonce
+            ):
+                return None
+            return ProcessExit(
+                return_code=int(payload["return_code"]),
+                reason=payload.get("reason", ExitReason.UNKNOWN.value),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            return None
+
+    def clear_exit_status(self, process: ManagedProcess) -> None:
+        path = self._registry_path(process.registry_key).with_suffix(".exit.json")
+        with exclusive_lock(
+            self._registry_path(process.registry_key).with_suffix(".lock")
+        ):
+            if not private_exists(path):
+                return
+            payload = json.loads(read_private_text(path))
+            if (
+                payload.get("registry_key") == process.registry_key
+                and payload.get("identity") == process.identity
+                and payload.get("command_digest") == process.command_digest
+                and payload.get("launch_nonce") == process.launch_nonce
+            ):
+                private_unlink(path)
+
     @staticmethod
     def _pid_exists(pid: int) -> bool:
         try:
@@ -511,12 +607,17 @@ class PosixProcessDriver:
         return None
 
     @staticmethod
-    def _environment(overrides: dict[str, str]) -> dict[str, str]:
+    def _environment(
+        overrides: dict[str, str],
+        *,
+        allowed_keys: frozenset[str] = frozenset(),
+    ) -> dict[str, str]:
         invalid = [
             key
             for key in overrides
             if key not in _BASE_ENVIRONMENT
             and not key.startswith("AGENT_SESSION_HARNESS_")
+            and key not in allowed_keys
         ]
         if invalid:
             raise ValueError(f"launch environment key is not allowlisted: {invalid[0]}")
@@ -525,6 +626,16 @@ class PosixProcessDriver:
         }
         environment.update(overrides)
         return environment
+
+    @staticmethod
+    def _environment_fingerprint(environment: dict[str, str]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                sorted(environment.items()),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
     def _same_process(left: ManagedProcess, right: ManagedProcess) -> bool:
@@ -600,6 +711,39 @@ def unregister_guarded_process(
             process,
         ):
             private_unlink(registry_path)
+
+
+def record_guarded_exit(
+    *,
+    registry_path: Path,
+    process: ManagedProcess,
+    terminal: ProcessExit,
+) -> None:
+    """Persist a guardian's exact terminal status before removing its registry."""
+
+    with exclusive_lock(registry_path.with_suffix(".lock")):
+        registered = PosixProcessDriver._read_registry(
+            registry_path,
+            process.registry_key,
+        )
+        if registered is None or not PosixProcessDriver._same_process(
+            registered,
+            process,
+        ):
+            raise RuntimeError("cannot record exit for a superseded guardian")
+        _atomic_private_json(
+            registry_path.with_suffix(".exit.json"),
+            {
+                "schema_version": 1,
+                "pid": process.pid,
+                "registry_key": process.registry_key,
+                "identity": process.identity,
+                "command_digest": process.command_digest,
+                "launch_nonce": process.launch_nonce,
+                "return_code": terminal.return_code,
+                "reason": terminal.reason.value,
+            },
+        )
 
 
 def _atomic_private_json(path: Path, payload: dict[str, object]) -> None:

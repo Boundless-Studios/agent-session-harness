@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 import time
 
+import pytest
+
 from agent_coordinator import JsonlClaimStore, TaskCoordinator
 
 from agent_session_harness.activity import Quiescence
@@ -53,16 +55,30 @@ class RolloutUsageReader:
 class CapsuleFileAdapter:
     name = "capsule-file"
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, fail_acknowledgement: bool = False):
         self.path = path
         self.calls: list[AdapterOperation] = []
+        self.fail_acknowledgement = fail_acknowledgement
 
     def execute(self, request) -> AdapterResponse:
         self.calls.append(request.operation)
+        if (
+            request.operation is AdapterOperation.ACKNOWLEDGE
+            and self.fail_acknowledgement
+        ):
+            return AdapterResponse(
+                ok=False,
+                fingerprint=None,
+                retryable=True,
+                error="required adapter unavailable",
+            )
         if request.operation is AdapterOperation.WRITE:
             self.path.write_bytes(request.capsule.canonical_bytes() + b"\n")
             fingerprint = request.capsule.fingerprint
-        elif request.operation is AdapterOperation.READ:
+        elif request.operation in {
+            AdapterOperation.READ,
+            AdapterOperation.ACKNOWLEDGE,
+        }:
             stored = HandoffCapsule.model_validate_json(
                 self.path.read_text(encoding="utf-8")
             )
@@ -83,9 +99,12 @@ class CapsuleFileAdapter:
 
 
 class CapsuleManager:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, fail_acknowledgement: bool = False):
         self.root = root
-        self.adapter = CapsuleFileAdapter(root / "capsule.json")
+        self.adapter = CapsuleFileAdapter(
+            root / "capsule.json",
+            fail_acknowledgement=fail_acknowledgement,
+        )
         self.manager = CheckpointManager(
             required_adapters=(self.adapter,),
             mirror_adapters=(),
@@ -126,6 +145,12 @@ class CapsuleManager:
             fingerprint=result.fingerprint,
             path=self.adapter.path,
         )
+
+    def acknowledge(self, capsule, *, idempotency_key) -> bool:
+        return self.manager.acknowledge(
+            capsule,
+            idempotency_key=idempotency_key,
+        ).verified
 
 
 def _wait_for(path: Path, *, timeout: float = 5.0) -> None:
@@ -288,6 +313,7 @@ def test_fake_runtime_rotates_once_to_a_fresh_acknowledged_successor(tmp_path) -
         assert checkpoint_manager.adapter.calls == [
             AdapterOperation.WRITE,
             AdapterOperation.READ,
+            AdapterOperation.ACKNOWLEDGE,
         ]
         assert len(checkpoint_events) == 1
         assert len(acknowledgement_events) == 1
@@ -311,3 +337,55 @@ def test_fake_runtime_rotates_once_to_a_fresh_acknowledged_successor(tmp_path) -
         process = supervisor.current_process
         if process is not None and driver.is_alive(process):
             driver.graceful_stop(process, 2)
+
+
+def test_successor_cannot_run_when_required_ack_adapter_is_unavailable(
+    tmp_path,
+) -> None:
+    state_path = tmp_path / "supervisor.json"
+    ledger = EventLedger(state_path.with_suffix(state_path.suffix + ".lifecycle"))
+    driver = PosixProcessDriver(tmp_path / "process-state")
+    checkpoint_manager = CapsuleManager(tmp_path, fail_acknowledgement=True)
+    supervisor = Supervisor(
+        runtime="codex",
+        chain_id="chain-required-ack",
+        cwd=tmp_path,
+        task_type="linear",
+        task_id="BOU-2195",
+        task_fingerprint="task-fingerprint",
+        executable=sys.executable,
+        runtime_args=(str(FAKE_RUNTIME), "--root", str(tmp_path)),
+        state_path=state_path,
+        process_driver=driver,
+        usage_reader=RolloutUsageReader(tmp_path),
+        checkpoint_manager=checkpoint_manager,
+        coordinator=CoordinatorAdapter(
+            TaskCoordinator(
+                JsonlClaimStore(tmp_path / "claims.jsonl"),
+                pid_is_live=lambda _pid: True,
+            )
+        ),
+        stop_timeout_seconds=2,
+    )
+
+    try:
+        supervisor.start()
+        rollout_path = tmp_path / "rollout-0.jsonl"
+        _wait_for(rollout_path)
+        busy = _wait_for_quiescence(ledger, Quiescence.BUSY)
+        supervisor.tick(busy)
+        _set_context_tokens(rollout_path, total_tokens=140)
+        assert supervisor.tick(busy).phase.value == "draining"
+        (tmp_path / "finish-activity-0").write_text("finish\n", encoding="utf-8")
+        idle = _wait_for_quiescence(ledger, Quiescence.IDLE)
+        assert supervisor.tick(idle).phase.value == "awaiting_ack"
+        _wait_for(acknowledgement_path(state_path))
+
+        assert not (tmp_path / "continuations.jsonl").exists()
+        with pytest.raises(RuntimeError, match="required checkpoint acknowledgement"):
+            supervisor.tick(idle)
+        time.sleep(0.1)
+        assert supervisor.snapshot.phase.value == "awaiting_ack"
+        assert not (tmp_path / "continuations.jsonl").exists()
+    finally:
+        supervisor.shutdown()

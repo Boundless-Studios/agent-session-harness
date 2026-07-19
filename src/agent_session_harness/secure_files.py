@@ -132,10 +132,18 @@ def read_private_text(
     path: str | os.PathLike[str],
     *,
     encoding: str = "utf-8",
+    max_bytes: int | None = None,
 ) -> str:
+    if max_bytes is not None and max_bytes <= 0:
+        raise ValueError("private read byte bound must be positive")
     descriptor = _open_private(Path(path), os.O_RDONLY)
     with os.fdopen(descriptor, "r", encoding=encoding) as handle:
-        return handle.read()
+        if max_bytes is None:
+            return handle.read()
+        encoded = handle.buffer.read(max_bytes + 1)
+        if len(encoded) > max_bytes:
+            raise ValueError(f"private file exceeds {max_bytes} bytes")
+        return encoded.decode(encoding)
 
 
 def private_file_mode(path: str | os.PathLike[str]) -> int:

@@ -38,6 +38,7 @@ from .native import (
 MAX_INPUT_BYTES = 1_048_576
 SUCCESSOR_READY_TIMEOUT_SECONDS = 2.0
 SUCCESSOR_READY_POLL_SECONDS = 0.02
+SUCCESSOR_ACK_TIMEOUT_SECONDS = 30.0
 
 
 class StopRequestMarker(BaseModel):
@@ -60,7 +61,7 @@ def run_hook(
 ) -> int:
     environment = environ if environ is not None else os.environ
     if environment.get("AGENT_SESSION_HARNESS_MANAGED") != "1":
-        raise RuntimeError("hook requires managed harness mode")
+        return 0
     encoded = stdin.read(MAX_INPUT_BYTES + 1)
     if len(encoded.encode("utf-8")) > MAX_INPUT_BYTES:
         raise ValueError("native hook input is too large")
@@ -165,6 +166,42 @@ def _acknowledge_verified_successor(
         ):
             return
         raise
+    _await_durable_acknowledgement(
+        state_path,
+        event=event,
+        fingerprint=values[1],
+        capsule_path=capsule_path,
+    )
+
+
+def _await_durable_acknowledgement(
+    state_path: Path,
+    *,
+    event: LifecycleEvent,
+    fingerprint: str,
+    capsule_path: Path,
+) -> None:
+    deadline = time.monotonic() + SUCCESSOR_ACK_TIMEOUT_SECONDS
+    while True:
+        snapshot = _read_snapshot(state_path)
+        if (
+            snapshot.phase is SupervisorPhase.RUNNING
+            and snapshot.runtime is event.runtime
+            and snapshot.chain_id == event.chain_id
+            and snapshot.generation == event.generation
+            and snapshot.process_pid == event.owner_pid
+            and snapshot.conversation_id == event.conversation_id
+            and snapshot.checkpoint_fingerprint == fingerprint
+            and snapshot.checkpoint_path == capsule_path
+        ):
+            return
+        if snapshot.phase is not SupervisorPhase.AWAITING_ACK:
+            raise RuntimeError(
+                "managed successor durable acknowledgement was not accepted"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError("managed successor durable acknowledgement timed out")
+        time.sleep(SUCCESSOR_READY_POLL_SECONDS)
 
 
 def _await_successor_snapshot(

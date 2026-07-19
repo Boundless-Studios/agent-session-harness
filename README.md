@@ -107,7 +107,9 @@ agent-session-harness supervise \
   --json
 ```
 
-The supervisor runs until interrupted. `--max-ticks` exists for bounded automation and tests. A terminal exit stops the managed child, fences its claim, and persists `blocked` rather than leaving an unowned agent running. `blocked` is terminal for that run specification: after resolving retained ownership, start a new chain and state path instead of reusing or resuming it.
+The supervisor runs until interrupted. `--max-ticks` exists for bounded automation and tests. Only a status-zero exit recorded by the guardian as natural, after its descendant process group is drained and verified, fences its claim and persists `completed`; forced, nonzero, unverified, or premature successor exits fail closed as `blocked`. Interrupting the supervisor records an explicit supervisor-stop reason, stops the managed child, fences its claim, and also persists `blocked` rather than leaving an unowned agent running. `blocked` is terminal for that run specification: after resolving retained ownership, start a new chain and state path instead of reusing or resuming it.
+
+Managed runtimes inherit a deliberately small base environment. A host can preserve an audited operational key without placing its value in argv, logs, or supervisor state by repeating `--runtime-env KEY`; unrelated ambient variables remain absent. Harness-control keys are reserved, and opaque value digests bind the immutable run and process specifications without persisting their plaintext values.
 
 The long-lived integration surface is `agent_session_harness.supervisor.Supervisor`. A host supplies four small protocols: native usage reader, checkpoint manager, fenced coordinator, and process driver. This keeps Linear, beads, PR dashboards, worktree launchers, and project safety policy outside the reusable package. The deterministic E2E test uses a real child process and proves root → checkpoint → fence → stop → fresh successor → acknowledgement with no overlap.
 
@@ -142,7 +144,7 @@ They return one bounded object:
 }
 ```
 
-Required adapters must pass `write` and independent `read` fingerprint checks. Mirror failures go to a locked `0600` outbox and can be retried later:
+Required adapters must pass `write` and independent `read` fingerprint checks, then return the same fingerprint for the successor's `acknowledge` operation before dispatch resumes. Mirror failures go to a size-bounded, locked `0600` outbox. Managed supervision makes one fail-open replay attempt at startup and after each safe tick; operators can explicitly replay a batch of up to 100 oldest entries:
 
 ```bash
 agent-session-harness outbox replay \
@@ -233,7 +235,7 @@ agent-session-harness hooks check \
   --runtime codex --path .codex/hooks.json --json
 ```
 
-`--dry-run` and `hooks uninstall` are supported. Invalid JSON is never mutated. Hook execution requires `AGENT_SESSION_HARNESS_MANAGED=1`, writes only to the local lifecycle ledger, performs no network work, and applies a 1 MiB input bound.
+`--dry-run` and `hooks uninstall` are supported. Invalid JSON is never mutated. Unmanaged hook invocations are silent no-ops. Managed hook execution requires `AGENT_SESSION_HARNESS_MANAGED=1`, writes only local lifecycle/acknowledgement state, performs no network work, and applies a 1 MiB input bound. A successor's `SessionStart` hook remains blocked until the supervisor has durably acknowledged every required checkpoint adapter; it cannot continue the handed-off action on a merely local acknowledgement.
 
 At a Stop event, normal sessions are allowed to stop. A draining session receives one continuation request listing the configured durable checkpoints. A recursion marker prevents repeated blocking. Once the capsule fingerprint is verified, Stop is allowed immediately.
 

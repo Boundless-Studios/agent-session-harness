@@ -53,6 +53,12 @@ def test_install_check_upgrade_and_uninstall_preserve_unrelated_hooks(
     assert installed["custom"] == original["custom"]
     assert installed["hooks"]["PreToolUse"][0] == original["hooks"]["PreToolUse"][0]
     assert installed["hooks"]["Stop"][0] == original["hooks"]["Stop"][0]
+    session_start_timeout = installed["hooks"]["SessionStart"][-1]["hooks"][0][
+        "timeout"
+    ]
+    stop_timeout = installed["hooks"]["Stop"][-1]["hooks"][0]["timeout"]
+    assert session_start_timeout >= 30
+    assert session_start_timeout > stop_timeout
     assert stat.S_IMODE(path.stat().st_mode) == 0o640
     assert path.with_suffix(path.suffix + ".agent-session-harness.bak").exists()
 

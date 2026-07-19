@@ -35,7 +35,11 @@ def _modules():
     return process, supervisor
 
 
-def _activity(quiescence: Quiescence) -> ActivitySnapshot:
+def _activity(
+    quiescence: Quiescence,
+    *,
+    handoff_requested_generations: frozenset[int] = frozenset(),
+) -> ActivitySnapshot:
     active = frozenset({"active"}) if quiescence is Quiescence.BUSY else frozenset()
     return ActivitySnapshot(
         quiescence=quiescence,
@@ -46,6 +50,14 @@ def _activity(quiescence: Quiescence) -> ActivitySnapshot:
         processed_event_count=1,
         last_event_at=NOW,
         integrity_warnings=(),
+        handoff_requested_generations=handoff_requested_generations,
+    )
+
+
+def _handoff_activity(quiescence: Quiescence = Quiescence.IDLE) -> ActivitySnapshot:
+    return _activity(
+        quiescence,
+        handoff_requested_generations=frozenset({0}),
     )
 
 
@@ -54,22 +66,32 @@ class FakeUsageReader:
         self.supervisor_module = supervisor_module
         self.percent = percent
         self.confident = confident
+        self.conversation_id = "native-conversation-0"
 
     def sample(self, _process):
         return self.supervisor_module.UsageObservation(
-            conversation_id="native-conversation-0",
+            conversation_id=self.conversation_id,
             context_percent=self.percent,
             confidence=(Confidence.CONFIDENT if self.confident else Confidence.UNKNOWN),
         )
 
 
 class FakeCheckpointManager:
-    def __init__(self, supervisor_module, root, *, crash_once=False):
+    def __init__(
+        self,
+        supervisor_module,
+        root,
+        *,
+        crash_once=False,
+        acknowledge_verified=True,
+    ):
         self.supervisor_module = supervisor_module
         self.root = root
         self.crash_once = crash_once
         self.receipts = {}
         self.calls = []
+        self.acknowledge_calls = []
+        self.acknowledge_verified = acknowledge_verified
 
     def checkpoint(self, request):
         self.calls.append(request.idempotency_key)
@@ -109,6 +131,10 @@ class FakeCheckpointManager:
             self.crash_once = False
             raise RuntimeError("checkpoint crash")
         return receipt
+
+    def acknowledge(self, capsule, *, idempotency_key):
+        self.acknowledge_calls.append((capsule.fingerprint, idempotency_key))
+        return self.acknowledge_verified
 
 
 class FakeCoordinator:
@@ -183,9 +209,14 @@ class FakeProcessDriver:
         self.active_pids = set()
         self.max_active = 0
         self.calls = []
+        self.requests = []
         self.crash_effect = crash_effect
+        self.exit_records = {}
+        self.exit_status_error = None
+        self.cleared_exit_records = []
 
     def start_fresh(self, request):
+        self.requests.append(request)
         self.calls.append(("start", request.generation, request.runtime_args))
         process = self.processes.get(request.generation)
         if process is None:
@@ -216,6 +247,15 @@ class FakeProcessDriver:
 
     def is_alive(self, process):
         return process.pid in self.active_pids
+
+    def exit_status(self, process):
+        if self.exit_status_error is not None:
+            raise self.exit_status_error
+        return self.exit_records.get(process.pid)
+
+    def clear_exit_status(self, process):
+        self.cleared_exit_records.append(process.pid)
+        self.exit_records.pop(process.pid, None)
 
 
 def _supervisor(
@@ -281,7 +321,7 @@ def test_fresh_launch_rejects_native_resume_arguments(tmp_path, runtime, args) -
 
 
 def test_controlled_launch_environment_preserves_cli_identity_and_rejects_noise(
-    monkeypatch,
+    tmp_path, monkeypatch
 ) -> None:
     process, _supervisor_module = _modules()
     monkeypatch.setenv("HOME", "/tmp/fake-home")
@@ -295,6 +335,33 @@ def test_controlled_launch_environment_preserves_cli_identity_and_rejects_noise(
     assert "UNRELATED_PRIVATE_VALUE" not in environment
     with pytest.raises(ValueError, match="allowlisted"):
         process.PosixProcessDriver._environment({"UNRELATED_PRIVATE_VALUE": "x"})
+
+    runtime_environment = process.PosixProcessDriver._environment(
+        {"DOCKER_HOST": "ssh://docker.example"},
+        allowed_keys=frozenset({"DOCKER_HOST"}),
+    )
+    assert runtime_environment["DOCKER_HOST"] == "ssh://docker.example"
+
+    with pytest.raises(ValueError, match="must have values"):
+        process.LaunchRequest(
+            runtime="codex",
+            chain_id="chain-1",
+            generation=0,
+            cwd=tmp_path,
+            executable="codex",
+            allowed_environment_keys=frozenset({"DOCKER_HOST"}),
+        )
+
+    with pytest.raises(ValueError, match="reserved"):
+        process.LaunchRequest(
+            runtime="codex",
+            chain_id="chain-1",
+            generation=0,
+            cwd=tmp_path,
+            executable="codex",
+            environment={"AGENT_SESSION_HARNESS_STATE_PATH": "/tmp/wrong"},
+            allowed_environment_keys=frozenset({"AGENT_SESSION_HARNESS_STATE_PATH"}),
+        )
 
 
 def test_restored_process_identity_fails_closed_on_pid_reuse(
@@ -392,9 +459,180 @@ def test_launch_guardian_exec_failure_is_not_reported_as_active(tmp_path) -> Non
         driver.start_fresh(request)
 
 
+def test_guardian_persists_clean_exit_status_for_supervisor_recovery(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    driver = process.PosixProcessDriver(tmp_path)
+    request = process.LaunchRequest(
+        runtime="codex",
+        chain_id="chain-clean-exit",
+        generation=0,
+        cwd=tmp_path,
+        executable=sys.executable,
+        runtime_args=("-c", "import time; time.sleep(0.2)"),
+    )
+    managed = driver.start_fresh(request)
+    recovered = process.ManagedProcess(
+        pid=managed.pid,
+        process_group_id=managed.process_group_id,
+        registry_key=managed.registry_key,
+        identity=managed.identity,
+        command_digest=managed.command_digest,
+        launch_nonce=managed.launch_nonce,
+    )
+
+    deadline = time.monotonic() + 3
+    while driver.is_alive(managed):
+        if time.monotonic() >= deadline:
+            raise AssertionError("guardian did not exit")
+        time.sleep(0.02)
+
+    terminal = process.PosixProcessDriver(tmp_path).exit_status(recovered)
+    assert terminal is not None
+    assert terminal.return_code == 0
+    assert terminal.reason is process.ExitReason.NATURAL
+
+
+def test_guardian_marks_watchdog_termination_even_when_child_exits_zero(
+    tmp_path,
+) -> None:
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    state_path = tmp_path / "supervisor.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "claim": {},
+                "chain_id": "chain-watchdog",
+                "generation": 0,
+                "phase": "blocked",
+                "process_pid": None,
+                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal,sys,time; "
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                "time.sleep(30)"
+            ),
+        ],
+        start_new_session=True,
+    )
+    time.sleep(0.05)
+
+    terminal = guardian._watch_child(
+        child,
+        process_pid=99999,
+        chain_id="chain-watchdog",
+        generation=0,
+        state_path=state_path,
+        timeout_seconds=1,
+    )
+
+    assert terminal.return_code == 0
+    assert terminal.reason is process.ExitReason.STATE_INVALID
+
+
+def test_guardian_marks_an_intentional_supervisor_stop(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal,sys,time; "
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                "time.sleep(30)"
+            ),
+        ],
+        start_new_session=True,
+    )
+    time.sleep(0.05)
+    state_path = tmp_path / "supervisor.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "claim": {"owner_session_id": "chain-stop:0"},
+                "chain_id": "chain-stop",
+                "generation": 0,
+                "phase": "blocked",
+                "process_pid": 99999,
+                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+
+    terminal = guardian._watch_child(
+        child,
+        process_pid=99999,
+        chain_id="chain-stop",
+        generation=0,
+        state_path=state_path,
+        timeout_seconds=1,
+    )
+
+    assert terminal.return_code == 0
+    assert terminal.reason is process.ExitReason.SUPERVISOR_STOP
+
+
+def test_guardian_drains_descendants_before_recording_natural_exit(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    runtime = tmp_path / "runtime.py"
+    descendant_marker = tmp_path / "descendant.pid"
+    runtime.write_text(
+        "import pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import time; time.sleep(30)'])\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid))\n"
+        "time.sleep(0.2)\n",
+        encoding="utf-8",
+    )
+    driver = process.PosixProcessDriver(tmp_path / "process-state")
+    request = process.LaunchRequest(
+        runtime="codex",
+        chain_id="chain-descendants",
+        generation=0,
+        cwd=tmp_path,
+        executable=sys.executable,
+        runtime_args=(str(runtime), str(descendant_marker)),
+    )
+    managed = driver.start_fresh(request)
+    deadline = time.monotonic() + 5
+    while not descendant_marker.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("runtime did not publish descendant PID")
+        time.sleep(0.02)
+    descendant_pid = int(descendant_marker.read_text(encoding="utf-8"))
+    try:
+        while driver.is_alive(managed):
+            if time.monotonic() >= deadline:
+                raise AssertionError("guardian did not exit")
+            time.sleep(0.02)
+        while process.PosixProcessDriver._pid_exists(descendant_pid):
+            if time.monotonic() >= deadline:
+                raise AssertionError("guardian left a descendant alive")
+            time.sleep(0.02)
+    finally:
+        if process.PosixProcessDriver._pid_exists(descendant_pid):
+            os.kill(descendant_pid, signal.SIGKILL)
+
+    terminal = driver.exit_status(managed)
+    assert terminal is not None
+    assert terminal.reason is process.ExitReason.NATURAL
+
+
 def test_recent_unspawned_launch_intent_recovers_in_the_same_call(tmp_path) -> None:
     process, _supervisor_module = _modules()
-    driver = process.PosixProcessDriver(tmp_path, startup_timeout_seconds=0.1)
+    driver = process.PosixProcessDriver(tmp_path, startup_timeout_seconds=0.5)
     request = process.LaunchRequest(
         runtime="codex",
         chain_id="chain-recent-intent",
@@ -407,11 +645,25 @@ def test_recent_unspawned_launch_intent_recovers_in_the_same_call(tmp_path) -> N
     registry_path = driver._registry_path(key)
     intent_path = registry_path.with_suffix(".intent")
     argv = [request.executable, *request.runtime_args]
+    effective_environment = {
+        **request.environment,
+        "AGENT_SESSION_HARNESS_MANAGED": "1",
+        "AGENT_SESSION_HARNESS_CHAIN_ID": request.chain_id,
+        "AGENT_SESSION_HARNESS_GENERATION": str(request.generation),
+    }
     command_digest = (
         __import__("hashlib")
         .sha256(
             json.dumps(
-                {"argv": argv, "cwd": str(request.cwd)},
+                {
+                    "argv": argv,
+                    "cwd": str(request.cwd),
+                    "environment_fingerprint": (
+                        process.PosixProcessDriver._environment_fingerprint(
+                            effective_environment
+                        )
+                    ),
+                },
                 sort_keys=True,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -588,7 +840,12 @@ def test_supervisor_warns_drains_waits_then_rotates_without_overlap(tmp_path) ->
     managed.usage_reader.percent = 10.0
     assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
 
-    awaiting = managed.tick(_activity(Quiescence.IDLE))
+    awaiting = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_generations=frozenset({0}),
+        )
+    )
 
     assert awaiting.phase.value == "awaiting_ack"
     assert awaiting.generation == 1
@@ -601,12 +858,61 @@ def test_supervisor_warns_drains_waits_then_rotates_without_overlap(tmp_path) ->
     assert "--continue" not in driver.calls[-1][2]
 
 
+def test_idle_at_rotation_threshold_waits_for_post_drain_handoff_request(
+    tmp_path,
+) -> None:
+    managed, _kwargs, driver, _coordinator, checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+
+    draining = managed.tick(_activity(Quiescence.IDLE))
+
+    assert draining.phase.value == "draining"
+    assert checkpoints.calls == []
+    assert [call[0] for call in driver.calls] == ["start"]
+
+    awaiting = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_generations=frozenset({0}),
+        )
+    )
+
+    assert awaiting.phase.value == "awaiting_ack"
+    assert len(checkpoints.calls) == 1
+
+
+def test_unknown_usage_during_drain_preserves_owner_and_blocks_checkpoint(
+    tmp_path,
+) -> None:
+    managed, _kwargs, driver, _coordinator, checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+    draining = managed.tick(_activity(Quiescence.BUSY))
+    assert draining.conversation_id == "native-conversation-0"
+
+    managed.usage_reader.confident = False
+    managed.usage_reader.conversation_id = "unresolved"
+    still_draining = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_generations=frozenset({0}),
+        )
+    )
+
+    assert still_draining.phase.value == "draining"
+    assert still_draining.conversation_id == "native-conversation-0"
+    assert still_draining.context_confidence is Confidence.UNKNOWN
+    assert checkpoints.calls == []
+    assert [call[0] for call in driver.calls] == ["start"]
+
+
 def test_successor_acknowledgement_requires_expected_generation_and_fingerprint(
     tmp_path,
 ) -> None:
     managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
     managed.start()
-    snapshot = managed.tick(_activity(Quiescence.IDLE))
+    snapshot = managed.tick(_handoff_activity())
 
     with pytest.raises(ValueError, match="fingerprint"):
         managed.acknowledge(
@@ -632,6 +938,29 @@ def test_successor_acknowledgement_requires_expected_generation_and_fingerprint(
     assert running.phase.value == "running"
     assert running.conversation_id == "native-conversation-1"
     assert managed.can_dispatch is True
+    assert _checkpoints.acknowledge_calls == [
+        (snapshot.checkpoint_fingerprint, "chain-1:1:ack")
+    ]
+
+
+def test_required_checkpoint_acknowledgement_blocks_running_transition(
+    tmp_path,
+) -> None:
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(tmp_path)
+    checkpoints.acknowledge_verified = False
+    managed.start()
+    snapshot = managed.tick(_handoff_activity())
+
+    with pytest.raises(RuntimeError, match="required checkpoint acknowledgement"):
+        managed.acknowledge(
+            generation=1,
+            fingerprint=snapshot.checkpoint_fingerprint,
+            conversation_id="native-conversation-1",
+            owner_pid=1001,
+        )
+
+    assert managed.snapshot.phase.value == "awaiting_ack"
+    assert managed.can_dispatch is False
 
 
 def test_successor_acknowledgement_is_bound_to_child_pid_and_heartbeats_claim(
@@ -639,7 +968,7 @@ def test_successor_acknowledgement_is_bound_to_child_pid_and_heartbeats_claim(
 ) -> None:
     managed, _kwargs, _driver, coordinator, _checkpoints = _supervisor(tmp_path)
     managed.start()
-    snapshot = managed.tick(_activity(Quiescence.IDLE))
+    snapshot = managed.tick(_handoff_activity())
 
     with pytest.raises(ValueError, match="process"):
         managed.acknowledge(
@@ -662,7 +991,7 @@ def test_successor_acknowledgement_is_bound_to_child_pid_and_heartbeats_claim(
 def test_successor_acknowledgement_rejects_tampered_capsule(tmp_path) -> None:
     managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
     managed.start()
-    snapshot = managed.tick(_activity(Quiescence.IDLE))
+    snapshot = managed.tick(_handoff_activity())
     assert snapshot.checkpoint_path is not None
     snapshot.checkpoint_path.write_text('{"tampered":true}\n', encoding="utf-8")
 
@@ -715,6 +1044,94 @@ def test_dead_managed_process_is_detected_before_more_dispatch(tmp_path) -> None
     driver.active_pids.clear()
 
     with pytest.raises(RuntimeError, match="managed process is not live"):
+        managed.tick(_handoff_activity())
+
+    assert managed.snapshot.phase.value == "blocked"
+    assert managed.can_dispatch is False
+
+
+def test_clean_managed_process_exit_completes_and_releases_claim(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    managed, _kwargs, driver, coordinator, _checkpoints = _supervisor(tmp_path)
+    started = managed.start()
+    assert started.process_pid is not None
+    driver.active_pids.clear()
+    driver.exit_records[started.process_pid] = process.ProcessExit(
+        return_code=0,
+        reason=process.ExitReason.NATURAL,
+    )
+
+    completed = managed.tick(_activity(Quiescence.IDLE))
+
+    assert completed.phase.value == "completed"
+    assert completed.claim is None
+    assert completed.process_pid is None
+    assert coordinator.active is None
+    assert managed.current_process is None
+    assert driver.cleared_exit_records == [started.process_pid]
+    assert managed.shutdown().phase.value == "completed"
+
+
+def test_nonzero_managed_process_exit_blocks_and_reports_status(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    started = managed.start()
+    assert started.process_pid is not None
+    driver.active_pids.clear()
+    driver.exit_records[started.process_pid] = process.ProcessExit(
+        return_code=17,
+        reason=process.ExitReason.NATURAL,
+    )
+
+    with pytest.raises(RuntimeError, match="status 17"):
+        managed.tick(_activity(Quiescence.IDLE))
+
+    assert managed.snapshot.phase.value == "blocked"
+
+
+def test_clean_exit_before_successor_acknowledgement_fails_closed(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    awaiting = managed.tick(_handoff_activity())
+    assert awaiting.phase.value == "awaiting_ack"
+    assert awaiting.process_pid is not None
+    driver.active_pids.clear()
+    driver.exit_records[awaiting.process_pid] = process.ProcessExit(
+        return_code=0,
+        reason=process.ExitReason.NATURAL,
+    )
+
+    with pytest.raises(RuntimeError, match="status 0"):
+        managed.tick(_handoff_activity())
+
+    assert managed.snapshot.phase.value == "blocked"
+
+
+def test_watchdog_zero_exit_never_completes(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    started = managed.start()
+    assert started.process_pid is not None
+    driver.active_pids.clear()
+    driver.exit_records[started.process_pid] = process.ProcessExit(
+        return_code=0,
+        reason=process.ExitReason.WATCHDOG_EXPIRED,
+    )
+
+    with pytest.raises(RuntimeError, match="watchdog_expired"):
+        managed.tick(_activity(Quiescence.IDLE))
+
+    assert managed.snapshot.phase is _supervisor_module.SupervisorPhase.BLOCKED
+
+
+def test_exit_status_read_failure_is_persisted_fail_closed(tmp_path) -> None:
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    driver.active_pids.clear()
+    driver.exit_status_error = OSError("exit registry unavailable")
+
+    with pytest.raises(OSError, match="registry unavailable"):
         managed.tick(_activity(Quiescence.IDLE))
 
     assert managed.snapshot.phase.value == "blocked"
@@ -728,7 +1145,7 @@ def test_stale_owner_during_fence_stops_predecessor_fail_closed(tmp_path) -> Non
     managed.start()
 
     with pytest.raises(RuntimeError, match="stale"):
-        managed.tick(_activity(Quiescence.IDLE))
+        managed.tick(_handoff_activity())
 
     assert managed.snapshot.phase.value == "blocked"
     assert driver.active_pids == set()
@@ -849,7 +1266,7 @@ def test_terminal_shutdown_stops_successor_after_launch_completion_failure(
 
     monkeypatch.setattr(managed, "_effect", fail_successor_launch_effect)
     with pytest.raises(RuntimeError, match="successor launch completion failed"):
-        managed.tick(_activity(Quiescence.IDLE))
+        managed.tick(_handoff_activity())
     monkeypatch.setattr(managed, "_effect", original_effect)
 
     snapshot = managed.shutdown()
@@ -923,6 +1340,7 @@ def test_initial_launch_recovers_without_duplicate_process(
         ("task_fingerprint", "different-task"),
         ("executable", "different-codex"),
         ("runtime_args", ("--different",)),
+        ("runtime_environment", {"DOCKER_HOST": "ssh://docker.example"}),
     ],
 )
 def test_recovery_rejects_a_different_immutable_run_spec(
@@ -938,13 +1356,45 @@ def test_recovery_rejects_a_different_immutable_run_spec(
     managed.shutdown()
 
 
+def test_recovery_rejects_changed_runtime_environment_value(tmp_path) -> None:
+    managed, kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    kwargs["runtime_environment"] = {"DOCKER_HOST": "ssh://docker-a"}
+    managed = type(managed)(**kwargs)
+    managed.start()
+
+    with pytest.raises(ValueError, match="run specification"):
+        type(managed)(
+            **{
+                **kwargs,
+                "runtime_environment": {"DOCKER_HOST": "ssh://docker-b"},
+            }
+        )
+
+    encoded = managed.state_path.read_text(encoding="utf-8")
+    assert "ssh://docker-a" not in encoded
+    assert "ssh://docker-b" not in encoded
+    managed.shutdown()
+
+
+def test_harness_control_environment_always_wins(tmp_path) -> None:
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.runtime_environment = {
+        "AGENT_SESSION_HARNESS_CHAIN_ID": "attacker-chain",
+    }
+
+    with pytest.raises(ValueError, match="reserved"):
+        managed.start()
+
+    assert driver.requests == []
+
+
 def test_acknowledgement_completion_crash_recovers_and_clears_stale_record(
     tmp_path, monkeypatch
 ) -> None:
     managed, kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
     _process_module, supervisor_module = _modules()
     managed.start()
-    snapshot = managed.tick(_activity(Quiescence.IDLE))
+    snapshot = managed.tick(_handoff_activity())
     supervisor_module.write_acknowledgement(
         state_path=managed.state_path,
         generation=1,
@@ -961,7 +1411,7 @@ def test_acknowledgement_completion_crash_recovers_and_clears_stale_record(
 
     monkeypatch.setattr(managed, "_effect", crash_after_acknowledgement)
     with pytest.raises(RuntimeError, match="acknowledgement crash"):
-        managed.tick(_activity(Quiescence.IDLE))
+        managed.tick(_handoff_activity())
 
     recovered = type(managed)(**kwargs)
     running = recovered.start()
@@ -1019,10 +1469,10 @@ def test_rotation_recovers_idempotently_after_each_effect_crash(
     )
     managed.start()
     with pytest.raises(RuntimeError, match="crash"):
-        managed.tick(_activity(Quiescence.IDLE))
+        managed.tick(_handoff_activity())
 
     recovered = type(managed)(**kwargs)
-    snapshot = recovered.tick(_activity(Quiescence.IDLE))
+    snapshot = recovered.tick(_handoff_activity())
 
     assert snapshot.phase.value == "awaiting_ack"
     assert driver.max_active == 1

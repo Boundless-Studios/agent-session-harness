@@ -12,7 +12,6 @@ import time
 from agent_session_harness.hooks.command import run_hook
 from agent_session_harness.hooks.native import normalize_native_event
 from agent_session_harness.ledger import EventLedger
-from agent_session_harness.supervisor import write_acknowledgement
 
 
 def append(path: Path, payload: dict[str, object]) -> None:
@@ -84,7 +83,26 @@ def main() -> int:
         )
         return exit_code
 
-    emit("SessionStart")
+    def session_start_hook() -> int:
+        return run_hook(
+            runtime="codex",
+            stdin=io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": conversation_id,
+                        "cwd": str(Path.cwd()),
+                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    }
+                )
+            ),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            environ=os.environ,
+        )
+
+    if session_start_hook() != 0:
+        raise RuntimeError("SessionStart hook failed")
     if generation == 0:
         emit("UserPromptSubmit", turn_id="turn-0")
         emit("PreToolUse", tool_use_id="tool-0", tool_name="fake-tool")
@@ -148,24 +166,8 @@ def main() -> int:
     )
 
     if generation > 0:
-        state_path = os.environ["AGENT_SESSION_HARNESS_STATE_PATH"]
         fingerprint = os.environ["AGENT_SESSION_HARNESS_CAPSULE_FINGERPRINT"]
         capsule_path = Path(os.environ["AGENT_SESSION_HARNESS_CAPSULE_PATH"])
-        deadline = time.monotonic() + 5
-        while True:
-            try:
-                write_acknowledgement(
-                    state_path=state_path,
-                    generation=generation,
-                    fingerprint=fingerprint,
-                    conversation_id=conversation_id,
-                    owner_pid=owner_pid,
-                )
-                break
-            except (FileNotFoundError, ValueError):
-                if time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.02)
         capsule = json.loads(capsule_path.read_text(encoding="utf-8"))
         append(
             root / "continuations.jsonl",

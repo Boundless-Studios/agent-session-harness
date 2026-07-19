@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sys
 import time
@@ -19,6 +20,7 @@ from .capsule import HandoffCapsule
 from .checkpoint import CheckpointManager as DurableCheckpointManager
 from .config import load_config
 from .coordinator import CoordinatorAdapter
+from .guardian import WATCHDOG_SHUTDOWN_MARGIN_SECONDS
 from .hooks.command import run_hook
 from .hooks.install import HookInstaller
 from .ledger import EventLedger
@@ -127,6 +129,13 @@ def _parser() -> argparse.ArgumentParser:
     supervise.add_argument("--required-capabilities-known", action="store_true")
     supervise.add_argument("--executable")
     supervise.add_argument("--runtime-arg", action="append", default=[])
+    supervise.add_argument(
+        "--runtime-env",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="inherit one explicitly named environment key into the managed runtime",
+    )
     supervise.add_argument("--usage-adapter", metavar="JSON_ARGV")
     supervise.add_argument("--capsule-adapter", metavar="JSON_ARGV")
     supervise.add_argument("--safety-adapter", metavar="JSON_ARGV")
@@ -390,6 +399,7 @@ def _run_supervise(args: argparse.Namespace) -> int:
         task_fingerprint=args.task_fingerprint,
         executable=executable,
         runtime_args=tuple(args.runtime_arg),
+        runtime_environment=_runtime_environment(args.runtime_env),
         state_path=state_path,
         process_driver=process_driver,
         usage_reader=_ExecutableUsageReader(usage_command),
@@ -403,7 +413,11 @@ def _run_supervise(args: argparse.Namespace) -> int:
     )
     ticks = 0
     interrupted = False
+    mirror_replay_error: str | None = None
     try:
+        mirror_replay_error = _replay_mirrors_fail_open(
+            checkpoint_manager.durable_manager
+        )
         started = managed.start()
         if started.phase is SupervisorPhase.BLOCKED:
             raise RuntimeError(
@@ -430,8 +444,13 @@ def _run_supervise(args: argparse.Namespace) -> int:
                         generation=managed.snapshot.generation,
                     ),
                 )
-            managed.tick(activity)
+            snapshot = managed.tick(activity)
             ticks += 1
+            if snapshot.phase is SupervisorPhase.COMPLETED:
+                break
+            replay_error = _replay_mirrors_fail_open(checkpoint_manager.durable_manager)
+            if replay_error is not None:
+                mirror_replay_error = replay_error
     except KeyboardInterrupt:
         interrupted = True
     finally:
@@ -449,6 +468,7 @@ def _run_supervise(args: argparse.Namespace) -> int:
         "generation": snapshot.generation,
         "process_pid": snapshot.process_pid,
         "interrupted": interrupted,
+        "mirror_replay_error": mirror_replay_error,
     }
     _emit(payload, json_output=args.json_output)
     return 130 if interrupted else 0
@@ -614,6 +634,17 @@ class _ExecutableCheckpointManager:
             path=path,
         )
 
+    def acknowledge(
+        self,
+        capsule: HandoffCapsule,
+        *,
+        idempotency_key: str,
+    ) -> bool:
+        return self.durable_manager.acknowledge(
+            capsule,
+            idempotency_key=idempotency_key,
+        ).verified
+
 
 def _atomic_private_write(path: Path, value: bytes) -> None:
     atomic_write_private_text(path, value.decode("utf-8"))
@@ -650,6 +681,30 @@ def _parse_named_environment(
         if key not in inherited:
             inherited.append(key)
     return {name: tuple(keys) for name, keys in parsed.items()}
+
+
+def _runtime_environment(keys: list[str]) -> dict[str, str]:
+    inherited: dict[str, str] = {}
+    seen: set[str] = set()
+    for key in keys:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) is None:
+            raise ValueError(f"invalid runtime environment key: {key}")
+        if key.startswith("AGENT_SESSION_HARNESS_"):
+            raise ValueError(f"reserved runtime environment key: {key}")
+        if key in seen:
+            raise ValueError(f"duplicate runtime environment key: {key}")
+        seen.add(key)
+        if key in os.environ:
+            inherited[key] = os.environ[key]
+    return inherited
+
+
+def _replay_mirrors_fail_open(manager: DurableCheckpointManager) -> str | None:
+    try:
+        manager.replay_mirrors(max_attempts=1)
+    except Exception as exc:
+        return sanitize_error(str(exc), max_length=500)
+    return None
 
 
 def _parse_json_argv(encoded_argv: str, *, label: str) -> tuple[str, ...]:
@@ -694,6 +749,12 @@ def _validate_supervise_intervals(args: argparse.Namespace) -> None:
         raise ValueError("max ticks must be non-negative")
     if args.adapter_timeout_seconds <= 0:
         raise ValueError("adapter timeout seconds must be positive")
+    watchdog_seconds = args.lease_seconds - WATCHDOG_SHUTDOWN_MARGIN_SECONDS
+    if 2 * (args.adapter_timeout_seconds + args.poll_seconds) >= watchdog_seconds:
+        raise ValueError(
+            "adapter timeout and poll interval must leave at least half the "
+            "watchdog lease for supervision"
+        )
     if (
         args.heartbeat_interval_seconds is not None
         and not 0 <= args.heartbeat_interval_seconds < args.lease_seconds

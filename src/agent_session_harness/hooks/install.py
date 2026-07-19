@@ -34,6 +34,8 @@ HOOK_EVENTS = (
     "PreCompact",
     "SessionEnd",
 )
+DEFAULT_HOOK_TIMEOUT_SECONDS = 5
+SESSION_START_HOOK_TIMEOUT_SECONDS = 35
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,17 @@ class HookInstaller:
             groups.append(
                 {
                     "matcher": "*",
-                    "hooks": [{"type": "command", "command": command, "timeout": 5}],
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": command,
+                            "timeout": (
+                                SESSION_START_HOOK_TIMEOUT_SECONDS
+                                if event_name == "SessionStart"
+                                else DEFAULT_HOOK_TIMEOUT_SECONDS
+                            ),
+                        }
+                    ],
                 }
             )
         changed = updated != manifest

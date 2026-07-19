@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import stat
 import threading
+import time
 
 import pytest
 
@@ -22,6 +23,24 @@ def _modules():
     except ModuleNotFoundError:
         pytest.fail("native lifecycle hooks are not implemented")
     return native, command
+
+
+def test_unmanaged_hook_is_a_silent_noop() -> None:
+    _native, command = _modules()
+    stdin = io.StringIO("not even JSON")
+    stdout = io.StringIO()
+
+    assert (
+        command.run_hook(
+            runtime="codex",
+            stdin=stdin,
+            stdout=stdout,
+            environ={},
+        )
+        == 0
+    )
+    assert stdout.getvalue() == ""
+    assert stdin.tell() == 0
 
 
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
@@ -322,13 +341,17 @@ def test_hook_command_requires_managed_mode_and_appends_locally(tmp_path) -> Non
     assert response["ok"] is True
     assert (tmp_path / "events.jsonl").read_text().count("session.started") == 1
 
-    with pytest.raises(RuntimeError, match="managed"):
+    unmanaged_stdout = io.StringIO()
+    assert (
         command.run_hook(
             runtime="claude",
             stdin=io.StringIO(json.dumps(payload)),
-            stdout=io.StringIO(),
+            stdout=unmanaged_stdout,
             environ={},
         )
+        == 0
+    )
+    assert unmanaged_stdout.getvalue() == ""
 
 
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
@@ -420,6 +443,24 @@ def test_session_start_auto_acknowledges_verified_successor(
                 state_path,
                 ready.model_dump_json() + "\n",
             )
+        deadline = time.monotonic() + 1
+        while supervisor.read_acknowledgement(state_path) is None:
+            if time.monotonic() >= deadline:
+                raise AssertionError("successor did not publish its acknowledgement")
+            time.sleep(0.01)
+        running = ready.model_copy(
+            update={
+                "phase": supervisor.SupervisorPhase.RUNNING,
+                "conversation_id": "conversation-1",
+            }
+        )
+        with secure_files.exclusive_lock(
+            state_path.with_suffix(state_path.suffix + ".lock")
+        ):
+            secure_files.atomic_write_private_text(
+                state_path,
+                running.model_dump_json() + "\n",
+            )
 
     publisher = threading.Thread(target=publish_ready_state)
     publisher.start()
@@ -443,6 +484,77 @@ def test_session_start_auto_acknowledges_verified_successor(
     assert acknowledgement.owner_pid == 1234
     assert read_count >= 2
     assert (tmp_path / "events.jsonl").read_text().count("session.started") == 1
+
+
+def test_session_start_blocks_when_durable_acknowledgement_never_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _native, command = _modules()
+    supervisor = importlib.import_module("agent_session_harness.supervisor")
+    capsule_module = importlib.import_module("agent_session_harness.capsule")
+    capsule = capsule_module.HandoffCapsule(
+        schema_version=1,
+        chain_id="chain-1",
+        predecessor_conversation_id="conversation-0",
+        target_generation=1,
+        task_ids={"bead": "bead-1"},
+        objective="Continue safely.",
+        exact_next_action="Do not run before ACK.",
+        completed_criteria=(),
+        remaining_criteria=("durable ACK",),
+        repository_path=tmp_path,
+        branch="test-branch",
+        head="deadbeef",
+        dirty_paths=(),
+        file_anchors=(),
+        symbol_anchors=(),
+        test_results={},
+        decisions=(),
+        blockers=(),
+        process_summaries={},
+        created_at=NOW,
+    )
+    capsule_path = tmp_path / "capsule.json"
+    capsule_path.write_bytes(capsule.canonical_bytes() + b"\n")
+    state_path = tmp_path / "supervisor.json"
+    snapshot = supervisor.SupervisorSnapshot(
+        runtime="codex",
+        chain_id="chain-1",
+        generation=1,
+        phase="awaiting_ack",
+        process_pid=1234,
+        checkpoint_fingerprint=capsule.fingerprint,
+        checkpoint_path=capsule_path,
+    )
+    state_path.write_text(snapshot.model_dump_json() + "\n", encoding="utf-8")
+    state_path.chmod(0o600)
+    environ = _stop_environment(tmp_path, state_path, generation=1)
+    environ.update(
+        {
+            "AGENT_SESSION_HARNESS_CAPSULE_PATH": str(capsule_path),
+            "AGENT_SESSION_HARNESS_CAPSULE_FINGERPRINT": capsule.fingerprint,
+            "AGENT_SESSION_HARNESS_TARGET_GENERATION": "1",
+        }
+    )
+    monkeypatch.setattr(command, "SUCCESSOR_ACK_TIMEOUT_SECONDS", 0.02)
+
+    with pytest.raises(RuntimeError, match="durable acknowledgement"):
+        command.run_hook(
+            runtime="codex",
+            stdin=io.StringIO(
+                json.dumps(
+                    {
+                        "hook_event_name": "SessionStart",
+                        "session_id": "conversation-1",
+                        "cwd": str(tmp_path),
+                        "timestamp": NOW.isoformat(),
+                    }
+                )
+            ),
+            stdout=io.StringIO(),
+            environ=environ,
+        )
 
 
 def test_hook_command_rejects_oversized_input(tmp_path) -> None:

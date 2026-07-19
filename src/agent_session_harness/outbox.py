@@ -25,6 +25,10 @@ from agent_session_harness.secure_files import (
 )
 
 
+DEFAULT_REPLAY_ATTEMPTS = 100
+DEFAULT_MAX_QUEUE_BYTES = 8 * 1024 * 1024
+
+
 class OutboxEntry(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -66,7 +70,10 @@ class MirrorOutbox:
         path: str | os.PathLike[str],
         *,
         dead_letter_path: str | os.PathLike[str] | None = None,
+        max_queue_bytes: int = DEFAULT_MAX_QUEUE_BYTES,
     ) -> None:
+        if max_queue_bytes <= 0:
+            raise ValueError("maximum queue bytes must be positive")
         self.path = Path(path)
         self.dead_letter_path = (
             Path(dead_letter_path)
@@ -74,6 +81,7 @@ class MirrorOutbox:
             else self.path.with_suffix(self.path.suffix + ".dead")
         )
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        self.max_queue_bytes = max_queue_bytes
 
     @property
     def depth(self) -> int:
@@ -81,7 +89,11 @@ class MirrorOutbox:
 
     def enqueue(self, adapter: str, request: AdapterRequest) -> bool:
         with exclusive_lock(self.lock_path):
-            entries = self._read(self.path, OutboxEntry)
+            entries = self._read(
+                self.path,
+                OutboxEntry,
+                max_bytes=self.max_queue_bytes,
+            )
             pair = (adapter, request.idempotency_key)
             if any(
                 (entry.adapter, entry.request.idempotency_key) == pair
@@ -94,27 +106,55 @@ class MirrorOutbox:
                 request=request,
                 enqueued_at=datetime.now(timezone.utc),
             )
+            encoded_size = len((self._encoded(entry) + "\n").encode("utf-8"))
+            existing_size = sum(
+                len((self._encoded(current) + "\n").encode("utf-8"))
+                for current in entries
+            )
+            if existing_size + encoded_size > self.max_queue_bytes:
+                raise ValueError(f"mirror outbox exceeds {self.max_queue_bytes} bytes")
             self._append(self.path, entry)
             return True
 
     def pending(self) -> tuple[OutboxEntry, ...]:
         with exclusive_lock(self.lock_path):
-            return tuple(self._read(self.path, OutboxEntry))
+            return tuple(
+                self._read(
+                    self.path,
+                    OutboxEntry,
+                    max_bytes=self.max_queue_bytes,
+                )
+            )
 
     def dead_letters(self) -> tuple[DeadLetterEntry, ...]:
         with exclusive_lock(self.lock_path):
-            return tuple(self._read(self.dead_letter_path, DeadLetterEntry))
+            return tuple(
+                self._read(
+                    self.dead_letter_path,
+                    DeadLetterEntry,
+                    max_bytes=self.max_queue_bytes,
+                )
+            )
 
     def replay(
         self,
         adapters: Mapping[str, CheckpointAdapter],
+        *,
+        max_attempts: int = DEFAULT_REPLAY_ATTEMPTS,
     ) -> ReplayResult:
+        if max_attempts <= 0:
+            raise ValueError("maximum replay attempts must be positive")
         with exclusive_lock(self.lock_path):
-            entries = self._read(self.path, OutboxEntry)
+            entries = self._read(
+                self.path,
+                OutboxEntry,
+                max_bytes=self.max_queue_bytes,
+            )
+            batch = entries[:max_attempts]
             retained: list[OutboxEntry] = []
             dead_letters: list[DeadLetterEntry] = []
             succeeded = 0
-            for entry in entries:
+            for entry in batch:
                 adapter = adapters.get(entry.adapter)
                 if adapter is None:
                     retained.append(entry)
@@ -145,11 +185,30 @@ class MirrorOutbox:
                         )
                     )
 
+            retained.extend(entries[len(batch) :])
+
+            existing_dead_letters = self._read(
+                self.dead_letter_path,
+                DeadLetterEntry,
+                max_bytes=self.max_queue_bytes,
+            )
+            dead_letter_size = sum(
+                len((self._encoded(entry) + "\n").encode("utf-8"))
+                for entry in existing_dead_letters
+            )
+            new_dead_letter_size = sum(
+                len((self._encoded(entry) + "\n").encode("utf-8"))
+                for entry in dead_letters
+            )
+            if dead_letter_size + new_dead_letter_size > self.max_queue_bytes:
+                raise ValueError(
+                    f"mirror dead-letter queue exceeds {self.max_queue_bytes} bytes"
+                )
             for dead_letter in dead_letters:
                 self._append(self.dead_letter_path, dead_letter)
             self._replace(self.path, retained)
             return ReplayResult(
-                attempted=len(entries),
+                attempted=len(batch),
                 succeeded=succeeded,
                 retained=len(retained),
                 dead_lettered=len(dead_letters),
@@ -180,12 +239,17 @@ class MirrorOutbox:
         append_private_text(path, cls._encoded(model) + "\n")
 
     @staticmethod
-    def _read(path: Path, model_type: type[BaseModel]) -> list:
+    def _read(
+        path: Path,
+        model_type: type[BaseModel],
+        *,
+        max_bytes: int,
+    ) -> list:
         if not private_exists(path):
             return []
         result = []
         for line_number, line in enumerate(
-            read_private_text(path).splitlines(),
+            read_private_text(path, max_bytes=max_bytes).splitlines(),
             start=1,
         ):
             if not line.strip():

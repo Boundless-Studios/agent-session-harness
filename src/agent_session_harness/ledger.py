@@ -46,6 +46,7 @@ class EventLedger:
         active_tools: set[str] = set()
         active_subagents: set[str] = set()
         active_critical_sections: set[str] = set()
+        handoff_requested_generations: set[int] = set()
         last_event_at: datetime | None = None
         processed = 0
 
@@ -83,6 +84,8 @@ class EventLedger:
                     )
                 else:
                     target.remove(activity_id)
+            elif event.event_type is EventType.HANDOFF_REQUESTED:
+                handoff_requested_generations.add(event.generation)
 
         active_groups = (
             active_turns,
@@ -106,6 +109,7 @@ class EventLedger:
             processed_event_count=processed,
             last_event_at=last_event_at,
             integrity_warnings=tuple(warnings),
+            handoff_requested_generations=frozenset(handoff_requested_generations),
         )
 
     def _read_events(self) -> tuple[list[LifecycleEvent], list[str]]:
