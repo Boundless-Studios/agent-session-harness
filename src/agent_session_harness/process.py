@@ -81,9 +81,7 @@ class ManagedProcess:
 class ProcessDriver(Protocol):
     def start_fresh(self, request: LaunchRequest) -> ManagedProcess: ...
 
-    def graceful_stop(
-        self, process: ManagedProcess, timeout_seconds: float
-    ) -> int: ...
+    def graceful_stop(self, process: ManagedProcess, timeout_seconds: float) -> int: ...
 
     def is_alive(self, process: ManagedProcess) -> bool: ...
 
@@ -121,9 +119,7 @@ class PosixProcessDriver:
             self._write_registry(registry_path, managed)
             return managed
 
-    def graceful_stop(
-        self, process: ManagedProcess, timeout_seconds: float
-    ) -> int:
+    def graceful_stop(self, process: ManagedProcess, timeout_seconds: float) -> int:
         if timeout_seconds < 0:
             raise ValueError("stop timeout must be non-negative")
         if self.is_alive(process):

@@ -45,7 +45,9 @@ def normalize_native_event(
     try:
         event_type = _EVENT_TYPES[hook_name]
     except KeyError as exc:
-        raise ValueError(f"unsupported native hook event: {hook_name or 'missing'}") from exc
+        raise ValueError(
+            f"unsupported native hook event: {hook_name or 'missing'}"
+        ) from exc
 
     conversation_id = str(
         payload.get("session_id")
@@ -83,7 +85,9 @@ def normalize_native_event(
         )
     )
     native_id = payload.get("event_id") or payload.get("hook_id")
-    event_id = str(native_id) if native_id else hashlib.sha256(identity.encode()).hexdigest()
+    event_id = (
+        str(native_id) if native_id else hashlib.sha256(identity.encode()).hexdigest()
+    )
     return LifecycleEvent(
         schema_version=1,
         event_id=event_id,

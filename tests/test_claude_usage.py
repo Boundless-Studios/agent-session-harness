@@ -93,6 +93,7 @@ def test_project_discovery_reports_ambiguous_live_conversations(tmp_path) -> Non
     projects_root = tmp_path / "claude-projects"
     (projects_root / "one").mkdir(parents=True)
     (projects_root / "two").mkdir(parents=True)
+
     def row(session: str) -> str:
         return (
             json.dumps(
@@ -110,12 +111,9 @@ def test_project_discovery_reports_ambiguous_live_conversations(tmp_path) -> Non
             )
             + "\n"
         )
-    (projects_root / "one" / "first.jsonl").write_text(
-        row("first"), encoding="utf-8"
-    )
-    (projects_root / "two" / "second.jsonl").write_text(
-        row("second"), encoding="utf-8"
-    )
+
+    (projects_root / "one" / "first.jsonl").write_text(row("first"), encoding="utf-8")
+    (projects_root / "two" / "second.jsonl").write_text(row("second"), encoding="utf-8")
 
     discovery = _reader(window_tokens=200_000).discover(
         projects_root=projects_root,

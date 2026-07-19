@@ -54,8 +54,7 @@ class HookInstaller:
         if not isinstance(hooks, dict):
             raise ValueError("hook manifest 'hooks' value must be an object")
         command = (
-            f"{OWNED_MARKER} agent-session-harness hook --runtime "
-            f"{self.runtime.value}"
+            f"{OWNED_MARKER} agent-session-harness hook --runtime {self.runtime.value}"
         )
         for event_name in HOOK_EVENTS:
             groups = hooks.setdefault(event_name, [])
@@ -64,9 +63,7 @@ class HookInstaller:
             groups.append(
                 {
                     "matcher": "*",
-                    "hooks": [
-                        {"type": "command", "command": command, "timeout": 5}
-                    ],
+                    "hooks": [{"type": "command", "command": command, "timeout": 5}],
                 }
             )
         changed = updated != manifest

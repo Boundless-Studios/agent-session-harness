@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
 from pathlib import Path
 import stat
@@ -89,15 +88,15 @@ def test_report_projects_supervisor_state_without_model_work(tmp_path, capsys) -
     }
 
 
-def test_hook_and_hook_installer_commands_round_trip(tmp_path, monkeypatch, capsys) -> None:
+def test_hook_and_hook_installer_commands_round_trip(
+    tmp_path, monkeypatch, capsys
+) -> None:
     manifest = tmp_path / "hooks.json"
     manifest.write_text('{"hooks":{}}\n', encoding="utf-8")
     monkeypatch.setenv("AGENT_SESSION_HARNESS_MANAGED", "1")
     monkeypatch.setenv("AGENT_SESSION_HARNESS_CHAIN_ID", "chain-1")
     monkeypatch.setenv("AGENT_SESSION_HARNESS_GENERATION", "0")
-    monkeypatch.setenv(
-        "AGENT_SESSION_HARNESS_LEDGER", str(tmp_path / "events.jsonl")
-    )
+    monkeypatch.setenv("AGENT_SESSION_HARNESS_LEDGER", str(tmp_path / "events.jsonl"))
     monkeypatch.setenv("AGENT_SESSION_HARNESS_OWNER_PID", "1234")
     monkeypatch.setattr(
         "sys.stdin",
@@ -130,29 +129,35 @@ def test_hook_and_hook_installer_commands_round_trip(tmp_path, monkeypatch, caps
         == 0
     )
     assert _json_stdout(capsys)["installed"] is True
-    assert cli.main(
-        [
-            "hooks",
-            "check",
-            "--runtime",
-            "codex",
-            "--path",
-            str(manifest),
-            "--json",
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                "hooks",
+                "check",
+                "--runtime",
+                "codex",
+                "--path",
+                str(manifest),
+                "--json",
+            ]
+        )
+        == 0
+    )
     assert _json_stdout(capsys)["installed"] is True
-    assert cli.main(
-        [
-            "hooks",
-            "uninstall",
-            "--runtime",
-            "codex",
-            "--path",
-            str(manifest),
-            "--json",
-        ]
-    ) == 0
+    assert (
+        cli.main(
+            [
+                "hooks",
+                "uninstall",
+                "--runtime",
+                "codex",
+                "--path",
+                str(manifest),
+                "--json",
+            ]
+        )
+        == 0
+    )
     assert _json_stdout(capsys)["installed"] is False
 
 
@@ -194,9 +199,7 @@ def test_acknowledge_writes_bounded_durable_record(tmp_path, capsys) -> None:
     assert stat.S_IMODE(acknowledgement_path.stat().st_mode) == 0o600
 
 
-def test_empty_outbox_replay_and_supervise_preflight_are_safe(
-    tmp_path, capsys
-) -> None:
+def test_empty_outbox_replay_and_supervise_preflight_are_safe(tmp_path, capsys) -> None:
     assert (
         cli.main(
             [

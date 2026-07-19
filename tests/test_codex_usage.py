@@ -24,7 +24,11 @@ def _reader():
 
 def test_fork_lineage_subtracts_each_child_baseline_per_dimension() -> None:
     usage = _reader().read_lineage(
-        [FIXTURES / "grandchild.jsonl", FIXTURES / "root.jsonl", FIXTURES / "child.jsonl"]
+        [
+            FIXTURES / "grandchild.jsonl",
+            FIXTURES / "root.jsonl",
+            FIXTURES / "child.jsonl",
+        ]
     )
 
     assert [session.session_id for session in usage.sessions] == [
@@ -136,9 +140,7 @@ def test_lineage_cycle_is_rejected(tmp_path) -> None:
 
 
 def test_usage_models_never_expose_transcript_payloads() -> None:
-    usage = _reader().read_lineage(
-        [FIXTURES / "root.jsonl", FIXTURES / "child.jsonl"]
-    )
+    usage = _reader().read_lineage([FIXTURES / "root.jsonl", FIXTURES / "child.jsonl"])
     encoded = usage.model_dump_json()
 
     fields = type(usage.sessions[0]).model_fields

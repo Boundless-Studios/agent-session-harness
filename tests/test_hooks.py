@@ -132,9 +132,10 @@ def test_hook_command_requires_managed_mode_and_appends_locally(tmp_path) -> Non
         "AGENT_SESSION_HARNESS_OWNER_PID": "1234",
     }
 
-    assert command.run_hook(
-        runtime="claude", stdin=stdin, stdout=stdout, environ=environ
-    ) == 0
+    assert (
+        command.run_hook(runtime="claude", stdin=stdin, stdout=stdout, environ=environ)
+        == 0
+    )
     response = json.loads(stdout.getvalue())
     assert response["ok"] is True
     assert (tmp_path / "events.jsonl").read_text().count("session.started") == 1

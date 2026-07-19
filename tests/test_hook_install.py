@@ -32,9 +32,7 @@ def test_install_check_upgrade_and_uninstall_preserve_unrelated_hooks(
                     ],
                 }
             ],
-            "Stop": [
-                {"hooks": [{"type": "command", "command": "existing stop"}]}
-            ],
+            "Stop": [{"hooks": [{"type": "command", "command": "existing stop"}]}],
         },
         "custom": {"keep": [1, 2, 3]},
     }

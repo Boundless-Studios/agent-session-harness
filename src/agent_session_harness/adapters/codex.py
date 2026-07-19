@@ -157,7 +157,10 @@ class CodexUsageReader:
                 raw_line = handle.readline()
                 if not raw_line:
                     break
-                if b'"session_meta"' not in raw_line and b'"token_count"' not in raw_line:
+                if (
+                    b'"session_meta"' not in raw_line
+                    and b'"token_count"' not in raw_line
+                ):
                     continue
                 try:
                     row = json.loads(raw_line.decode("utf-8"))
@@ -238,7 +241,9 @@ class CodexUsageReader:
             ]
             baseline = inherited[-1].cumulative if inherited else None
             if baseline is None:
-                warnings.append("fork baseline is unavailable; incremental usage unknown")
+                warnings.append(
+                    "fork baseline is unavailable; incremental usage unknown"
+                )
                 confidence = Confidence.DEGRADED
 
         if warnings and confidence is Confidence.CONFIDENT:
@@ -260,9 +265,7 @@ class CodexUsageReader:
             final_reasoning_output_tokens=final.reasoning_output_tokens,
             final_total_tokens=final.total_tokens,
             baseline_input_tokens=_dimension(baseline, "input_tokens"),
-            baseline_cached_input_tokens=_dimension(
-                baseline, "cached_input_tokens"
-            ),
+            baseline_cached_input_tokens=_dimension(baseline, "cached_input_tokens"),
             baseline_output_tokens=_dimension(baseline, "output_tokens"),
             baseline_reasoning_output_tokens=_dimension(
                 baseline, "reasoning_output_tokens"
@@ -280,9 +283,7 @@ class CodexUsageReader:
             context_tokens=final_event.latest.total_tokens,
             window_tokens=final_event.window_tokens,
             context_percent=(
-                100.0
-                * final_event.latest.total_tokens
-                / final_event.window_tokens
+                100.0 * final_event.latest.total_tokens / final_event.window_tokens
             ),
             confidence=confidence,
             warnings=tuple(warnings),

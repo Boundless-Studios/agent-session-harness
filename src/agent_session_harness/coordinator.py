@@ -144,9 +144,7 @@ class CoordinatorAdapter:
             release_reason=record.release_reason or "context-rotation",
         )
 
-    def _assert_current(
-        self, handle: ClaimHandle, *, now: datetime | None
-    ) -> None:
+    def _assert_current(self, handle: ClaimHandle, *, now: datetime | None) -> None:
         decision = self.coordinator.status(self._task(handle), now=now)
         current = decision.claim
         if (

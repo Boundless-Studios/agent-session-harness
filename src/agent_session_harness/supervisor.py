@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from enum import Enum
+import hmac
 import json
 import os
 from pathlib import Path
@@ -60,6 +61,15 @@ class VerifiedCheckpoint(BaseModel):
     path: Path
 
 
+class AcknowledgementRecord(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    generation: int = Field(ge=0)
+    fingerprint: str = Field(min_length=1, max_length=64)
+    conversation_id: str = Field(min_length=1, max_length=160)
+
+
 class UsageReader(Protocol):
     def sample(self, process: ManagedProcess) -> UsageObservation: ...
 
@@ -83,6 +93,7 @@ class SupervisorSnapshot(BaseModel):
     process_group_id: int | None = None
     process_registry_key: str | None = None
     context_percent: float | None = Field(default=None, ge=0)
+    context_confidence: Confidence = Confidence.UNKNOWN
     checkpoint_fingerprint: str | None = None
     checkpoint_path: Path | None = None
     warning_emitted: bool = False
@@ -121,7 +132,9 @@ class Supervisor:
         self.executable = executable
         self.runtime_args = runtime_args
         self.state_path = Path(state_path)
-        self.effect_path = self.state_path.with_suffix(self.state_path.suffix + ".events")
+        self.effect_path = self.state_path.with_suffix(
+            self.state_path.suffix + ".events"
+        )
         self.process_driver = process_driver
         self.usage_reader = usage_reader
         self.checkpoint_manager = checkpoint_manager
@@ -167,6 +180,17 @@ class Supervisor:
     def tick(self, activity: ActivitySnapshot) -> SupervisorSnapshot:
         if self.snapshot.phase is SupervisorPhase.INITIAL:
             raise RuntimeError("supervisor must be started before ticking")
+        if self.snapshot.phase is SupervisorPhase.AWAITING_ACK:
+            acknowledgement = read_acknowledgement(self.state_path)
+            if acknowledgement is None:
+                return self.snapshot
+            snapshot = self.acknowledge(
+                generation=acknowledgement.generation,
+                fingerprint=acknowledgement.fingerprint,
+                conversation_id=acknowledgement.conversation_id,
+            )
+            clear_acknowledgement(self.state_path)
+            return snapshot
         if self.snapshot.phase in {
             SupervisorPhase.RUNNING,
             SupervisorPhase.WARNING,
@@ -198,6 +222,7 @@ class Supervisor:
                 "phase": SupervisorPhase.RUNNING,
                 "conversation_id": conversation_id,
                 "context_percent": None,
+                "context_confidence": Confidence.UNKNOWN,
                 "warning_emitted": False,
             }
         )
@@ -213,6 +238,7 @@ class Supervisor:
             update={
                 "conversation_id": sample.conversation_id,
                 "context_percent": sample.context_percent,
+                "context_confidence": sample.confidence,
             }
         )
         if sample.confidence is not Confidence.CONFIDENT:
@@ -229,8 +255,7 @@ class Supervisor:
                 }
             )
         if (
-            self.snapshot.phase
-            in {SupervisorPhase.RUNNING, SupervisorPhase.WARNING}
+            self.snapshot.phase in {SupervisorPhase.RUNNING, SupervisorPhase.WARNING}
             and sample.context_percent >= self.rotate_percent
         ):
             self.snapshot = self.snapshot.model_copy(
@@ -354,10 +379,14 @@ class Supervisor:
             "AGENT_SESSION_HARNESS_LEDGER": str(
                 self.state_path.with_suffix(self.state_path.suffix + ".lifecycle")
             ),
+            "AGENT_SESSION_HARNESS_STATE_PATH": str(self.state_path),
         }
         message = None
         if generation > 0:
-            if self.snapshot.checkpoint_path is None or self.snapshot.checkpoint_fingerprint is None:
+            if (
+                self.snapshot.checkpoint_path is None
+                or self.snapshot.checkpoint_fingerprint is None
+            ):
                 raise RuntimeError("successor launch requires a verified checkpoint")
             environment.update(
                 {
@@ -502,3 +531,72 @@ def _lock(path: Path):
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def acknowledgement_path(state_path: str | os.PathLike[str]) -> Path:
+    path = Path(state_path)
+    return path.with_suffix(path.suffix + ".ack")
+
+
+def write_acknowledgement(
+    *,
+    state_path: str | os.PathLike[str],
+    generation: int,
+    fingerprint: str,
+    conversation_id: str,
+) -> Path:
+    state = Path(state_path)
+    with _lock(state.with_suffix(state.suffix + ".lock")):
+        snapshot = SupervisorSnapshot.model_validate_json(
+            state.read_text(encoding="utf-8")
+        )
+        if snapshot.phase is not SupervisorPhase.AWAITING_ACK:
+            raise ValueError("supervisor is not awaiting an acknowledgement")
+        if generation != snapshot.generation:
+            raise ValueError("acknowledgement generation does not match")
+        if snapshot.checkpoint_fingerprint is None or not hmac.compare_digest(
+            fingerprint, snapshot.checkpoint_fingerprint
+        ):
+            raise ValueError("acknowledgement fingerprint does not match")
+        record = AcknowledgementRecord(
+            generation=generation,
+            fingerprint=fingerprint,
+            conversation_id=conversation_id,
+        )
+        target = acknowledgement_path(state)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            text=True,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(record.model_dump_json() + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(temporary_path, 0o600)
+            os.replace(temporary_path, target)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+        return target
+
+
+def read_acknowledgement(
+    state_path: str | os.PathLike[str],
+) -> AcknowledgementRecord | None:
+    target = acknowledgement_path(state_path)
+    if not target.exists():
+        return None
+    with _lock(target.with_suffix(target.suffix + ".lock")):
+        return AcknowledgementRecord.model_validate_json(
+            target.read_text(encoding="utf-8")
+        )
+
+
+def clear_acknowledgement(state_path: str | os.PathLike[str]) -> None:
+    target = acknowledgement_path(state_path)
+    with _lock(target.with_suffix(target.suffix + ".lock")):
+        if target.exists():
+            target.unlink()

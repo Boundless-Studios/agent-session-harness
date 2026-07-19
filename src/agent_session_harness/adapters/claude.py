@@ -83,7 +83,9 @@ class ClaudeUsageReader:
                     continue
                 message = payload.get("message")
                 if not isinstance(message, dict):
-                    warnings.append(f"missing assistant message at byte offset {offset}")
+                    warnings.append(
+                        f"missing assistant message at byte offset {offset}"
+                    )
                     degraded = True
                     continue
                 usage = message.get("usage")
