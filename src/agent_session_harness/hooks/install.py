@@ -157,11 +157,17 @@ class HookInstaller:
         )
 
     @staticmethod
-    def _current_entry(entry: object) -> bool:
+    def _current_entry(entry: object, event_name: str) -> bool:
+        expected_timeout = (
+            SESSION_START_HOOK_TIMEOUT_SECONDS
+            if event_name == "SessionStart"
+            else DEFAULT_HOOK_TIMEOUT_SECONDS
+        )
         return (
             isinstance(entry, dict)
             and isinstance(entry.get("command"), str)
             and OWNED_MARKER in entry["command"]
+            and entry.get("timeout") == expected_timeout
         )
 
     @staticmethod
@@ -178,7 +184,10 @@ class HookInstaller:
                     group.get("hooks"), list
                 ):
                     continue
-                if any(HookInstaller._current_entry(entry) for entry in group["hooks"]):
+                if any(
+                    HookInstaller._current_entry(entry, event_name)
+                    for entry in group["hooks"]
+                ):
                     found.add(event_name)
         return found == set(HOOK_EVENTS)
 

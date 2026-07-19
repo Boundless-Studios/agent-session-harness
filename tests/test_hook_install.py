@@ -115,6 +115,23 @@ def test_upgrade_replaces_older_owned_marker_without_duplicates(tmp_path) -> Non
     assert installer.install().changed is False
 
 
+@pytest.mark.parametrize(
+    ("event_name", "stale_timeout"),
+    [("SessionStart", 5), ("Stop", 35)],
+)
+def test_check_rejects_stale_event_timeout(
+    tmp_path: Path, event_name: str, stale_timeout: int
+) -> None:
+    path = tmp_path / "settings.json"
+    installer = _installer("codex", path)
+    installer.install()
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["hooks"][event_name][-1]["hooks"][0]["timeout"] = stale_timeout
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert installer.check().installed is False
+
+
 def test_installer_can_pin_an_absolute_harness_entrypoint(tmp_path) -> None:
     path = tmp_path / "settings.json"
     executable = tmp_path / "bin with spaces" / "agent-session-harness"
