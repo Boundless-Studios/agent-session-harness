@@ -586,6 +586,10 @@ def _run_supervise(args: argparse.Namespace) -> int:
         # Surfaced so a wedged usage sampler is visible to the operator instead
         # of silently never rotating (BOU-2208).
         "usage_alarm": snapshot.usage_alarm,
+        # Surfaced for the same reason: a managed session whose hooks stopped
+        # firing never rotates, and without this it looks healthy until it runs
+        # out of context (BOU-2222).
+        "liveness_alarm": snapshot.liveness_alarm,
     }
     _emit(payload, json_output=args.json_output)
     return 130 if interrupted else 0

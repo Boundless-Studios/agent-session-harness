@@ -174,11 +174,16 @@ def test_report_projects_supervisor_state_without_model_work(tmp_path, capsys) -
         "conversation_id": None,
         "cumulative_tokens": None,
         "generation": 1,
+        "liveness_alarm": None,
         "outbox_depth": 0,
         "quiescence": "unknown",
         "runtime": "codex",
+        # No ledger was supplied, so no hook has ever been seen to report
+        # (BOU-2222): "quiescence unknown" alone never said that out loud.
+        "runtime_liveness": "never_reported",
         "schema_version": 1,
         "state": "awaiting_ack",
+        "usage_alarm": None,
         "window_tokens": None,
     }
 

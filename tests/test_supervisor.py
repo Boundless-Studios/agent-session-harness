@@ -13,7 +13,11 @@ import pytest
 
 from agent_coordinator import ClaimConflictError
 
-from agent_session_harness.activity import ActivitySnapshot, Quiescence
+from agent_session_harness.activity import (
+    ActivitySnapshot,
+    Quiescence,
+    RuntimeLiveness,
+)
 from agent_session_harness.capsule import HandoffCapsule
 from agent_session_harness.coordinator import (
     ClaimHandle,
@@ -58,6 +62,33 @@ def _handoff_activity(quiescence: Quiescence = Quiescence.IDLE) -> ActivitySnaps
     return _activity(
         quiescence,
         handoff_requested_generations=frozenset({0}),
+    )
+
+
+def _silent_activity(
+    liveness: RuntimeLiveness,
+    *,
+    quiescence: Quiescence = Quiescence.UNKNOWN,
+    active: frozenset[str] = frozenset(),
+) -> ActivitySnapshot:
+    """A ledger that has gone quiet, with a handoff already requested.
+
+    The requested handoff is deliberate: it is the state a real session reaches
+    just before its hooks break, and it is the one input that would otherwise
+    let a relaxed staleness gate rotate into silence.
+    """
+    never = liveness is RuntimeLiveness.NEVER_REPORTED
+    return ActivitySnapshot(
+        quiescence=quiescence,
+        active_turn_ids=frozenset(),
+        active_tool_ids=active,
+        active_subagent_ids=frozenset(),
+        active_critical_section_ids=frozenset(),
+        processed_event_count=0 if never else 4,
+        last_event_at=None if never else NOW - timedelta(minutes=30),
+        integrity_warnings=(),
+        handoff_requested_generations=frozenset() if never else frozenset({0}),
+        runtime_liveness=liveness,
     )
 
 
@@ -1790,3 +1821,151 @@ def test_rotation_recovers_idempotently_after_each_effect_crash(
     assert len(checkpoints.receipts) == 1
     assert len(coordinator.released) == 1
     assert len(driver.processes) == 2
+
+
+def test_hooks_that_never_reported_alarm_loudly_and_never_rotate(tmp_path) -> None:
+    """BOU-2222: a session whose hooks never fired must not look healthy.
+
+    Nothing else in the chain notices: usage sampling reads the runtime's own
+    logs, so context still climbs past the rotate threshold, the supervisor
+    parks in DRAINING, and the only symptom is an absence of events.
+    """
+    managed, _kwargs, driver, _coordinator, checkpoints = _supervisor(
+        tmp_path,
+        runtime_silence_alarm_ticks=2,
+        runtime_silence_grace_seconds=0.0,
+    )
+    managed.start()
+
+    first = managed.tick(_silent_activity(RuntimeLiveness.NEVER_REPORTED))
+    second = managed.tick(_silent_activity(RuntimeLiveness.NEVER_REPORTED))
+
+    assert first.phase.value == "draining"
+    assert first.liveness_alarm is None
+    assert second.liveness_alarm is not None
+    assert "never reported" in second.liveness_alarm
+    assert second.runtime_silence_streak == 2
+    assert checkpoints.calls == []
+    assert [call[0] for call in driver.calls] == ["start"]
+    journal = (tmp_path / "supervisor.json.events").read_text(encoding="utf-8")
+    assert "runtime-liveness" in journal
+
+
+def test_silence_after_a_quiescent_session_alarms_and_still_withholds_rotation(
+    tmp_path,
+) -> None:
+    """Chosen behaviour for "events stopped while idle": alarm, do not rotate.
+
+    Rotation needs the runtime to have asked for a handoff, and that request can
+    only arrive through the same hooks that went silent. So a stale request from
+    before the silence is not consent to rotate now -- treating an absence of
+    events as proof that nothing is running is exactly the mistake that would
+    rotate mid-tool. The fault is made loud instead.
+    """
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(
+        tmp_path,
+        runtime_silence_alarm_ticks=2,
+        runtime_silence_grace_seconds=0.0,
+    )
+    managed.start()
+
+    managed.tick(_silent_activity(RuntimeLiveness.SILENT_IDLE))
+    silent = managed.tick(_silent_activity(RuntimeLiveness.SILENT_IDLE))
+
+    assert silent.phase.value == "draining"
+    assert silent.liveness_alarm is not None
+    assert "stopped reporting" in silent.liveness_alarm
+    assert checkpoints.calls == []
+
+    recovered = managed.tick(_handoff_activity())
+
+    assert recovered.phase.value == "awaiting_ack"
+    assert recovered.liveness_alarm is None
+    assert recovered.runtime_silence_streak == 0
+    assert len(checkpoints.calls) == 1
+
+
+def test_silence_with_a_tool_in_flight_never_rotates(tmp_path) -> None:
+    """The bug this fix must not trade itself for.
+
+    A long tool call is running and the hook that would have reported its finish
+    is the broken thing. Rotating here kills the runtime mid-write, so silence
+    with outstanding work is refused even when every other gate agrees.
+    """
+    managed, _kwargs, driver, _coordinator, checkpoints = _supervisor(
+        tmp_path,
+        runtime_silence_alarm_ticks=2,
+        runtime_silence_grace_seconds=0.0,
+    )
+    managed.start()
+
+    managed.tick(
+        _silent_activity(
+            RuntimeLiveness.SILENT_ACTIVE,
+            active=frozenset({"tool-in-flight"}),
+        )
+    )
+    silent = managed.tick(
+        _silent_activity(
+            RuntimeLiveness.SILENT_ACTIVE,
+            active=frozenset({"tool-in-flight"}),
+        )
+    )
+
+    assert silent.phase.value == "draining"
+    assert silent.liveness_alarm is not None
+    assert "outstanding" in silent.liveness_alarm
+    assert checkpoints.calls == []
+
+    # Defence in depth: even a snapshot that claims IDLE must not rotate while
+    # the reporting path that produced that claim is known to be broken.
+    contradictory = managed.tick(
+        _silent_activity(
+            RuntimeLiveness.SILENT_ACTIVE,
+            quiescence=Quiescence.IDLE,
+            active=frozenset({"tool-in-flight"}),
+        )
+    )
+
+    assert contradictory.phase.value == "draining"
+    assert checkpoints.calls == []
+    assert [call[0] for call in driver.calls] == ["start"]
+
+
+def test_healthy_reporting_never_raises_the_silence_alarm(tmp_path) -> None:
+    """The alarm has to stay quiet on the ordinary path to mean anything."""
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(
+        tmp_path,
+        runtime_silence_alarm_ticks=1,
+        runtime_silence_grace_seconds=0.0,
+    )
+    managed.start()
+
+    snapshot = managed.tick(_activity(Quiescence.BUSY))
+
+    assert snapshot.liveness_alarm is None
+    assert snapshot.runtime_silence_streak == 0
+
+
+def test_a_fast_poll_interval_cannot_alarm_on_a_young_session(tmp_path) -> None:
+    """The tick streak alone is not a duration.
+
+    `--poll-seconds` goes down to milliseconds, so a tick-only threshold would
+    declare the hooks dead a fraction of a second into a session that simply
+    has not run its first tool yet. The elapsed-silence floor is what makes the
+    alarm mean "this has been quiet long enough to be a fault".
+    """
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(
+        tmp_path,
+        runtime_silence_alarm_ticks=1,
+        runtime_silence_grace_seconds=3600.0,
+    )
+    managed.start()
+
+    for _ in range(4):
+        snapshot = managed.tick(_silent_activity(RuntimeLiveness.NEVER_REPORTED))
+
+    assert snapshot.liveness_alarm is None
+    assert snapshot.runtime_silence_streak == 4
+    assert snapshot.runtime_silence_since is not None
+    assert checkpoints.calls == []

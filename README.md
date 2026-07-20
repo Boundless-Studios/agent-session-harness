@@ -286,7 +286,9 @@ Normal dispatch stays disabled until the expected generation and fingerprint mat
 
 ## Status consumers
 
-`report --json` emits the stable downstream status contract used by terminal and dashboard integrations: runtime, governor state, context percentage/confidence, quiescence, active turn/tool/subagent/critical counts, chain/conversation/generation IDs, last checkpoint fingerprint, and outbox depth.
+`report --json` emits the stable downstream status contract used by terminal and dashboard integrations: runtime, governor state, context percentage/confidence, quiescence, runtime liveness, active turn/tool/subagent/critical counts, chain/conversation/generation IDs, last checkpoint fingerprint, outbox depth, and any raised alarm.
+
+`runtime_liveness` answers a question quiescence cannot: whether the runtime's own lifecycle hooks are still reporting at all. `reporting` is healthy; `never_reported` means no hook event has ever arrived (hooks misconfigured, never installed, or a crashed bridge); `silent_idle` and `silent_active` mean the hooks stopped, the second with work still outstanding. A faulted liveness never permits rotation — silence is not evidence that nothing is running — and once it persists past both `runtime_silence_alarm_ticks` and `runtime_silence_grace_seconds` the supervisor raises `liveness_alarm`, writes a `runtime-liveness` effect, and prints to stderr. A managed session that has stopped rotating is therefore loud instead of merely quiet.
 
 ```bash
 agent-session-harness report \
