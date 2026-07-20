@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime
 import json
 import os
@@ -25,6 +26,33 @@ from .secure_files import (
 MAX_LEDGER_BYTES = 16 * 1_048_576
 MAX_LEDGER_EVENTS = 50_000
 MAX_EVENT_BYTES = 64 * 1024
+MAX_RETAINED_WARNINGS = 256
+
+
+@dataclass(frozen=True)
+class _IntegrityWarning:
+    """One ledger integrity finding plus how long it may gate quiescence.
+
+    BOU-2208: warnings used to be a flat list of strings that gated quiescence
+    for the supervisor's whole life, because the cache is only cleared when the
+    file is replaced. One unparseable line or one unmatched finish therefore
+    pinned quiescence to UNKNOWN forever, and `DRAINING` only leaves for `IDLE`,
+    so the session sat above the rotate threshold and never rotated.
+
+    A parse problem says "some events near here may be missing right now", not
+    "this ledger is permanently untrustworthy". Transient findings keep gating
+    only while they are within the same staleness window the rest of quiescence
+    uses; a genuinely truncated or unreadable read stays sticky.
+    """
+
+    message: str
+    observed_at: datetime
+    sticky: bool = False
+
+    def gates(self, *, now: datetime, stale_after_seconds: float) -> bool:
+        if self.sticky:
+            return True
+        return (now - self.observed_at).total_seconds() <= stale_after_seconds
 
 
 class EventLedger:
@@ -35,7 +63,7 @@ class EventLedger:
         self._read_offset = 0
         self._line_count = 0
         self._cached_events: list[LifecycleEvent] = []
-        self._cached_warnings: list[str] = []
+        self._cached_warnings: list[_IntegrityWarning] = []
 
     def append(self, event: LifecycleEvent) -> None:
         encoded = json.dumps(
@@ -60,7 +88,7 @@ class EventLedger:
         now: datetime,
         stale_after_seconds: float,
     ) -> ActivitySnapshot:
-        events, warnings = self._read_events()
+        events, warnings = self._read_events(now=now)
         seen: set[str] = set()
         # Counted, not set-tracked: when a runtime supplies no tool-use id the
         # hook derives one from the call's own fields, so two identical calls in
@@ -109,8 +137,18 @@ class EventLedger:
                     # Counter lookups insert a zero key; drop it so an unmatched
                     # finish cannot leave phantom outstanding work behind.
                     target.pop(activity_id, None)
+                    # Stamped with the event's own time, not the read time: this
+                    # warning is re-derived from retained history on every
+                    # materialize, so a read-time stamp would keep it forever
+                    # fresh and permanently gate quiescence.
                     warnings.append(
-                        f"{label} finish without start: {activity_id or 'missing'}"
+                        _IntegrityWarning(
+                            message=(
+                                f"{label} finish without start: "
+                                f"{activity_id or 'missing'}"
+                            ),
+                            observed_at=event.timestamp,
+                        )
                     )
                 else:
                     target[activity_id] -= 1
@@ -140,11 +178,15 @@ class EventLedger:
             active_critical_section_ids=frozenset(active_critical_sections),
             processed_event_count=processed,
             last_event_at=last_event_at,
-            integrity_warnings=tuple(warnings),
+            integrity_warnings=tuple(warning.message for warning in warnings),
             handoff_requested_generations=frozenset(handoff_requested_generations),
         )
 
-    def _read_events(self) -> tuple[list[LifecycleEvent], list[str]]:
+    def _read_events(
+        self,
+        *,
+        now: datetime,
+    ) -> tuple[list[LifecycleEvent], list[_IntegrityWarning]]:
         with exclusive_lock(self.lock_path):
             if not private_exists(self.path):
                 self._reset_cache()
@@ -157,34 +199,82 @@ class EventLedger:
                     max_bytes=MAX_LEDGER_BYTES,
                 )
             except (UnicodeDecodeError, ValueError):
-                return [], ["lifecycle ledger exceeds bounds or is unreadable"]
+                # Recomputed on every call rather than cached, so it clears by
+                # itself as soon as the file becomes readable again.
+                return [], [
+                    _IntegrityWarning(
+                        message="lifecycle ledger exceeds bounds or is unreadable",
+                        observed_at=now,
+                        sticky=True,
+                    )
+                ]
 
         if reset:
             self._reset_cache()
         lines = tail.splitlines()
         if tail and not tail.endswith("\n"):
-            self._cached_warnings.append("lifecycle ledger has a partial final line")
+            self._record_warning("lifecycle ledger has a partial final line", now=now)
         for line_number, line in enumerate(lines, start=self._line_count + 1):
             if not line.strip():
                 continue
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
-                self._cached_warnings.append(f"line {line_number}: invalid JSON")
+                self._record_warning(f"line {line_number}: invalid JSON", now=now)
                 continue
             try:
                 self._cached_events.append(LifecycleEvent.model_validate(payload))
             except ValidationError:
-                self._cached_warnings.append(
-                    f"line {line_number}: invalid lifecycle event"
+                self._record_warning(
+                    f"line {line_number}: invalid lifecycle event",
+                    now=now,
                 )
             if len(self._cached_events) > MAX_LEDGER_EVENTS:
-                self._cached_warnings.append("lifecycle ledger exceeds event limit")
+                # A truncated read really is permanently untrustworthy: the
+                # events beyond the bound are never materialized, so outstanding
+                # work can be invisible for as long as this ledger is in use.
+                self._record_warning(
+                    "lifecycle ledger exceeds event limit",
+                    now=now,
+                    sticky=True,
+                )
                 break
         self._line_count += len(lines)
         self._read_offset = offset
         self._file_identity = identity
         return list(self._cached_events), list(self._cached_warnings)
+
+    def _record_warning(
+        self,
+        message: str,
+        *,
+        now: datetime,
+        sticky: bool = False,
+    ) -> None:
+        # Refresh rather than drop a repeat: "partial final line" can be
+        # observed again on a later read, and a re-observed finding must start
+        # gating again instead of inheriting an already-expired timestamp.
+        for index, cached in enumerate(self._cached_warnings):
+            if cached.message == message:
+                self._cached_warnings[index] = _IntegrityWarning(
+                    message=message,
+                    observed_at=now,
+                    sticky=cached.sticky or sticky,
+                )
+                return
+        self._cached_warnings.append(
+            _IntegrityWarning(message=message, observed_at=now, sticky=sticky)
+        )
+        if len(self._cached_warnings) > MAX_RETAINED_WARNINGS:
+            transient = next(
+                (
+                    index
+                    for index, cached in enumerate(self._cached_warnings)
+                    if not cached.sticky
+                ),
+                None,
+            )
+            del self._cached_warnings[0 if transient is None else transient]
 
     def _reset_cache(self) -> None:
         self._file_identity = None
@@ -196,13 +286,17 @@ class EventLedger:
     @staticmethod
     def _quiescence(
         *,
-        warnings: list[str],
+        warnings: list[_IntegrityWarning],
         last_event_at: datetime | None,
         now: datetime,
         stale_after_seconds: float,
         has_active: bool,
     ) -> Quiescence:
-        if warnings or last_event_at is None:
+        gating = any(
+            warning.gates(now=now, stale_after_seconds=stale_after_seconds)
+            for warning in warnings
+        )
+        if gating or last_event_at is None:
             return Quiescence.UNKNOWN
         age_seconds = (now - last_event_at).total_seconds()
         if age_seconds < 0 or age_seconds > stale_after_seconds:

@@ -94,6 +94,9 @@ class _RawSession:
     started_at: datetime
     events: tuple[_TokenEvent, ...]
     warnings: tuple[str, ...]
+    # True when a record was skipped *after* the last usable token-count event,
+    # i.e. the reported figures are stale rather than merely incomplete.
+    stale_tail: bool = False
 
 
 class CodexUsageReader:
@@ -150,6 +153,7 @@ class CodexUsageReader:
         started_at: datetime | None = None
         events: list[_TokenEvent] = []
         warnings: list[str] = []
+        stale_tail = False
 
         with path.open("rb") as handle:
             while True:
@@ -166,6 +170,7 @@ class CodexUsageReader:
                     row = json.loads(raw_line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     warnings.append(f"invalid usage JSON at byte offset {offset}")
+                    stale_tail = True
                     continue
                 if not isinstance(row, dict):
                     continue
@@ -189,11 +194,14 @@ class CodexUsageReader:
                 info = payload.get("info")
                 if not isinstance(info, dict):
                     warnings.append(f"missing token info at byte offset {offset}")
+                    stale_tail = True
                     continue
                 window_tokens = _nonnegative_int(info.get("model_context_window"))
                 if window_tokens == 0:
                     warnings.append(f"missing context window at byte offset {offset}")
+                    stale_tail = True
                     continue
+                stale_tail = False
                 events.append(
                     _TokenEvent(
                         observed_at=_timestamp(row.get("timestamp"), path),
@@ -215,6 +223,7 @@ class CodexUsageReader:
             started_at=started_at or fallback_time,
             events=tuple(sorted(events, key=lambda event: event.observed_at)),
             warnings=tuple(warnings),
+            stale_tail=stale_tail,
         )
 
     def _to_usage(self, raw: _RawSession) -> CodexSessionUsage:
@@ -246,7 +255,12 @@ class CodexUsageReader:
                 )
                 confidence = Confidence.DEGRADED
 
-        if warnings and confidence is Confidence.CONFIDENT:
+        # BOU-2208: a warning used to promote the sample to DEGRADED wholesale,
+        # and the whole rollout is re-read on every sample, so one skipped
+        # record degraded every future sample for the session's life. Only a
+        # skip *after* the last usable event makes the reported figures wrong;
+        # an earlier skip is superseded by the later good event.
+        if raw.stale_tail and confidence is Confidence.CONFIDENT:
             confidence = Confidence.DEGRADED
         final = final_event.cumulative
         incremental = _subtract(final, baseline)

@@ -96,12 +96,21 @@ class FakeUsageReader:
         self.percent = percent
         self.confident = confident
         self.conversation_id = "native-conversation-0"
+        self.error: Exception | None = None
+        self.confidence: Confidence | None = None
+        self.calls = 0
 
     def sample(self, _process):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        confidence = self.confidence or (
+            Confidence.CONFIDENT if self.confident else Confidence.UNKNOWN
+        )
         return self.supervisor_module.UsageObservation(
             conversation_id=self.conversation_id,
             context_percent=self.percent,
-            confidence=(Confidence.CONFIDENT if self.confident else Confidence.UNKNOWN),
+            confidence=confidence,
         )
 
 
@@ -301,6 +310,7 @@ def _supervisor(
     stale_on_fence=False,
     heartbeat_interval_seconds=20.0,
     checkpoint_verified=True,
+    **supervisor_kwargs,
 ):
     process, supervisor = _modules()
     driver = FakeProcessDriver(process, crash_effect=crash_effect)
@@ -330,6 +340,7 @@ def _supervisor(
         "checkpoint_manager": checkpoints,
         "coordinator": coordinator,
         "heartbeat_interval_seconds": heartbeat_interval_seconds,
+        **supervisor_kwargs,
     }
     return supervisor.Supervisor(**kwargs), kwargs, driver, coordinator, checkpoints
 
@@ -1027,6 +1038,117 @@ def test_unknown_usage_during_drain_preserves_owner_and_blocks_checkpoint(
     assert still_draining.context_confidence is Confidence.UNKNOWN
     assert checkpoints.calls == []
     assert [call[0] for call in driver.calls] == ["start"]
+
+
+def test_transient_usage_adapter_error_does_not_block_the_chain(tmp_path) -> None:
+    """BOU-2208 latch 3: one flaky 5s adapter call used to destroy the session.
+
+    `JsonCommand.execute` raises `RuntimeError` on timeout, a non-zero exit, or
+    malformed JSON. Nothing caught it, so it unwound `tick()` into the CLI's
+    `finally: managed.shutdown()`, which persists `BLOCKED` and kills the
+    runtime; the next `supervise` then refuses to start.
+    """
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.error = RuntimeError("usage adapter timed out")
+
+    degraded = managed.tick(_activity(Quiescence.BUSY))
+
+    assert degraded.phase.value == "running"
+    assert degraded.context_confidence is Confidence.UNKNOWN
+    assert degraded.usage_sample_failure_streak == 1
+    assert [call[0] for call in driver.calls] == ["start"]
+
+    managed.usage_reader.error = None
+    recovered = managed.tick(_activity(Quiescence.BUSY))
+
+    assert recovered.phase.value == "draining"
+    assert recovered.context_percent == pytest.approx(75.0)
+    assert recovered.context_confidence is Confidence.CONFIDENT
+    assert recovered.usage_sample_failure_streak == 0
+    assert recovered.usage_alarm is None
+
+
+def test_persistent_usage_adapter_failure_raises_a_loud_alarm(tmp_path) -> None:
+    """Silence is the failure mode; a wedged sampler must announce itself."""
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(
+        tmp_path,
+        usage_failure_alarm_ticks=2,
+    )
+    managed.start()
+    managed.usage_reader.error = RuntimeError("usage adapter timed out")
+
+    for _ in range(3):
+        snapshot = managed.tick(_activity(Quiescence.BUSY))
+
+    assert snapshot.phase.value == "running"
+    assert snapshot.usage_alarm is not None
+    assert "usage" in snapshot.usage_alarm
+    assert [call[0] for call in driver.calls] == ["start"]
+    journal = (tmp_path / "supervisor.json.events").read_text(encoding="utf-8")
+    assert "usage-sample" in journal
+
+
+def test_degraded_usage_sample_still_updates_context_and_drains(tmp_path) -> None:
+    """BOU-2208 latch 2: degraded samples were discarded, percent never moved."""
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.confidence = Confidence.DEGRADED
+
+    snapshot = managed.tick(_activity(Quiescence.BUSY))
+
+    assert snapshot.phase.value == "draining"
+    assert snapshot.context_percent == pytest.approx(75.0)
+    assert snapshot.context_confidence is Confidence.DEGRADED
+    assert checkpoints.calls == []
+
+
+def test_prolonged_non_confident_sampling_rotates_with_an_alarm(tmp_path) -> None:
+    """Never rotating is worse than rotating on a degraded measurement.
+
+    Quiescence and the requested handoff still gate the transition, so this
+    cannot rotate while a tool is still running.
+    """
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(
+        tmp_path,
+        non_confident_rotation_tolerance_ticks=3,
+    )
+    managed.start()
+    managed.usage_reader.confidence = Confidence.DEGRADED
+
+    first = managed.tick(_handoff_activity())
+    second = managed.tick(_handoff_activity())
+
+    assert first.phase.value == "draining"
+    assert second.phase.value == "draining"
+    assert checkpoints.calls == []
+
+    third = managed.tick(_handoff_activity())
+
+    assert third.phase.value == "awaiting_ack"
+    assert third.usage_alarm is not None
+    assert len(checkpoints.calls) == 1
+
+
+def test_tolerated_non_confident_sampling_never_rotates_while_busy(tmp_path) -> None:
+    """The degrade path must not trade one latch for a worse bug."""
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(
+        tmp_path,
+        non_confident_rotation_tolerance_ticks=2,
+    )
+    managed.start()
+    managed.usage_reader.confidence = Confidence.DEGRADED
+
+    for _ in range(6):
+        snapshot = managed.tick(
+            _activity(
+                Quiescence.BUSY,
+                handoff_requested_generations=frozenset({0}),
+            )
+        )
+
+    assert snapshot.phase.value == "draining"
+    assert checkpoints.calls == []
 
 
 def test_successor_acknowledgement_requires_expected_generation_and_fingerprint(
