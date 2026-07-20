@@ -187,7 +187,11 @@ def doctor_report(
 
 
 def _coordinator_check() -> dict[str, object]:
-    expected = "0.2.0"
+    # Keep in step with the pinned `agent-coordinator` in pyproject.toml. The
+    # pin and this constant are two halves of one decision: bumping only the
+    # pin makes `doctor` report the harness incompatible with the library it
+    # actually ships against.
+    expected = "0.3.0"
     try:
         installed_version = metadata.version("agent-coordinator")
     except metadata.PackageNotFoundError:
