@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 import json
 import os
@@ -61,10 +62,17 @@ class EventLedger:
     ) -> ActivitySnapshot:
         events, warnings = self._read_events()
         seen: set[str] = set()
-        active_turns: set[str] = set()
-        active_tools: set[str] = set()
-        active_subagents: set[str] = set()
-        active_critical_sections: set[str] = set()
+        # Counted, not set-tracked: when a runtime supplies no tool-use id the
+        # hook derives one from the call's own fields, so two identical calls in
+        # one prompt share an id. Under set semantics the second finish would
+        # look like a finish-without-start, and that warning latches quiescence
+        # to UNKNOWN for the life of the supervisor -- rotation would never run.
+        # Counting makes repeats balance exactly. Quiescence only asks whether
+        # anything is outstanding, so this does not change its meaning.
+        active_turns: Counter[str] = Counter()
+        active_tools: Counter[str] = Counter()
+        active_subagents: Counter[str] = Counter()
+        active_critical_sections: Counter[str] = Counter()
         handoff_requested_generations: set[int] = set()
         last_event_at: datetime | None = None
         processed = 0
@@ -93,16 +101,21 @@ class EventLedger:
 
             if event.event_type in starts:
                 target, _label = starts[event.event_type]
-                target.add(event.activity_id or "")
+                target[event.activity_id or ""] += 1
             elif event.event_type in finishes:
                 target, label = finishes[event.event_type]
                 activity_id = event.activity_id or ""
-                if activity_id not in target:
+                if target[activity_id] <= 0:
+                    # Counter lookups insert a zero key; drop it so an unmatched
+                    # finish cannot leave phantom outstanding work behind.
+                    target.pop(activity_id, None)
                     warnings.append(
                         f"{label} finish without start: {activity_id or 'missing'}"
                     )
                 else:
-                    target.remove(activity_id)
+                    target[activity_id] -= 1
+                    if target[activity_id] == 0:
+                        del target[activity_id]
             elif event.event_type is EventType.HANDOFF_REQUESTED:
                 handoff_requested_generations.add(event.generation)
 

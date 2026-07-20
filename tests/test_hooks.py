@@ -94,17 +94,18 @@ def test_native_events_normalize_to_sanitized_lifecycle(
 @pytest.mark.parametrize(
     "hook_name",
     [
-        "PreToolUse",
-        "PostToolUse",
-        "PostToolUseFailure",
         "SubagentStart",
         "SubagentStop",
     ],
 )
-def test_concurrent_native_activity_without_an_opaque_id_fails_closed(
+def test_concurrent_subagent_activity_without_an_opaque_id_fails_closed(
     tmp_path,
     hook_name,
 ) -> None:
+    """Subagent events still fail closed — they do carry `agent_id`.
+
+    Tool events deliberately no longer do; see the companion test below.
+    """
     native, _command = _modules()
     payload = {
         "hook_event_name": hook_name,
@@ -121,6 +122,89 @@ def test_concurrent_native_activity_without_an_opaque_id_fails_closed(
             generation=0,
             owner_pid=1234,
         )
+
+
+@pytest.mark.parametrize(
+    "hook_name",
+    ["PreToolUse", "PostToolUse", "PostToolUseFailure"],
+)
+def test_tool_hooks_derive_an_activity_id_rather_than_blocking(
+    tmp_path,
+    hook_name,
+) -> None:
+    """BOU-2207: failing closed here blocks every tool call in a managed session.
+
+    Claude Code's documented tool payloads carry no tool-use identifier, and a
+    raised ValueError becomes exit 2, which for PreToolUse blocks the tool. The
+    harness must not depend on an undocumented field.
+    """
+    native, _command = _modules()
+    payload = {
+        "hook_event_name": hook_name,
+        "session_id": "conversation-1",
+        "cwd": str(tmp_path),
+        "timestamp": NOW.isoformat(),
+        "tool_name": "Bash",
+    }
+
+    event = native.normalize_native_event(
+        runtime="claude",
+        payload=payload,
+        chain_id="chain-1",
+        generation=0,
+        owner_pid=1234,
+    )
+
+    assert event.activity_id
+    assert event.activity_id.startswith("derived:")
+
+
+def test_pre_and_post_tool_hooks_derive_the_same_activity_id(tmp_path) -> None:
+    """The ledger pairs starts against finishes; a mismatch never reaches IDLE.
+
+    If Pre and Post derived different ids, `active_tools` would never empty and
+    rotation would stall forever — trading a blocking bug for a silent one.
+    """
+    native, _command = _modules()
+
+    def _event(hook_name: str):
+        return native.normalize_native_event(
+            runtime="claude",
+            payload={
+                "hook_event_name": hook_name,
+                "session_id": "conversation-1",
+                "cwd": str(tmp_path),
+                "timestamp": NOW.isoformat(),
+                "prompt_id": "prompt-1",
+                "tool_name": "Bash",
+            },
+            chain_id="chain-1",
+            generation=0,
+            owner_pid=1234,
+        )
+
+    assert _event("PreToolUse").activity_id == _event("PostToolUse").activity_id
+
+
+def test_supplied_tool_use_id_wins_over_the_derived_id(tmp_path) -> None:
+    native, _command = _modules()
+
+    event = native.normalize_native_event(
+        runtime="claude",
+        payload={
+            "hook_event_name": "PreToolUse",
+            "session_id": "conversation-1",
+            "cwd": str(tmp_path),
+            "timestamp": NOW.isoformat(),
+            "tool_name": "Bash",
+            "tool_use_id": "toolu_01REAL",
+        },
+        chain_id="chain-1",
+        generation=0,
+        owner_pid=1234,
+    )
+
+    assert event.activity_id == "toolu_01REAL"
 
 
 @pytest.mark.parametrize("runtime", ["claude", "codex"])
