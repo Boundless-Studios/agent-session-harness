@@ -39,11 +39,14 @@ def test_duplicate_content_rows_count_one_api_message() -> None:
 
 
 def test_live_context_includes_input_cache_and_output(tmp_path) -> None:
+    # The model is long-context so the 1M window under test is the one the
+    # rollout actually names; `window_tokens` is only a fallback for
+    # unrecognized identities and no longer overrides the model.
     rollout = tmp_path / "cache.jsonl"
     rollout.write_text(
         '{"type":"assistant","timestamp":"2026-07-19T03:00:00Z",'
         '"sessionId":"claude-cache","cwd":"/tmp/project","message":{'
-        '"id":"msg-cache","model":"claude-opus-4-6","usage":{'
+        '"id":"msg-cache","model":"claude-opus-4-8[1m]","usage":{'
         '"input_tokens":10000,"output_tokens":10000,'
         '"cache_creation_input_tokens":5000,"cache_read_input_tokens":100000},'
         '"content":[]}}\n',
@@ -124,3 +127,108 @@ def test_project_discovery_reports_ambiguous_live_conversations(tmp_path) -> Non
     assert discovery.error == "multiple Claude conversations match cwd"
     assert discovery.candidates == tuple(sorted(discovery.candidates))
     assert len(discovery.candidates) == 2
+
+
+def _assistant_row(
+    *, message_id: str, model: str, timestamp: str, input_tokens: int = 100_000
+) -> str:
+    return json.dumps(
+        {
+            "type": "assistant",
+            "timestamp": timestamp,
+            "sessionId": "claude-window",
+            "cwd": "/tmp/project",
+            "message": {
+                "id": message_id,
+                "model": model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+                "content": [],
+            },
+        }
+    )
+
+
+def test_window_is_derived_from_a_1m_model_not_the_fallback(tmp_path) -> None:
+    """BOU-2211: a 1M-context model must not be measured against a 200k window.
+
+    The supervisor supplies a conservative fallback, but the model identity in
+    the rollout is authoritative and has to win. Otherwise a 1M session reports
+    ~5x its real usage and drains at ~14% of the real window.
+    """
+    rollout = tmp_path / "one-million.jsonl"
+    rollout.write_text(
+        _assistant_row(
+            message_id="msg-1m",
+            model="claude-opus-4-8[1m]",
+            timestamp="2026-07-19T03:00:00Z",
+            input_tokens=200_000,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    usage = _reader(window_tokens=200_000).read_file(rollout)
+
+    assert usage.window_tokens == 1_000_000
+    assert usage.context_percent == pytest.approx(20.0)
+    assert usage.confidence is Confidence.CONFIDENT
+
+
+def test_mixed_model_rollout_uses_the_most_recent_model(tmp_path) -> None:
+    """BOU-2211: model switching is routine and must not disable usage sampling.
+
+    A `/model` switch mid-session leaves two model identities in one rollout.
+    The latest assistant message is the one whose window is actually in force.
+    """
+    rollout = tmp_path / "mixed-model.jsonl"
+    rollout.write_text(
+        "\n".join(
+            [
+                _assistant_row(
+                    message_id="msg-old",
+                    model="claude-opus-4-6",
+                    timestamp="2026-07-19T03:00:00Z",
+                ),
+                _assistant_row(
+                    message_id="msg-new",
+                    model="claude-opus-4-8[1m]",
+                    timestamp="2026-07-19T04:00:00Z",
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    usage = _reader(window_tokens=200_000).read_file(rollout)
+
+    assert usage.window_tokens == 1_000_000
+    assert usage.confidence is Confidence.CONFIDENT
+
+
+def test_unknown_model_falls_back_to_the_supplied_window(tmp_path) -> None:
+    """An unmapped model degrades to the caller's fallback rather than failing.
+
+    Refusing to produce a sample would stop rotation entirely, which is the very
+    failure BOU-2195 exists to prevent.
+    """
+    rollout = tmp_path / "unknown-model.jsonl"
+    rollout.write_text(
+        _assistant_row(
+            message_id="msg-unknown",
+            model="claude-not-a-real-model",
+            timestamp="2026-07-19T03:00:00Z",
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    usage = _reader(window_tokens=200_000).read_file(rollout)
+
+    assert usage.window_tokens == 200_000
+    assert usage.context_percent == pytest.approx(50.0)
