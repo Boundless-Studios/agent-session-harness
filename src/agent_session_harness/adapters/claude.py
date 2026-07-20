@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from ..models import Confidence, Runtime, UsageSample
+from .discovery import iter_files
 
 
 class ClaudeDiscovery(BaseModel):
@@ -263,7 +264,7 @@ class ClaudeUsageReader:
         resolved_cwd = Path(cwd).expanduser().resolve()
         slug = str(resolved_cwd).replace(os.sep, "-")
         candidates: list[Path] = []
-        for path in root.rglob("*.jsonl"):
+        for path in iter_files(root):
             relative_parts = path.relative_to(root).parts
             slug_match = bool(relative_parts and relative_parts[0] == slug)
             if slug_match or self._contains_cwd(path, resolved_cwd):

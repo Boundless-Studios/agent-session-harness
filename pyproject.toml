@@ -16,7 +16,11 @@ dependencies = [
 agent-session-harness = "agent_session_harness.cli:main"
 
 [project.optional-dependencies]
-dev = ["build>=1", "pytest>=8", "ruff>=0.12"]
+dev = ["build>=1", "httpx>=0.27,<1", "pytest>=8", "ruff>=0.12"]
+# The beads checkpoint adapter shells out to the `bd` CLI and pulls in no
+# Python packages; the extra exists to declare that runtime requirement.
+beads = []
+linear = ["httpx>=0.27,<1"]
 
 [build-system]
 requires = ["hatchling"]

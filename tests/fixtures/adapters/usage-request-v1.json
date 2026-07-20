@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "operation": "sample",
+  "process": {
+    "pid": 4242,
+    "process_group_id": 4243,
+    "registry_key": "chain-1:0",
+    "identity": "guardian-identity",
+    "command_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "launch_nonce": "launch-1"
+  }
+}

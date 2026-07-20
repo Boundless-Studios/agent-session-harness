@@ -1,0 +1,2 @@
+{"schema_version":1,"event_id":"session-start","runtime":"claude","chain_id":"chain-1","conversation_id":"claude-session-1","generation":0,"event_type":"session.started","timestamp":"2026-07-19T08:00:00Z","cwd":"__WORKTREE__","owner_pid":4242,"activity_id":null,"name":null}
+{"schema_version":1,"event_id":"turn-start","runtime":"claude","chain_id":"chain-1","conversation_id":"claude-session-1","generation":0,"event_type":"turn.started","timestamp":"2026-07-19T08:01:00Z","cwd":"__WORKTREE__","owner_pid":4242,"activity_id":"turn-1","name":null}
