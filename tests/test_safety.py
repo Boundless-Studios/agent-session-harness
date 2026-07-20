@@ -5,7 +5,11 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from agent_session_harness.activity import ActivitySnapshot, Quiescence
+from agent_session_harness.activity import (
+    ActivitySnapshot,
+    Quiescence,
+    RuntimeLiveness,
+)
 from agent_session_harness.safety import (
     ProjectSafetyObservation,
     ProjectSafetyStatus,
@@ -71,6 +75,32 @@ def test_busy_project_blocks_rotation_and_names_critical_sections() -> None:
     assert merged.active_critical_section_ids == frozenset(
         {"git-index-lock", "deployment"}
     )
+
+
+def test_project_safety_merge_preserves_runtime_liveness() -> None:
+    """BOU-2222: the probe answers a different question than hook liveness.
+
+    A quiescent project must not be able to launder a silent runtime into a
+    snapshot that looks like it is reporting.
+    """
+    silent = ActivitySnapshot(
+        quiescence=Quiescence.UNKNOWN,
+        active_turn_ids=frozenset(),
+        active_tool_ids=frozenset(),
+        active_subagent_ids=frozenset(),
+        active_critical_section_ids=frozenset(),
+        processed_event_count=0,
+        last_event_at=None,
+        integrity_warnings=(),
+        runtime_liveness=RuntimeLiveness.NEVER_REPORTED,
+    )
+
+    merged = merge_project_safety(
+        silent,
+        _observation(ProjectSafetyStatus.QUIESCENT),
+    )
+
+    assert merged.runtime_liveness is RuntimeLiveness.NEVER_REPORTED
 
 
 def test_busy_project_without_a_name_gets_a_stable_sentinel() -> None:

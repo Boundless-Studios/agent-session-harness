@@ -14,7 +14,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .activity import ActivitySnapshot, Quiescence
+from .activity import ActivitySnapshot, Quiescence, RuntimeLiveness
 from .adapters.command import sanitize_error
 from .capsule import HandoffCapsule
 from .coordinator import ClaimHandle, CoordinatorAdapter, StaleOwnerError
@@ -49,6 +49,30 @@ USAGE_FAILURE_ALARM_TICKS = 3
 # fix; the quiescence and requested-handoff gates still hold, so this can never
 # rotate while a tool is running.
 NON_CONFIDENT_ROTATION_TOLERANCE_TICKS = 5
+# BOU-2222: consecutive ticks of a runtime reporting fault before the supervisor
+# announces that the lifecycle hooks have stopped speaking. A fresh generation
+# legitimately has an empty ledger for its first tick or two, so one faulted
+# observation is not yet evidence.
+RUNTIME_SILENCE_ALARM_TICKS = 3
+# ...and the wall-clock floor underneath that tick count. The poll interval is
+# operator-configurable down to milliseconds, so ticks alone would alarm on a
+# session that is a few hundred milliseconds old. Silence only means something
+# once it has lasted longer than a plausible gap between hook events.
+RUNTIME_SILENCE_GRACE_SECONDS = 60.0
+_RUNTIME_SILENCE_ALARMS = {
+    RuntimeLiveness.NEVER_REPORTED: (
+        "runtime lifecycle hooks have never reported an event while the managed "
+        "process is live; the session cannot rotate and will run out of context"
+    ),
+    RuntimeLiveness.SILENT_ACTIVE: (
+        "runtime lifecycle hooks stopped reporting with work still outstanding; "
+        "rotation is withheld because a call may still be in flight"
+    ),
+    RuntimeLiveness.SILENT_IDLE: (
+        "runtime lifecycle hooks stopped reporting; rotation is withheld because "
+        "silence cannot be distinguished from a broken hook"
+    ),
+}
 
 
 class SupervisorPhase(str, Enum):
@@ -154,6 +178,9 @@ class SupervisorSnapshot(BaseModel):
     usage_sample_failure_streak: int = Field(default=0, ge=0)
     non_confident_sample_streak: int = Field(default=0, ge=0)
     usage_alarm: str | None = Field(default=None, max_length=320)
+    runtime_silence_streak: int = Field(default=0, ge=0)
+    runtime_silence_since: datetime | None = None
+    liveness_alarm: str | None = Field(default=None, max_length=320)
 
 
 class Supervisor:
@@ -185,6 +212,8 @@ class Supervisor:
         non_confident_rotation_tolerance_ticks: int = (
             NON_CONFIDENT_ROTATION_TOLERANCE_TICKS
         ),
+        runtime_silence_alarm_ticks: int = RUNTIME_SILENCE_ALARM_TICKS,
+        runtime_silence_grace_seconds: float = RUNTIME_SILENCE_GRACE_SECONDS,
     ):
         if not 0 < warn_percent < rotate_percent <= 100:
             raise ValueError("thresholds must satisfy 0 < warn < rotate <= 100")
@@ -200,6 +229,10 @@ class Supervisor:
             raise ValueError(
                 "non-confident rotation tolerance must allow at least one retry"
             )
+        if runtime_silence_alarm_ticks < 1:
+            raise ValueError("runtime silence alarm threshold must be positive")
+        if runtime_silence_grace_seconds < 0:
+            raise ValueError("runtime silence grace must be non-negative")
         if not 0 <= heartbeat_interval_seconds < lease_seconds:
             raise ValueError(
                 "heartbeat interval must satisfy 0 <= interval < lease seconds"
@@ -258,6 +291,8 @@ class Supervisor:
         self.non_confident_rotation_tolerance_ticks = (
             non_confident_rotation_tolerance_ticks
         )
+        self.runtime_silence_alarm_ticks = runtime_silence_alarm_ticks
+        self.runtime_silence_grace_seconds = runtime_silence_grace_seconds
         self.run_spec_fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -523,6 +558,11 @@ class Supervisor:
             SupervisorPhase.DRAINING,
         }:
             self._observe_usage()
+            # BOU-2222: evaluated in RUNNING and WARNING too. A session whose
+            # hooks are dead is already broken there; waiting until it reaches
+            # DRAINING to notice means the first symptom is a session that has
+            # quietly stopped rotating.
+            self._observe_runtime_liveness(activity)
             if self.snapshot.phase is SupervisorPhase.DRAINING:
                 # Safety gates, never relaxed: the runtime asked to hand off and
                 # nothing is outstanding. Rotating past either would be worse
@@ -532,6 +572,13 @@ class Supervisor:
                     not in activity.handoff_requested_generations
                     or activity.quiescence is not Quiescence.IDLE
                 ):
+                    return self.snapshot
+                # Both gates above are computed from the very reporting path
+                # that liveness says is broken, so neither can be trusted on
+                # its own here. A handoff request recorded before the hooks
+                # went silent is not consent to rotate now, and an absence of
+                # start events is not proof that no tool is running.
+                if activity.runtime_liveness.is_faulted:
                     return self.snapshot
                 # Measurement quality is a different question. Waiting forever
                 # for a CONFIDENT sample is exactly how a degraded reader pinned
@@ -627,6 +674,9 @@ class Supervisor:
                 "usage_sample_failure_streak": 0,
                 "non_confident_sample_streak": 0,
                 "usage_alarm": None,
+                "runtime_silence_streak": 0,
+                "runtime_silence_since": None,
+                "liveness_alarm": None,
             }
         )
         self._persist()
@@ -807,13 +857,87 @@ class Supervisor:
                 "context growth is no longer observable"
             )
 
-    def _raise_usage_alarm(self, message: str) -> None:
-        bounded = sanitize_error(message, max_length=320)
-        if self.snapshot.usage_alarm == bounded:
+    def _observe_runtime_liveness(self, activity: ActivitySnapshot) -> None:
+        """Announce a runtime that has stopped reporting through its hooks.
+
+        BOU-2222: hooks that never fire produce no findings at all, only an
+        absence of events, and quiescence renders that absence as UNKNOWN --
+        the same value it uses for a merely stale ledger. `DRAINING` only
+        leaves for `IDLE`, so the session parks above the rotate threshold and
+        looks identical to a healthy one until it runs out of context. The
+        reporting fault cannot fix itself, so the alarm is the whole remedy:
+        rotation stays blocked either way, but it stops being silent.
+
+        `_ensure_active_process_is_live` has already run this tick, so reaching
+        here means the managed child is alive. Silence is therefore a property
+        of the reporting path, not of a runtime that simply exited.
+        """
+        now = self._now()
+        if not activity.runtime_liveness.is_faulted:
+            cleared = self.snapshot.liveness_alarm is not None
+            if cleared or self.snapshot.runtime_silence_streak:
+                self.snapshot = self.snapshot.model_copy(
+                    update={
+                        "runtime_silence_streak": 0,
+                        "runtime_silence_since": None,
+                        "liveness_alarm": None,
+                    }
+                )
+                self._persist()
+            if cleared:
+                self._effect(
+                    "runtime-liveness",
+                    "recovered",
+                    generation=self.snapshot.generation,
+                )
             return
-        self.snapshot = self.snapshot.model_copy(update={"usage_alarm": bounded})
+        streak = self.snapshot.runtime_silence_streak + 1
+        since = self.snapshot.runtime_silence_since or now
+        self.snapshot = self.snapshot.model_copy(
+            update={
+                "runtime_silence_streak": streak,
+                "runtime_silence_since": since,
+            }
+        )
         self._persist()
-        self._effect("usage-sample", "alarm", generation=self.snapshot.generation)
+        # Both floors must be cleared: the tick count keeps a single unlucky
+        # observation from alarming, and the elapsed window keeps a fast poll
+        # interval from turning those ticks into a fraction of a second.
+        if streak < self.runtime_silence_alarm_ticks:
+            return
+        if (now - since).total_seconds() < self.runtime_silence_grace_seconds:
+            return
+        # Stable per-fault text: the running count lives in the streak field, so
+        # the alarm announces once per episode instead of on every poll.
+        self._raise_alarm(
+            field="liveness_alarm",
+            current=self.snapshot.liveness_alarm,
+            effect="runtime-liveness",
+            message=_RUNTIME_SILENCE_ALARMS[activity.runtime_liveness],
+        )
+
+    def _raise_usage_alarm(self, message: str) -> None:
+        self._raise_alarm(
+            field="usage_alarm",
+            current=self.snapshot.usage_alarm,
+            effect="usage-sample",
+            message=message,
+        )
+
+    def _raise_alarm(
+        self,
+        *,
+        field: str,
+        current: str | None,
+        effect: str,
+        message: str,
+    ) -> None:
+        bounded = sanitize_error(message, max_length=320)
+        if current == bounded:
+            return
+        self.snapshot = self.snapshot.model_copy(update={field: bounded})
+        self._persist()
+        self._effect(effect, "alarm", generation=self.snapshot.generation)
         print(f"agent-session-harness alarm: {bounded}", file=sys.stderr, flush=True)
 
     def _advance_rotation(self) -> SupervisorSnapshot:

@@ -341,3 +341,103 @@ def test_ledger_refuses_to_append_past_its_byte_bound(
 
     with pytest.raises(ValueError, match="byte limit"):
         ledger.append(_event(events, tmp_path, "event-2", "tool.finished"))
+
+
+def test_liveness_reports_never_reported_when_no_hook_event_exists(tmp_path) -> None:
+    """BOU-2222: an absence of events is a distinct fault from a stale event.
+
+    Quiescence collapses "hooks never worked" and "hooks stopped" into the same
+    UNKNOWN, so a session whose hooks were never installed looks exactly like a
+    session sitting between turns.
+    """
+    _models, _events, ledger_module, activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+
+    snapshot = ledger.materialize(now=NOW, stale_after_seconds=30)
+
+    assert snapshot.quiescence is activity.Quiescence.UNKNOWN
+    assert snapshot.runtime_liveness is activity.RuntimeLiveness.NEVER_REPORTED
+
+
+def test_supervisor_written_handoff_events_are_not_hook_liveness(tmp_path) -> None:
+    """Only the runtime's own hooks prove the hooks are alive.
+
+    The supervisor appends checkpoint and acknowledgement events itself, so a
+    successor generation with completely dead hooks still has a non-empty
+    ledger. Counting those as evidence would hide the fault after the first
+    rotation.
+    """
+    _models, events, ledger_module, activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "handoff-ack:chain-1:1",
+            "handoff.acknowledged",
+            activity_id=None,
+        )
+    )
+
+    snapshot = ledger.materialize(now=NOW, stale_after_seconds=30)
+
+    assert snapshot.runtime_liveness is activity.RuntimeLiveness.NEVER_REPORTED
+
+
+def test_liveness_separates_silence_while_idle_from_silence_mid_tool(
+    tmp_path,
+) -> None:
+    """Silence with work outstanding is the dangerous case; keep it separate."""
+    _models, events, ledger_module, activity = _modules()
+    idle_ledger = ledger_module.EventLedger(tmp_path / "idle.jsonl")
+    idle_ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+    idle_ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "event-2",
+            "tool.finished",
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+    busy_ledger = ledger_module.EventLedger(tmp_path / "busy.jsonl")
+    busy_ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+
+    silent_idle = idle_ledger.materialize(
+        now=NOW + timedelta(seconds=600),
+        stale_after_seconds=30,
+    )
+    fresh = busy_ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    )
+    silent_active = busy_ledger.materialize(
+        now=NOW + timedelta(seconds=600),
+        stale_after_seconds=30,
+    )
+
+    assert silent_idle.runtime_liveness is activity.RuntimeLiveness.SILENT_IDLE
+    assert fresh.runtime_liveness is activity.RuntimeLiveness.REPORTING
+    assert silent_active.runtime_liveness is activity.RuntimeLiveness.SILENT_ACTIVE
+    assert silent_active.active_tool_ids == frozenset({"activity-1"})
+
+
+def test_integrity_warnings_alone_do_not_claim_the_hooks_are_dead(tmp_path) -> None:
+    """A parse problem is a ledger fault, not evidence the runtime went silent.
+
+    BOU-2208 made those findings age out of quiescence; liveness must not
+    quietly reintroduce them as a permanent fault under a new name.
+    """
+    _models, events, ledger_module, activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+    with ledger.path.open("a", encoding="utf-8") as handle:
+        handle.write('{"truncated":\n')
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.quiescence is activity.Quiescence.UNKNOWN
+    assert snapshot.runtime_liveness is activity.RuntimeLiveness.REPORTING

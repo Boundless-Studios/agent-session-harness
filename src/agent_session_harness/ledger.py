@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .activity import ActivitySnapshot, Quiescence
+from .activity import ActivitySnapshot, Quiescence, RuntimeLiveness
 from .events import LifecycleEvent
 from .models import EventType
 from .secure_files import (
@@ -27,6 +27,18 @@ MAX_LEDGER_BYTES = 16 * 1_048_576
 MAX_LEDGER_EVENTS = 50_000
 MAX_EVENT_BYTES = 64 * 1024
 MAX_RETAINED_WARNINGS = 256
+
+# BOU-2222: the supervisor appends these itself, so they are proof that the
+# supervisor is alive, never that the runtime's hooks are. A successor whose
+# hooks are completely dead still has an acknowledgement in its ledger, and
+# counting it would hide the fault from the first rotation onwards.
+SUPERVISOR_AUTHORED_EVENT_TYPES = frozenset(
+    {
+        EventType.HANDOFF_CHECKPOINTED,
+        EventType.HANDOFF_ACKNOWLEDGED,
+        EventType.HANDOFF_FENCED,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,7 @@ class EventLedger:
         active_critical_sections: Counter[str] = Counter()
         handoff_requested_generations: set[int] = set()
         last_event_at: datetime | None = None
+        last_hook_event_at: datetime | None = None
         processed = 0
 
         starts = {
@@ -126,6 +139,10 @@ class EventLedger:
             processed += 1
             if last_event_at is None or event.timestamp > last_event_at:
                 last_event_at = event.timestamp
+            if event.event_type not in SUPERVISOR_AUTHORED_EVENT_TYPES and (
+                last_hook_event_at is None or event.timestamp > last_hook_event_at
+            ):
+                last_hook_event_at = event.timestamp
 
             if event.event_type in starts:
                 target, _label = starts[event.event_type]
@@ -172,6 +189,12 @@ class EventLedger:
         )
         return ActivitySnapshot(
             quiescence=quiescence,
+            runtime_liveness=self._runtime_liveness(
+                last_hook_event_at=last_hook_event_at,
+                now=now,
+                stale_after_seconds=stale_after_seconds,
+                has_active=any(active_groups),
+            ),
             active_turn_ids=frozenset(active_turns),
             active_tool_ids=frozenset(active_tools),
             active_subagent_ids=frozenset(active_subagents),
@@ -282,6 +305,33 @@ class EventLedger:
         self._line_count = 0
         self._cached_events.clear()
         self._cached_warnings.clear()
+
+    @staticmethod
+    def _runtime_liveness(
+        *,
+        last_hook_event_at: datetime | None,
+        now: datetime,
+        stale_after_seconds: float,
+        has_active: bool,
+    ) -> RuntimeLiveness:
+        """Classify the reporting path itself, independently of quiescence.
+
+        Integrity warnings are deliberately not consulted: an unparseable line
+        says the ledger is briefly untrustworthy, not that the runtime stopped
+        talking. Folding them in here would re-create the BOU-2208 latch under
+        a new name.
+        """
+        if last_hook_event_at is None:
+            return RuntimeLiveness.NEVER_REPORTED
+        age_seconds = (now - last_hook_event_at).total_seconds()
+        if age_seconds <= stale_after_seconds:
+            # Includes a negative age from clock skew: the events are fresh
+            # enough to prove the hooks are alive, and quiescence separately
+            # refuses to trust their ordering.
+            return RuntimeLiveness.REPORTING
+        return (
+            RuntimeLiveness.SILENT_ACTIVE if has_active else RuntimeLiveness.SILENT_IDLE
+        )
 
     @staticmethod
     def _quiescence(

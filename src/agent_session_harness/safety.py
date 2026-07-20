@@ -128,4 +128,7 @@ def merge_project_safety(
         last_event_at=activity.last_event_at,
         integrity_warnings=activity.integrity_warnings + observation.warnings,
         handoff_requested_generations=activity.handoff_requested_generations,
+        # The project probe observes the worktree, not the runtime's hooks, so
+        # it can neither confirm nor clear a reporting fault (BOU-2222).
+        runtime_liveness=activity.runtime_liveness,
     )

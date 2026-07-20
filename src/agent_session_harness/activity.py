@@ -13,6 +13,28 @@ class Quiescence(str, Enum):
     UNKNOWN = "unknown"
 
 
+class RuntimeLiveness(str, Enum):
+    """Whether the runtime's own hooks are still reporting at all.
+
+    BOU-2222: quiescence answers "is work outstanding", and it collapses every
+    way of not knowing into UNKNOWN. A session whose hooks broke -- never
+    installed, misconfigured, crashed bridge -- is therefore indistinguishable
+    from a session that is merely between turns, and it parks in DRAINING
+    forever with no finding to show for it. Liveness answers the separate
+    question "is the reporting path itself working", so that silence can be
+    named as a fault instead of read as calm.
+    """
+
+    REPORTING = "reporting"
+    NEVER_REPORTED = "never_reported"
+    SILENT_IDLE = "silent_idle"
+    SILENT_ACTIVE = "silent_active"
+
+    @property
+    def is_faulted(self) -> bool:
+        return self is not RuntimeLiveness.REPORTING
+
+
 @dataclass(frozen=True)
 class ActivitySnapshot:
     quiescence: Quiescence
@@ -24,6 +46,7 @@ class ActivitySnapshot:
     last_event_at: datetime | None
     integrity_warnings: tuple[str, ...]
     handoff_requested_generations: frozenset[int] = frozenset()
+    runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
 
     @property
     def active_count(self) -> int:

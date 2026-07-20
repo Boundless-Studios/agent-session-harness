@@ -15,7 +15,7 @@ from typing import Literal, Mapping, Sequence
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from . import __version__
-from .activity import Quiescence
+from .activity import Quiescence, RuntimeLiveness
 from .adapters.command import (
     AdapterOperation,
     AdapterRequest,
@@ -61,6 +61,11 @@ class StatusReport(BaseModel):
     active: ActiveCounts
     checkpoint_fingerprint: str | None
     outbox_depth: int = Field(ge=0)
+    # BOU-2222: quiescence alone cannot tell a dashboard whether the runtime is
+    # calm or mute, and a mute runtime never rotates.
+    runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
+    liveness_alarm: str | None = None
+    usage_alarm: str | None = None
 
 
 def build_report(
@@ -73,6 +78,8 @@ def build_report(
 ) -> StatusReport:
     state = SupervisorSnapshot.model_validate_json(read_private_text(state_path))
     quiescence = Quiescence.UNKNOWN
+    # No ledger to read is itself the "no hook has ever reported" case.
+    runtime_liveness = RuntimeLiveness.NEVER_REPORTED
     active = ActiveCounts()
     if ledger_path is not None:
         snapshot = EventLedger(ledger_path).materialize(
@@ -80,6 +87,7 @@ def build_report(
             stale_after_seconds=stale_after_seconds,
         )
         quiescence = snapshot.quiescence
+        runtime_liveness = snapshot.runtime_liveness
         active = ActiveCounts(
             turns=len(snapshot.active_turn_ids),
             tools=len(snapshot.active_tool_ids),
@@ -102,6 +110,9 @@ def build_report(
         active=active,
         checkpoint_fingerprint=state.checkpoint_fingerprint,
         outbox_depth=outbox_depth,
+        runtime_liveness=runtime_liveness,
+        liveness_alarm=state.liveness_alarm,
+        usage_alarm=state.usage_alarm,
     )
 
 
