@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"claude-session-1","message":{"content":"private text that must not be staged"},"cwd":"__WORKTREE__"}
+{"type":"assistant","sessionId":"claude-session-1","timestamp":"2026-07-19T08:01:01Z","message":{"id":"msg-1","model":"claude-opus-4-6","usage":{"input_tokens":1000,"output_tokens":100,"cache_creation_input_tokens":200,"cache_read_input_tokens":300},"content":[{"type":"text","text":"private answer that must not be staged"},{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"private"}}]}}

@@ -222,6 +222,32 @@ Allowed statuses are `quiescent`, `busy`, and `unknown`. Project and native life
 
 All adapter commands are direct argv execution with a five-second default timeout. Usage/capsule stdout is capped at 1 MiB; checkpoint stdout and all stderr are capped at 64 KiB. Overflow, malformed JSON, timeout, or non-zero exit fails closed; mirror checkpoint failures alone are queued for retry.
 
+## Built-in adapters
+
+Nothing about a usage rollout, a Git index lock, a beads note, or a Linear comment is project-specific, so the harness ships those four adapters itself. Each speaks the same stdin/stdout JSON contract as an external adapter and is addressable as an argv array:
+
+```bash
+agent-session-harness adapter usage --claude-fallback-window-tokens 200000
+agent-session-harness adapter project-safety
+agent-session-harness adapter beads
+agent-session-harness adapter linear --credential-variable LINEAR_API_KEY
+```
+
+- `adapter usage` resolves the conversation from the harness lifecycle ledger, locates its rollout by conversation identity, strips it to accounting metadata, and samples it. The context window comes from the model the rollout names; `--claude-fallback-window-tokens` applies only to model identities the harness does not recognize and never overrides a recognized one.
+- `adapter project-safety` is the reference implementation of the project-quiescence contract above: real Git index locks, harness-owned critical-section leases with PID-reuse detection, and sibling processes still in the runtime process group.
+- `adapter beads` needs the `bd` CLI on `PATH` (extra: `beads`, which carries no Python packages).
+- `adapter linear` needs the `linear` extra (`httpx`). **Credentials are always injected.** The adapter never reads a host project's secret store: the default provider reads one environment variable, and a host with its own secret manager passes a `CredentialProvider` (or a complete transport) into `agent_session_harness.adapters.linear.main`.
+
+Wire them into a managed run exactly like any external adapter:
+
+```bash
+  --usage-adapter '["agent-session-harness","adapter","usage"]' \
+  --safety-adapter '["agent-session-harness","adapter","project-safety"]' \
+  --required-adapter 'beads=["agent-session-harness","adapter","beads"]' \
+  --mirror-adapter 'linear=["agent-session-harness","adapter","linear"]' \
+  --adapter-env linear=LINEAR_API_KEY
+```
+
 ## Native hooks
 
 Install owned hook fragments additively; unrelated hooks and their order are preserved.
@@ -277,7 +303,7 @@ Consumers should project this record; they should not infer lifecycle ownership 
 - [`agent-coordinator`](https://github.com/Boundless-Studios/agent-coordinator) owns atomic claims and lease-epoch fencing.
 - `worktree-deck` may route fresh actions through a managed command while preserving its explicit manual-resume action.
 - `agentic-pr-dash` may ingest lifecycle events and canonical status reports, but PR concepts never enter this package.
-- Project adapters own beads/Linear updates, repository safety checks, and any project-specific hook policy.
+- Generic adapters (usage sampling, project safety, beads, Linear) ship here; see [Built-in adapters](#built-in-adapters). Project adapters own capsule authoring from a host's own task records, credential loading, and any project-specific hook policy.
 
 ## Privacy and recovery
 

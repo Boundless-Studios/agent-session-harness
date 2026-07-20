@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "operation": "write",
+  "idempotency_key": "chain-1:1",
+  "capsule": {
+    "schema_version": 1,
+    "chain_id": "chain-1",
+    "predecessor_conversation_id": "conversation-0",
+    "target_generation": 1,
+    "task_ids": {
+      "linear": "BOU-2212",
+      "bead": "bead-1"
+    },
+    "objective": "Ship crash-safe fresh-session rotation.",
+    "exact_next_action": "Run the adapter contract tests.",
+    "completed_criteria": [
+      "harness checkpoint verified"
+    ],
+    "remaining_criteria": [
+      "host adapter verified"
+    ],
+    "repository_path": "/tmp/harness-worktree",
+    "branch": "bou-2212-test",
+    "head": "deadbeef",
+    "dirty_paths": [],
+    "file_anchors": [
+      "src/agent_session_harness/adapters/beads.py"
+    ],
+    "symbol_anchors": [
+      "handle_request"
+    ],
+    "test_results": {
+      "focused": "running"
+    },
+    "decisions": [
+      "beads is required"
+    ],
+    "blockers": [],
+    "process_summaries": {
+      "pytest": "idle"
+    },
+    "created_at": "2026-07-19T08:00:00Z",
+    "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+}

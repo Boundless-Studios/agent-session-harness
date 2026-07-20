@@ -13,6 +13,10 @@ import sys
 import time
 from typing import Any
 
+from .adapters import beads as beads_adapter
+from .adapters import linear as linear_adapter
+from .adapters import project_safety as project_safety_adapter
+from .adapters import usage as usage_adapter
 from .adapters.claude import ClaudeUsageReader
 from .adapters.codex import CodexUsageReader
 from .adapters.command import CommandAdapter, JsonCommand, sanitize_error
@@ -230,6 +234,53 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_json(replay)
     replay.set_defaults(handler=_run_outbox)
+
+    adapter = subparsers.add_parser(
+        "adapter",
+        help="run one bounded JSON adapter over stdin/stdout",
+    )
+    adapter_actions = adapter.add_subparsers(dest="adapter_action", required=True)
+
+    usage = adapter_actions.add_parser(
+        "usage", help="sample usage for one managed conversation"
+    )
+    usage.add_argument("--ledger", action="append", default=[])
+    usage.add_argument("--cwd", default=None)
+    usage.add_argument("--claude-root", action="append")
+    usage.add_argument("--codex-root", action="append")
+    usage.add_argument(
+        "--claude-fallback-window-tokens",
+        type=int,
+        help=(
+            "context window for model identities the rollout names but the "
+            "harness does not recognize; never overrides a recognized model"
+        ),
+    )
+    usage.add_argument(
+        "--max-rollout-bytes", type=int, default=usage_adapter.MAX_ROLLOUT_BYTES
+    )
+    usage.set_defaults(handler=_run_adapter)
+
+    project_safety = adapter_actions.add_parser(
+        "project-safety", help="probe host repository quiescence"
+    )
+    project_safety.set_defaults(handler=_run_adapter)
+
+    beads = adapter_actions.add_parser(
+        "beads", help="mirror one checkpoint into the beads tracker"
+    )
+    beads.add_argument("--bd-command", action="append", default=[])
+    beads.set_defaults(handler=_run_adapter)
+
+    linear = adapter_actions.add_parser(
+        "linear", help="mirror one checkpoint into a Linear issue"
+    )
+    linear.add_argument(
+        "--credential-variable",
+        default=linear_adapter.DEFAULT_CREDENTIAL_VARIABLE,
+        help="environment variable holding the Linear API key",
+    )
+    linear.set_defaults(handler=_run_adapter)
     return parser
 
 
@@ -273,6 +324,25 @@ def _run_inspect(args: argparse.Namespace) -> int:
         )
     _emit(usage.model_dump(mode="json"), json_output=args.json_output)
     return 0
+
+
+def _run_adapter(args: argparse.Namespace) -> int:
+    """Dispatch one stdin/stdout adapter; each writes its own bounded JSON."""
+
+    if args.adapter_action == "usage":
+        return usage_adapter.main(
+            ledger_paths=args.ledger or None,
+            cwd=args.cwd,
+            claude_roots=args.claude_root,
+            codex_roots=args.codex_root,
+            claude_fallback_window_tokens=args.claude_fallback_window_tokens,
+            max_rollout_bytes=args.max_rollout_bytes,
+        )
+    if args.adapter_action == "project-safety":
+        return project_safety_adapter.main()
+    if args.adapter_action == "beads":
+        return beads_adapter.main(argv=tuple(args.bd_command) or ("bd",))
+    return linear_adapter.main(credential_variable=args.credential_variable)
 
 
 def _run_report(args: argparse.Namespace) -> int:
