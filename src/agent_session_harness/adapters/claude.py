@@ -22,6 +22,42 @@ class ClaudeDiscovery(BaseModel):
     error: str | None = None
 
 
+# Context window per model identity, as recorded in `message.model`. The rollout
+# is authoritative: a caller-supplied window is only a fallback for identities
+# absent from this table, because measuring a 1M session against a 200k window
+# overstates usage ~5x and drains the session at ~14% of its real capacity.
+_BASE_CONTEXT_WINDOW_TOKENS = 200_000
+_LONG_CONTEXT_SUFFIX = "[1m]"
+_LONG_CONTEXT_WINDOW_TOKENS = 1_000_000
+
+CONTEXT_WINDOWS: dict[str, int] = {
+    "claude-opus-4-6": _BASE_CONTEXT_WINDOW_TOKENS,
+    "claude-opus-4-8": _BASE_CONTEXT_WINDOW_TOKENS,
+    "claude-sonnet-5": _BASE_CONTEXT_WINDOW_TOKENS,
+    "claude-fable-5": _BASE_CONTEXT_WINDOW_TOKENS,
+    "claude-haiku-4-5": _BASE_CONTEXT_WINDOW_TOKENS,
+}
+
+
+def resolve_window_tokens(model: str | None) -> int | None:
+    """Context window for a model identity, or None when it is unrecognized.
+
+    Handles the `[1m]` long-context suffix generically so a newly released
+    long-context variant resolves correctly without a table entry.
+    """
+    if not model:
+        return None
+    normalized = model.strip()
+    if not normalized:
+        return None
+    exact = CONTEXT_WINDOWS.get(normalized)
+    if exact is not None:
+        return exact
+    if normalized.endswith(_LONG_CONTEXT_SUFFIX):
+        return _LONG_CONTEXT_WINDOW_TOKENS
+    return None
+
+
 @dataclass
 class _MessageUsage:
     key: str
@@ -31,6 +67,7 @@ class _MessageUsage:
     output_tokens: int
     cache_creation_tokens: int
     cache_read_tokens: int
+    model: str | None = None
     tools: set[tuple[str, str]] = field(default_factory=set)
 
     def merge(
@@ -42,7 +79,11 @@ class _MessageUsage:
         cache_creation_tokens: int,
         cache_read_tokens: int,
         tools: set[tuple[str, str]],
+        model: str | None = None,
     ) -> None:
+        # A later row for the same message id carries the authoritative model.
+        if model:
+            self.model = model
         self.observed_at = max(self.observed_at, observed_at)
         self.input_tokens = max(self.input_tokens, input_tokens)
         self.output_tokens = max(self.output_tokens, output_tokens)
@@ -55,6 +96,13 @@ class _MessageUsage:
 
 class ClaudeUsageReader:
     def __init__(self, *, window_tokens: int):
+        """`window_tokens` is a FALLBACK, not an override.
+
+        The model identity recorded in the rollout wins whenever it is
+        recognized (see `resolve_window_tokens`); this value applies only to
+        unrecognized identities. Callers cannot know the window ahead of time
+        because the operator may switch models mid-session.
+        """
         if window_tokens <= 0:
             raise ValueError("window_tokens must be positive")
         self.window_tokens = window_tokens
@@ -111,6 +159,8 @@ class ClaudeUsageReader:
                 observed_at = self._timestamp(payload.get("timestamp"), rollout_path)
                 values = self._usage_values(usage)
                 tools = self._safe_tools(message.get("content"), key)
+                raw_model = message.get("model")
+                row_model = raw_model if isinstance(raw_model, str) else None
                 existing = records.get(key)
                 if existing is None:
                     records[key] = _MessageUsage(
@@ -121,6 +171,7 @@ class ClaudeUsageReader:
                         output_tokens=values[1],
                         cache_creation_tokens=values[2],
                         cache_read_tokens=values[3],
+                        model=row_model,
                         tools=tools,
                     )
                     order += 1
@@ -132,6 +183,7 @@ class ClaudeUsageReader:
                         cache_creation_tokens=values[2],
                         cache_read_tokens=values[3],
                         tools=tools,
+                        model=row_model,
                     )
 
         ordered = sorted(records.values(), key=lambda item: item.order)
@@ -160,6 +212,10 @@ class ClaudeUsageReader:
             )
 
         latest = max(ordered, key=lambda item: (item.observed_at, item.order))
+        # The most recent assistant message names the model whose window is in
+        # force right now. A mid-session `/model` switch is routine, so a mixed
+        # rollout must resolve rather than refuse to produce a sample.
+        window_tokens = resolve_window_tokens(latest.model) or self.window_tokens
         context_tokens = (
             latest.input_tokens
             + latest.output_tokens
@@ -189,8 +245,8 @@ class ClaudeUsageReader:
             latest_cache_creation_tokens=latest.cache_creation_tokens,
             latest_cache_read_tokens=latest.cache_read_tokens,
             context_tokens=context_tokens,
-            window_tokens=self.window_tokens,
-            context_percent=100.0 * context_tokens / self.window_tokens,
+            window_tokens=window_tokens,
+            context_percent=100.0 * context_tokens / window_tokens,
             confidence=(Confidence.DEGRADED if degraded else Confidence.CONFIDENT),
             message_keys=tuple(item.key for item in ordered),
             tool_counts=dict(sorted(tool_counts.items())),
