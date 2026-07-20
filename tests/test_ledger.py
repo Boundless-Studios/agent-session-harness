@@ -101,6 +101,74 @@ def test_finish_without_start_makes_quiescence_unknown(tmp_path) -> None:
     assert any("finish without start" in item for item in snapshot.integrity_warnings)
 
 
+def test_repeated_activity_ids_balance_instead_of_wedging_quiescence(
+    tmp_path,
+) -> None:
+    """BOU-2207: two concurrent calls may share a derived activity id.
+
+    When a runtime supplies no tool-use id the hook derives one from the call's
+    own fields, so identical calls in one prompt collide. Set-tracking would
+    treat the second finish as a finish-without-start, and that warning latches
+    quiescence to UNKNOWN for the life of the supervisor — rotation would never
+    run again. Counting makes the pair balance exactly.
+    """
+    _models, events, ledger_module, activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    shared = "derived:collision"
+    for index, event_type in enumerate(
+        ("tool.started", "tool.started", "tool.finished", "tool.finished")
+    ):
+        ledger.append(
+            _event(
+                events,
+                tmp_path,
+                f"event-{index}",
+                event_type,
+                activity_id=shared,
+            )
+        )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.active_tool_ids == frozenset()
+    assert not [
+        item for item in snapshot.integrity_warnings if "finish without start" in item
+    ]
+    assert snapshot.quiescence is activity.Quiescence.IDLE
+
+
+def test_unbalanced_repeated_activity_id_still_reports_outstanding_work(
+    tmp_path,
+) -> None:
+    """Counting must not under-report: two starts and one finish is still busy."""
+    _models, events, ledger_module, activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    shared = "derived:collision"
+    for index, event_type in enumerate(
+        ("tool.started", "tool.started", "tool.finished")
+    ):
+        ledger.append(
+            _event(
+                events,
+                tmp_path,
+                f"event-{index}",
+                event_type,
+                activity_id=shared,
+            )
+        )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.active_tool_ids == frozenset({shared})
+    assert snapshot.quiescence is not activity.Quiescence.IDLE
+
+
 def test_corrupt_line_is_retained_as_integrity_warning(tmp_path) -> None:
     _models, events, ledger_module, activity = _modules()
     ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")

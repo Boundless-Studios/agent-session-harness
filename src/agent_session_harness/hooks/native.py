@@ -222,6 +222,26 @@ def _checkpoint_fields(values: Sequence[str]) -> str:
     return ", ".join(safe_values) if safe_values else "configured adapters"
 
 
+def _derived_activity_id(payload: Mapping[str, object], conversation_id: str) -> str:
+    """Stable tool-call id for runtimes that do not supply one.
+
+    Built only from fields a PreToolUse and its matching PostToolUse both carry,
+    so the pair resolves to the same id. Deliberately excludes the tool payload:
+    the harness never reads prompt or tool argument text, and the granularity is
+    not needed. Quiescence asks only whether anything is outstanding, and the
+    ledger counts activity, so two different calls sharing an id still balance
+    (+1 +1 -1 -1). Finer identity would buy nothing and would cost the boundary.
+    """
+    material = "|".join(
+        (
+            conversation_id,
+            str(payload.get("prompt_id") or ""),
+            str(payload.get("tool_name") or payload.get("name") or ""),
+        )
+    )
+    return f"derived:{hashlib.sha256(material.encode('utf-8')).hexdigest()[:32]}"
+
+
 def _activity_id(
     hook_name: str, payload: Mapping[str, object], conversation_id: str
 ) -> str | None:
@@ -229,9 +249,19 @@ def _activity_id(
         return str(payload.get("turn_id") or f"turn:{conversation_id}")
     if hook_name in {"PreToolUse", "PostToolUse", "PostToolUseFailure"}:
         raw_value = payload.get("tool_use_id") or payload.get("call_id")
-        if not raw_value:
-            raise ValueError("native tool hook is missing an activity ID")
-        return str(raw_value)
+        if raw_value:
+            return str(raw_value)
+        # Claude Code's documented PreToolUse/PostToolUse payloads carry no
+        # tool-use identifier. Raising here returns exit 2, which for PreToolUse
+        # BLOCKS the tool call — so a managed session could run no tools at all.
+        # Never depend on an undocumented field; derive a stable id instead.
+        #
+        # The id must be identical for the Pre and Post of one call, because the
+        # ledger pairs starts against finishes to decide quiescence. Calls that
+        # share a prompt and tool name collide; the ledger counts activity
+        # rather than set-tracking it, so collisions balance instead of wedging
+        # quiescence. Codex still supplies call_id and is unaffected.
+        return _derived_activity_id(payload, conversation_id)
     if hook_name in {"SubagentStart", "SubagentStop"}:
         raw_value = payload.get("agent_id") or payload.get("subagent_id")
         if not raw_value:
