@@ -583,6 +583,9 @@ def _run_supervise(args: argparse.Namespace) -> int:
         "process_pid": snapshot.process_pid,
         "interrupted": interrupted,
         "mirror_replay_error": mirror_replay_error,
+        # Surfaced so a wedged usage sampler is visible to the operator instead
+        # of silently never rotating (BOU-2208).
+        "usage_alarm": snapshot.usage_alarm,
     }
     _emit(payload, json_output=args.json_output)
     return 130 if interrupted else 0

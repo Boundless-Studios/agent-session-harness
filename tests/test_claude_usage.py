@@ -77,6 +77,88 @@ def test_missing_message_ids_are_deterministic_but_degraded() -> None:
     assert all(key.startswith("offset:") for key in first.message_keys)
 
 
+def _recovery_row(
+    *,
+    message_id: str | None,
+    timestamp: str,
+    input_tokens: int,
+) -> str:
+    message: dict = {
+        "model": "claude-opus-4-8",
+        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        "content": [],
+    }
+    if message_id is not None:
+        message["id"] = message_id
+    return json.dumps(
+        {
+            "type": "assistant",
+            "timestamp": timestamp,
+            "sessionId": "claude-recovered",
+            "message": message,
+        }
+    )
+
+
+def test_one_malformed_row_does_not_degrade_a_healthy_tail(tmp_path) -> None:
+    """BOU-2208 latch 2: the sticky `degraded` flag never recovered.
+
+    One unreadable row set `degraded` for the rest of the read, and the whole
+    rollout is re-read on every sample, so the flag was effectively permanent.
+    The supervisor discards non-confident samples entirely, so context percent
+    stopped updating and rotation never fired.
+    """
+    rollout = tmp_path / "recovered.jsonl"
+    rollout.write_text(
+        "\n".join(
+            [
+                _recovery_row(
+                    message_id="msg-1",
+                    timestamp="2026-07-19T03:00:00Z",
+                    input_tokens=1_000,
+                ),
+                '{"type":"assistant","message":{"id":"msg-2",',
+                _recovery_row(
+                    message_id="msg-3",
+                    timestamp="2026-07-19T03:02:00Z",
+                    input_tokens=150_000,
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    usage = _reader(window_tokens=200_000).read_file(rollout)
+
+    assert usage.confidence is Confidence.CONFIDENT
+    assert usage.context_percent == pytest.approx(75.0)
+    assert any("invalid JSON" in warning for warning in usage.warnings)
+
+
+def test_malformed_row_after_the_last_usable_row_is_degraded(tmp_path) -> None:
+    """A corrupt tail really does make the reported figures stale."""
+    rollout = tmp_path / "stale-tail.jsonl"
+    rollout.write_text(
+        "\n".join(
+            [
+                _recovery_row(
+                    message_id="msg-1",
+                    timestamp="2026-07-19T03:00:00Z",
+                    input_tokens=1_000,
+                ),
+                '{"type":"assistant","message":{"id":"msg-2",',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    usage = _reader(window_tokens=200_000).read_file(rollout)
+
+    assert usage.confidence is Confidence.DEGRADED
+
+
 def test_reader_never_returns_user_text_or_transcript_fields() -> None:
     usage = _reader(window_tokens=200_000).read_file(
         FIXTURES / "duplicate-message.jsonl"

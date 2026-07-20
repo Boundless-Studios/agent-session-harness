@@ -9,11 +9,13 @@ import hmac
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .activity import ActivitySnapshot, Quiescence
+from .adapters.command import sanitize_error
 from .capsule import HandoffCapsule
 from .coordinator import ClaimHandle, CoordinatorAdapter, StaleOwnerError
 from .events import LifecycleEvent
@@ -36,6 +38,17 @@ from .secure_files import (
     private_unlink,
     read_private_text,
 )
+
+
+# BOU-2208: consecutive usage-sampling failures before the supervisor announces
+# that it can no longer see context growth. Sampling never tears the chain down,
+# so the alarm is the only thing standing between a wedged sampler and silence.
+USAGE_FAILURE_ALARM_TICKS = 3
+# Consecutive non-confident samples after which a drained, quiescent generation
+# rotates anyway. Never rotating is the failure mode this whole effort exists to
+# fix; the quiescence and requested-handoff gates still hold, so this can never
+# rotate while a tool is running.
+NON_CONFIDENT_ROTATION_TOLERANCE_TICKS = 5
 
 
 class SupervisorPhase(str, Enum):
@@ -138,6 +151,9 @@ class SupervisorSnapshot(BaseModel):
     checkpoint_fingerprint: str | None = None
     checkpoint_path: Path | None = None
     warning_emitted: bool = False
+    usage_sample_failure_streak: int = Field(default=0, ge=0)
+    non_confident_sample_streak: int = Field(default=0, ge=0)
+    usage_alarm: str | None = Field(default=None, max_length=320)
 
 
 class Supervisor:
@@ -165,6 +181,10 @@ class Supervisor:
         stop_timeout_seconds: float = 10.0,
         successor_retry_limit: int = 1,
         successor_ack_timeout_seconds: float = 30.0,
+        usage_failure_alarm_ticks: int = USAGE_FAILURE_ALARM_TICKS,
+        non_confident_rotation_tolerance_ticks: int = (
+            NON_CONFIDENT_ROTATION_TOLERANCE_TICKS
+        ),
     ):
         if not 0 < warn_percent < rotate_percent <= 100:
             raise ValueError("thresholds must satisfy 0 < warn < rotate <= 100")
@@ -174,6 +194,12 @@ class Supervisor:
             raise ValueError("successor retry limit must be non-negative")
         if successor_ack_timeout_seconds <= 0:
             raise ValueError("successor acknowledgement timeout must be positive")
+        if usage_failure_alarm_ticks < 1:
+            raise ValueError("usage failure alarm threshold must be positive")
+        if non_confident_rotation_tolerance_ticks < 2:
+            raise ValueError(
+                "non-confident rotation tolerance must allow at least one retry"
+            )
         if not 0 <= heartbeat_interval_seconds < lease_seconds:
             raise ValueError(
                 "heartbeat interval must satisfy 0 <= interval < lease seconds"
@@ -228,6 +254,10 @@ class Supervisor:
         self.stop_timeout_seconds = stop_timeout_seconds
         self.successor_retry_limit = successor_retry_limit
         self.successor_ack_timeout_seconds = successor_ack_timeout_seconds
+        self.usage_failure_alarm_ticks = usage_failure_alarm_ticks
+        self.non_confident_rotation_tolerance_ticks = (
+            non_confident_rotation_tolerance_ticks
+        )
         self.run_spec_fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -494,11 +524,24 @@ class Supervisor:
         }:
             self._observe_usage()
             if self.snapshot.phase is SupervisorPhase.DRAINING:
+                # Safety gates, never relaxed: the runtime asked to hand off and
+                # nothing is outstanding. Rotating past either would be worse
+                # than the latch this change removes.
                 if (
-                    self.snapshot.context_confidence is not Confidence.CONFIDENT
-                    or self.snapshot.generation
+                    self.snapshot.generation
                     not in activity.handoff_requested_generations
                     or activity.quiescence is not Quiescence.IDLE
+                ):
+                    return self.snapshot
+                # Measurement quality is a different question. Waiting forever
+                # for a CONFIDENT sample is exactly how a degraded reader pinned
+                # a session above the rotate threshold for its whole life, so
+                # tolerate a bounded run of non-confident samples and then
+                # rotate under an alarm rather than stay silent.
+                if (
+                    self.snapshot.context_confidence is not Confidence.CONFIDENT
+                    and self.snapshot.non_confident_sample_streak
+                    < self.non_confident_rotation_tolerance_ticks
                 ):
                     return self.snapshot
                 self._set_phase(SupervisorPhase.CHECKPOINTING)
@@ -579,6 +622,11 @@ class Supervisor:
                 "cumulative_tokens": None,
                 "warning_emitted": False,
                 "successor_ack_deadline_at": None,
+                # A fresh generation starts with a clean sampling record so the
+                # predecessor's degradation cannot pre-arm the successor.
+                "usage_sample_failure_streak": 0,
+                "non_confident_sample_streak": 0,
+                "usage_alarm": None,
             }
         )
         self._persist()
@@ -655,26 +703,69 @@ class Supervisor:
     def _observe_usage(self) -> None:
         if self.current_process is None:
             raise RuntimeError("managed process metadata is unavailable")
-        sample = self.usage_reader.sample(self.current_process)
-        if sample.confidence is not Confidence.CONFIDENT:
-            self.snapshot = self.snapshot.model_copy(
-                update={"context_confidence": sample.confidence}
-            )
-            self._persist()
+        try:
+            sample = self.usage_reader.sample(self.current_process)
+        except Exception as exc:
+            # BOU-2208: the usage adapter is an out-of-process helper with a
+            # short timeout, so a transient failure is expected. It used to
+            # unwind `tick()` into the CLI's terminal `shutdown()`, which
+            # persists BLOCKED and kills the runtime -- one flaky five-second
+            # invocation destroyed a live session. Degrade instead.
+            self._record_usage_sample_failure(exc)
             return
-        self.snapshot = self.snapshot.model_copy(
-            update={
-                "conversation_id": sample.conversation_id,
-                "context_percent": sample.context_percent,
-                "context_confidence": sample.confidence,
-                "context_tokens": sample.context_tokens,
-                "window_tokens": sample.window_tokens,
-                "cumulative_tokens": sample.cumulative_tokens,
-            }
-        )
+
+        confident = sample.confidence is Confidence.CONFIDENT
+        update: dict[str, object] = {
+            "context_confidence": sample.confidence,
+            "usage_sample_failure_streak": 0,
+            "non_confident_sample_streak": (
+                0 if confident else self.snapshot.non_confident_sample_streak + 1
+            ),
+        }
+        had_alarm = self.snapshot.usage_alarm is not None
+        if confident:
+            update["usage_alarm"] = None
+        if sample.confidence is not Confidence.UNKNOWN:
+            # A DEGRADED sample still carries real measurements that are merely
+            # less trustworthy; discarding it is what stopped context percent
+            # from ever reaching the rotate threshold. An UNKNOWN sample carries
+            # no measurement at all, so it must not overwrite what is known.
+            update.update(
+                {
+                    "conversation_id": sample.conversation_id,
+                    "context_percent": sample.context_percent,
+                    "context_tokens": sample.context_tokens,
+                    "window_tokens": sample.window_tokens,
+                    "cumulative_tokens": sample.cumulative_tokens,
+                }
+            )
+        self.snapshot = self.snapshot.model_copy(update=update)
+        if sample.confidence is not Confidence.UNKNOWN:
+            self._apply_usage_thresholds(sample.context_percent)
+        self._persist()
+        if confident:
+            if had_alarm:
+                self._effect(
+                    "usage-sample",
+                    "recovered",
+                    generation=self.snapshot.generation,
+                )
+            return
+        streak = self.snapshot.non_confident_sample_streak
+        if streak >= self.non_confident_rotation_tolerance_ticks:
+            # Deliberately stable text: the running count lives in
+            # `non_confident_sample_streak`, so the alarm is announced once per
+            # episode instead of re-printing on every poll.
+            self._raise_usage_alarm(
+                "usage sampling has not been confident for "
+                f"{self.non_confident_rotation_tolerance_ticks} consecutive "
+                "ticks; rotation decisions now use unverified context"
+            )
+
+    def _apply_usage_thresholds(self, context_percent: float) -> None:
         if (
             self.snapshot.phase is SupervisorPhase.RUNNING
-            and sample.context_percent >= self.warn_percent
+            and context_percent >= self.warn_percent
         ):
             self.snapshot = self.snapshot.model_copy(
                 update={
@@ -684,12 +775,46 @@ class Supervisor:
             )
         if (
             self.snapshot.phase in {SupervisorPhase.RUNNING, SupervisorPhase.WARNING}
-            and sample.context_percent >= self.rotate_percent
+            and context_percent >= self.rotate_percent
         ):
             self.snapshot = self.snapshot.model_copy(
                 update={"phase": SupervisorPhase.DRAINING}
             )
+
+    def _record_usage_sample_failure(self, cause: Exception) -> None:
+        failures = self.snapshot.usage_sample_failure_streak + 1
+        self.snapshot = self.snapshot.model_copy(
+            update={
+                "context_confidence": Confidence.UNKNOWN,
+                "usage_sample_failure_streak": failures,
+                "non_confident_sample_streak": (
+                    self.snapshot.non_confident_sample_streak + 1
+                ),
+            }
+        )
         self._persist()
+        if failures == 1:
+            self._effect(
+                "usage-sample",
+                "failed",
+                generation=self.snapshot.generation,
+            )
+        if failures >= self.usage_failure_alarm_ticks:
+            self._raise_usage_alarm(
+                "usage sampling has failed at least "
+                f"{self.usage_failure_alarm_ticks} consecutive times "
+                f"({sanitize_error(str(cause) or type(cause).__name__)}); "
+                "context growth is no longer observable"
+            )
+
+    def _raise_usage_alarm(self, message: str) -> None:
+        bounded = sanitize_error(message, max_length=320)
+        if self.snapshot.usage_alarm == bounded:
+            return
+        self.snapshot = self.snapshot.model_copy(update={"usage_alarm": bounded})
+        self._persist()
+        self._effect("usage-sample", "alarm", generation=self.snapshot.generation)
+        print(f"agent-session-harness alarm: {bounded}", file=sys.stderr, flush=True)
 
     def _advance_rotation(self) -> SupervisorSnapshot:
         while True:

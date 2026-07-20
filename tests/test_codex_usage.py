@@ -110,6 +110,97 @@ def test_missing_fork_baseline_is_degraded_and_never_guessed(tmp_path) -> None:
     assert any("baseline" in warning for warning in usage.sessions[0].warnings)
 
 
+def _codex_rollout(path: Path, rows: list[dict]) -> Path:
+    path.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _token_count_row(timestamp: str, info: dict) -> dict:
+    return {
+        "timestamp": timestamp,
+        "type": "event_msg",
+        "payload": {"type": "token_count", "info": info},
+    }
+
+
+def test_one_skipped_token_event_does_not_degrade_a_healthy_tail(tmp_path) -> None:
+    """BOU-2208 latch 2: a skipped record must not pin the reader to DEGRADED.
+
+    Warnings used to be promoted to DEGRADED wholesale, and the whole rollout is
+    re-read on every sample, so one `token_count` event without
+    `model_context_window` degraded every future sample. The supervisor then
+    discards every sample, so context percent never updates and rotation never
+    fires.
+    """
+    rollout = _codex_rollout(
+        tmp_path / "recovered.jsonl",
+        [
+            {
+                "timestamp": "2026-07-19T03:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "recovered", "timestamp": "2026-07-19T03:00:00Z"},
+            },
+            _token_count_row(
+                "2026-07-19T03:01:00Z",
+                {
+                    "total_token_usage": {"total_tokens": 10},
+                    "last_token_usage": {"total_tokens": 10},
+                },
+            ),
+            _token_count_row(
+                "2026-07-19T03:02:00Z",
+                {
+                    "total_token_usage": {"total_tokens": 150},
+                    "last_token_usage": {"total_tokens": 150},
+                    "model_context_window": 200,
+                },
+            ),
+        ],
+    )
+
+    usage = _reader().read_file(rollout)
+
+    assert usage.confidence is Confidence.CONFIDENT
+    assert usage.context_percent == pytest.approx(75.0)
+    assert any("context window" in warning for warning in usage.warnings)
+
+
+def test_skipped_token_event_after_the_last_good_event_is_degraded(tmp_path) -> None:
+    """A corrupt tail really does make the reported figures stale."""
+    rollout = _codex_rollout(
+        tmp_path / "stale-tail.jsonl",
+        [
+            {
+                "timestamp": "2026-07-19T03:00:00Z",
+                "type": "session_meta",
+                "payload": {"id": "stale-tail", "timestamp": "2026-07-19T03:00:00Z"},
+            },
+            _token_count_row(
+                "2026-07-19T03:01:00Z",
+                {
+                    "total_token_usage": {"total_tokens": 10},
+                    "last_token_usage": {"total_tokens": 10},
+                    "model_context_window": 200,
+                },
+            ),
+            _token_count_row(
+                "2026-07-19T03:02:00Z",
+                {
+                    "total_token_usage": {"total_tokens": 150},
+                    "last_token_usage": {"total_tokens": 150},
+                },
+            ),
+        ],
+    )
+
+    usage = _reader().read_file(rollout)
+
+    assert usage.confidence is Confidence.DEGRADED
+
+
 def test_lineage_cycle_is_rejected(tmp_path) -> None:
     def rollout(path: Path, session_id: str, parent_id: str) -> None:
         path.write_text(

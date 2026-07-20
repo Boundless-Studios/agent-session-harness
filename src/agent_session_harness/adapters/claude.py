@@ -70,6 +70,9 @@ class _MessageUsage:
     cache_read_tokens: int
     model: str | None = None
     tools: set[tuple[str, str]] = field(default_factory=set)
+    # True when the row carried no `message.id` and the key had to be derived
+    # from its byte offset, so this record cannot be deduplicated reliably.
+    derived_key: bool = False
 
     def merge(
         self,
@@ -113,7 +116,13 @@ class ClaudeUsageReader:
         records: dict[str, _MessageUsage] = {}
         conversation_id: str | None = None
         warnings: list[str] = []
-        degraded = False
+        # BOU-2208: a single sticky `degraded` flag never recovered, and the
+        # whole rollout is re-read on every sample, so one unreadable row pinned
+        # every future sample to DEGRADED — which the supervisor discards
+        # entirely, so context percent stopped updating and rotation never
+        # fired. Split the flag by what the finding actually invalidates.
+        structurally_degraded = False
+        stale_tail = False
 
         with rollout_path.open("rb") as handle:
             order = 0
@@ -126,7 +135,7 @@ class ClaudeUsageReader:
                     payload = json.loads(raw_line.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     warnings.append(f"invalid JSON at byte offset {offset}")
-                    degraded = True
+                    stale_tail = True
                     continue
                 if not isinstance(payload, dict) or payload.get("type") != "assistant":
                     continue
@@ -135,27 +144,30 @@ class ClaudeUsageReader:
                     warnings.append(
                         f"missing assistant message at byte offset {offset}"
                     )
-                    degraded = True
+                    stale_tail = True
                     continue
                 usage = message.get("usage")
                 if not isinstance(usage, dict):
                     warnings.append(f"missing usage at byte offset {offset}")
-                    degraded = True
+                    stale_tail = True
                     continue
 
                 row_conversation = str(payload.get("sessionId") or rollout_path.stem)
                 if conversation_id is None:
                     conversation_id = row_conversation
                 elif conversation_id != row_conversation:
-                    degraded = True
+                    # Structural: no later row can make a mixed rollout coherent.
+                    structurally_degraded = True
                     warnings.append("multiple conversation IDs in one rollout")
 
                 raw_message_id = message.get("id")
+                derived_key = not raw_message_id
                 if raw_message_id:
                     key = f"message:{row_conversation}:{raw_message_id}"
                 else:
                     key = f"offset:{offset}"
-                    degraded = True
+                    warnings.append(f"missing message id at byte offset {offset}")
+                stale_tail = False
 
                 observed_at = self._timestamp(payload.get("timestamp"), rollout_path)
                 values = self._usage_values(usage)
@@ -174,6 +186,7 @@ class ClaudeUsageReader:
                         cache_read_tokens=values[3],
                         model=row_model,
                         tools=tools,
+                        derived_key=derived_key,
                     )
                     order += 1
                 else:
@@ -217,6 +230,12 @@ class ClaudeUsageReader:
         # force right now. A mid-session `/model` switch is routine, so a mixed
         # rollout must resolve rather than refuse to produce a sample.
         window_tokens = resolve_window_tokens(latest.model) or self.window_tokens
+        # Only findings that invalidate the figures being reported may degrade
+        # the sample: a mixed rollout, an unreadable tail (so the numbers are
+        # stale), or a latest record that could not be keyed by message id (so
+        # it may be a duplicate). A skipped row that a later good row supersedes
+        # is recorded as a warning and nothing more.
+        degraded = structurally_degraded or stale_tail or latest.derived_key
         context_tokens = (
             latest.input_tokens
             + latest.output_tokens
