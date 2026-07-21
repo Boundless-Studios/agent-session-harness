@@ -983,7 +983,9 @@ class Supervisor:
         # it is both safe and the most direct way to see an alarm, which is what
         # made the fault loud instead of silent in the first place.
         if not _stderr_belongs_to_someone_else():
-            print(f"agent-session-harness alarm: {bounded}", file=sys.stderr, flush=True)
+            print(
+                f"agent-session-harness alarm: {bounded}", file=sys.stderr, flush=True
+            )
 
     def _advance_rotation(self) -> SupervisorSnapshot:
         while True:
