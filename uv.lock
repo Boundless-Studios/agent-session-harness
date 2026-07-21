@@ -4,8 +4,8 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "agent-coordinator"
-version = "0.2.0"
-source = { git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=v0.2.0#d558062de240937295c120c4f9ef0d1b1d7cb229" }
+version = "0.3.0"
+source = { git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=v0.3.0#7576e2a4e7e8aa9a0d262b744a1b84fcc49f7767" }
 
 [[package]]
 name = "agent-session-harness"
@@ -30,7 +30,7 @@ linear = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-coordinator", git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=v0.2.0" },
+    { name = "agent-coordinator", git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=v0.3.0" },
     { name = "build", marker = "extra == 'dev'", specifier = ">=1" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27,<1" },
     { name = "httpx", marker = "extra == 'linear'", specifier = ">=0.27,<1" },
