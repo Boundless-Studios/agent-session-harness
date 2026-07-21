@@ -75,6 +75,36 @@ _RUNTIME_SILENCE_ALARMS = {
 }
 
 
+def _stderr_belongs_to_someone_else() -> bool:
+    """True when writing to stderr would land on a surface another process owns.
+
+    Two distinct cases, and the second is the one that actually bit us:
+
+    * **stderr is a terminal.** Something may be drawing a full-screen UI on it.
+    * **we are inside a managed session.** The supervisor runs from the runtime's
+      native hooks, and a hook's stderr is a PIPE the runtime reads and renders —
+      not a tty — so an ``isatty`` check alone would sail straight through and the
+      text still reaches the user's screen. ``AGENT_SESSION_HARNESS_MANAGED`` is
+      the runtime declaring it owns the session's output; honour it.
+
+    Deliberately conservative: an unusable or lying stream (``isatty`` raising, a
+    closed fd, a stub without ``isatty``) counts as someone else's, so the
+    fallback is "stay quiet" rather than "risk corrupting a UI". The alarm is
+    durable in the snapshot, the effect ledger and the status projection, so
+    silence here loses no signal — whereas a wrong guess the other way eats the
+    text a user is typing.
+    """
+    if os.environ.get("AGENT_SESSION_HARNESS_MANAGED") == "1":
+        return True
+    stream = getattr(sys, "stderr", None)
+    if stream is None:
+        return True
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return True
+
+
 class SupervisorPhase(str, Enum):
     INITIAL = "initial"
     RUNNING = "running"
@@ -938,7 +968,24 @@ class Supervisor:
         self.snapshot = self.snapshot.model_copy(update={field: bounded})
         self._persist()
         self._effect(effect, "alarm", generation=self.snapshot.generation)
-        print(f"agent-session-harness alarm: {bounded}", file=sys.stderr, flush=True)
+        # NEVER write to an interactive terminal. The supervisor runs inside hooks
+        # that inherit the runtime's stderr, and that stderr is frequently the tty
+        # a full-screen TUI (the Claude CLI) is drawing on. Writing there does not
+        # append a line — it scribbles over whatever the TUI owns, in practice the
+        # prompt buffer, destroying text the user is mid-way through typing.
+        #
+        # The alarm is already durable three ways without this: the snapshot field
+        # (persisted above), the effect ledger, and the status projection that
+        # feeds the statusline. So the print adds no signal a consumer can't
+        # already reach — it only adds a way to corrupt someone's screen.
+        #
+        # Kept for the redirected case (daemon logs, captured output, CI), where
+        # it is both safe and the most direct way to see an alarm, which is what
+        # made the fault loud instead of silent in the first place.
+        if not _stderr_belongs_to_someone_else():
+            print(
+                f"agent-session-harness alarm: {bounded}", file=sys.stderr, flush=True
+            )
 
     def _advance_rotation(self) -> SupervisorSnapshot:
         while True:

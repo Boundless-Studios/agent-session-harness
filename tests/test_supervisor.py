@@ -1885,6 +1885,65 @@ def test_silence_after_a_quiescent_session_alarms_and_still_withholds_rotation(
     assert len(checkpoints.calls) == 1
 
 
+def test_alarm_never_writes_to_a_managed_session_stderr(tmp_path, capsys) -> None:
+    """BOU-2300: the alarm must not scribble on a UI another process owns.
+
+    The supervisor runs from the runtime's native hooks, and a hook's stderr is a
+    pipe the runtime reads and renders. Writing an unsolicited line there landed
+    on the Claude CLI's prompt buffer and destroyed text the user was typing.
+
+    The alarm still has to FIRE and persist -- this pins suppression of the
+    terminal write only, not of the fault itself, which the assertions on
+    ``liveness_alarm`` below guard.
+    """
+    import os as _os
+
+    _os.environ["AGENT_SESSION_HARNESS_MANAGED"] = "1"
+    try:
+        managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(
+            tmp_path,
+            runtime_silence_alarm_ticks=2,
+            runtime_silence_grace_seconds=0.0,
+        )
+        managed.start()
+        capsys.readouterr()  # drop start-up noise; only the alarm write matters
+
+        managed.tick(_silent_activity(RuntimeLiveness.SILENT_IDLE))
+        silent = managed.tick(_silent_activity(RuntimeLiveness.SILENT_IDLE))
+    finally:
+        _os.environ.pop("AGENT_SESSION_HARNESS_MANAGED", None)
+
+    # The fault is still raised and still durable.
+    assert silent.liveness_alarm is not None
+    assert "stopped reporting" in silent.liveness_alarm
+
+    # ...but nothing was written to the surface the runtime owns.
+    captured = capsys.readouterr()
+    assert "agent-session-harness alarm:" not in captured.err
+    assert "agent-session-harness alarm:" not in captured.out
+
+
+def test_alarm_still_prints_when_stderr_is_redirected(tmp_path, capsys) -> None:
+    """The other half: a daemon/CI run with captured stderr keeps the loud line.
+
+    Suppressing everywhere would undo what made a silent fault loud in the first
+    place. Outside a managed session, and with stderr not a tty (capsys replaces
+    it with a non-tty buffer), the alarm still announces itself.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(
+        tmp_path,
+        runtime_silence_alarm_ticks=2,
+        runtime_silence_grace_seconds=0.0,
+    )
+    managed.start()
+    capsys.readouterr()
+
+    managed.tick(_silent_activity(RuntimeLiveness.SILENT_IDLE))
+    managed.tick(_silent_activity(RuntimeLiveness.SILENT_IDLE))
+
+    assert "agent-session-harness alarm:" in capsys.readouterr().err
+
+
 def test_silence_with_a_tool_in_flight_never_rotates(tmp_path) -> None:
     """The bug this fix must not trade itself for.
 
