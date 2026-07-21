@@ -113,6 +113,7 @@ class EventLedger:
         active_tools: Counter[str] = Counter()
         active_subagents: Counter[str] = Counter()
         active_critical_sections: Counter[str] = Counter()
+        reaped_tools: set[str] = set()
         handoff_requested_generations: set[int] = set()
         last_event_at: datetime | None = None
         last_hook_event_at: datetime | None = None
@@ -171,6 +172,28 @@ class EventLedger:
                     target[activity_id] -= 1
                     if target[activity_id] == 0:
                         del target[activity_id]
+                if event.event_type is EventType.TURN_IDLE and active_tools:
+                    # BOU-2236: the runtime fires PreToolUse (-> tool.started)
+                    # BEFORE its permission gate. A denied call never runs, so
+                    # neither PostToolUse nor PostToolUseFailure is ever emitted
+                    # and the start can never be balanced. `has_active` then
+                    # stays true forever, quiescence never returns IDLE, and
+                    # DRAINING only leaves for IDLE -- so one denied command
+                    # wedges rotation for the life of the session.
+                    #
+                    # turn.idle is the runtime's own statement that the turn
+                    # finished, so no tool belonging to it can still be in
+                    # flight. Reaping here restores the invariant without
+                    # needing a denial signal the runtime does not emit.
+                    #
+                    # Scoped to tools deliberately: subagents and critical
+                    # sections may legitimately outlive a turn, and they are
+                    # what keeps quiescence BUSY in that case -- which is also
+                    # why reaping tools here is safe. Not a warning either: a
+                    # gating warning would hold quiescence at UNKNOWN and
+                    # re-block the rotation this repairs.
+                    reaped_tools.update(active_tools)
+                    active_tools.clear()
             elif event.event_type is EventType.HANDOFF_REQUESTED:
                 handoff_requested_generations.add(event.generation)
 
@@ -202,6 +225,7 @@ class EventLedger:
             processed_event_count=processed,
             last_event_at=last_event_at,
             integrity_warnings=tuple(warning.message for warning in warnings),
+            reaped_tool_ids=frozenset(reaped_tools),
             handoff_requested_generations=frozenset(handoff_requested_generations),
         )
 

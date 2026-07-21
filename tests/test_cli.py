@@ -177,6 +177,8 @@ def test_report_projects_supervisor_state_without_model_work(tmp_path, capsys) -
         "liveness_alarm": None,
         "outbox_depth": 0,
         "quiescence": "unknown",
+        # BOU-2236: no ledger was supplied, so nothing could be reconciled.
+        "reaped_tools": 0,
         "runtime": "codex",
         # No ledger was supplied, so no hook has ever been seen to report
         # (BOU-2222): "quiescence unknown" alone never said that out loud.
