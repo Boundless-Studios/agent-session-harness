@@ -113,9 +113,7 @@ def test_rotation_completes_even_though_a_denied_tool_never_closed(tmp_path) -> 
         assert running.checkpoint_fingerprint
         capsule_path = Path(str(running.checkpoint_path))
         assert capsule_path.is_file()
-        HandoffCapsule.model_validate_json(
-            capsule_path.read_text(encoding="utf-8")
-        )
+        HandoffCapsule.model_validate_json(capsule_path.read_text(encoding="utf-8"))
     finally:
         process = supervisor.current_process
         if process is not None and driver.is_alive(process):
