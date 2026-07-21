@@ -106,6 +106,12 @@ def main() -> int:
     if generation == 0:
         emit("UserPromptSubmit", turn_id="turn-0")
         emit("PreToolUse", tool_use_id="tool-0", tool_name="fake-tool")
+        if (root / "deny-a-tool").exists():
+            # BOU-2236: a call the permission gate denies. PreToolUse fires
+            # BEFORE the gate, so the start is recorded, the tool never runs,
+            # and neither PostToolUse nor PostToolUseFailure can ever follow.
+            # Emitted with no matching finish on purpose.
+            emit("PreToolUse", tool_use_id="tool-denied", tool_name="fake-tool")
     append(
         root / "history.jsonl",
         {

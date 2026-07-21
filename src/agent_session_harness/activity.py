@@ -47,6 +47,11 @@ class ActivitySnapshot:
     integrity_warnings: tuple[str, ...]
     handoff_requested_generations: frozenset[int] = frozenset()
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
+    # Tool starts closed by turn-idle reconciliation rather than by their own
+    # finish event (BOU-2236). Reported for observability only -- these are NOT
+    # counted as active. A non-empty set here is the fingerprint of a permission
+    # gate that denies calls at PreToolUse, which is normal, not a fault.
+    reaped_tool_ids: frozenset[str] = frozenset()
 
     @property
     def active_count(self) -> int:

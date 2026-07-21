@@ -66,6 +66,12 @@ class StatusReport(BaseModel):
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
     liveness_alarm: str | None = None
     usage_alarm: str | None = None
+    # BOU-2236: how many tool starts the last turn-idle had to reconcile because
+    # a permission gate denied them at PreToolUse, so no finish could ever
+    # arrive. Zero on runtimes without such a gate. Non-zero is expected, not a
+    # fault -- but a number that climbs every turn is the signal that a gate is
+    # denying heavily, which is worth seeing on a dashboard.
+    reaped_tools: int = Field(default=0, ge=0)
 
 
 def build_report(
@@ -81,6 +87,7 @@ def build_report(
     # No ledger to read is itself the "no hook has ever reported" case.
     runtime_liveness = RuntimeLiveness.NEVER_REPORTED
     active = ActiveCounts()
+    reaped_tools = 0
     if ledger_path is not None:
         snapshot = EventLedger(ledger_path).materialize(
             now=now or datetime.now(tz=timezone.utc),
@@ -94,6 +101,7 @@ def build_report(
             subagents=len(snapshot.active_subagent_ids),
             critical_sections=len(snapshot.active_critical_section_ids),
         )
+        reaped_tools = len(snapshot.reaped_tool_ids)
     outbox_depth = MirrorOutbox(outbox_path).depth if outbox_path else 0
     return StatusReport(
         runtime=state.runtime,
@@ -110,6 +118,7 @@ def build_report(
         active=active,
         checkpoint_fingerprint=state.checkpoint_fingerprint,
         outbox_depth=outbox_depth,
+        reaped_tools=reaped_tools,
         runtime_liveness=runtime_liveness,
         liveness_alarm=state.liveness_alarm,
         usage_alarm=state.usage_alarm,
