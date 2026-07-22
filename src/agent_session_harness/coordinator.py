@@ -70,9 +70,7 @@ class _SecureJsonlClaimStore(JsonlClaimStore):
         self,
         build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
         *,
-        compact_events: Callable[
-            [list[dict[str, Any]]], list[dict[str, Any]] | None
-        ]
+        compact_events: Callable[[list[dict[str, Any]]], list[dict[str, Any]] | None]
         | None = None,
     ) -> dict[str, Any]:
         with exclusive_lock(self.lock_path):
@@ -88,8 +86,7 @@ class _SecureJsonlClaimStore(JsonlClaimStore):
                 atomic_write_private_text(
                     self.path,
                     "".join(
-                        json.dumps(item, sort_keys=True) + "\n"
-                        for item in compacted
+                        json.dumps(item, sort_keys=True) + "\n" for item in compacted
                     ),
                 )
             return event
