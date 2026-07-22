@@ -113,7 +113,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     inspect.add_argument("--path")
     inspect.add_argument("--lineage", action="append", default=[])
-    inspect.add_argument("--window-tokens", type=int, default=200_000)
+    inspect.add_argument("--window-tokens", type=int)
     _add_json(inspect)
     inspect.set_defaults(handler=_run_inspect)
 

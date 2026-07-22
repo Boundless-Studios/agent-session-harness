@@ -142,6 +142,51 @@ def test_inspect_reads_native_usage_as_stable_json(capsys) -> None:
     assert payload["context_percent"] == 62.5
 
 
+def test_inspect_without_window_override_uses_rollout_model(
+    tmp_path: Path, capsys
+) -> None:
+    rollout = tmp_path / "long-context.jsonl"
+    rollout.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "sessionId": "long-context",
+                "timestamp": "2026-07-22T00:00:00Z",
+                "message": {
+                    "id": "msg-long-context",
+                    "model": "claude-opus-4-8[1m]",
+                    "usage": {
+                        "input_tokens": 100_000,
+                        "output_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                    },
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert (
+        cli.main(
+            [
+                "inspect",
+                "--runtime",
+                "claude",
+                "--path",
+                str(rollout),
+                "--json",
+            ]
+        )
+        == 0
+    )
+
+    payload = _json_stdout(capsys)
+    assert payload["window_tokens"] == 1_000_000
+    assert payload["context_percent"] == 10.0
+
+
 def test_report_projects_supervisor_state_without_model_work(tmp_path, capsys) -> None:
     state_path = tmp_path / "supervisor.json"
     snapshot = SupervisorSnapshot(
