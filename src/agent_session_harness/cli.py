@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -35,7 +36,11 @@ from .hooks.install import HookInstaller
 from .ledger import EventLedger
 from .models import Runtime
 from .outbox import MirrorOutbox
-from .process import ManagedProcess, PosixProcessDriver
+from .process import (
+    DEFAULT_PROCESS_STARTUP_TIMEOUT_SECONDS,
+    ManagedProcess,
+    PosixProcessDriver,
+)
 from .report import build_report, doctor_report
 from .safety import merge_project_safety, sample_project_safety
 from .secure_files import atomic_write_private_text
@@ -173,6 +178,11 @@ def _parser() -> argparse.ArgumentParser:
     supervise.add_argument("--coordinator-store")
     supervise.add_argument("--outbox")
     supervise.add_argument("--process-state-dir")
+    supervise.add_argument(
+        "--process-startup-timeout-seconds",
+        type=float,
+        default=DEFAULT_PROCESS_STARTUP_TIMEOUT_SECONDS,
+    )
     supervise.add_argument("--poll-seconds", type=float, default=1.0)
     supervise.add_argument("--lease-seconds", type=int, default=60)
     supervise.add_argument("--heartbeat-interval-seconds", type=float)
@@ -357,6 +367,7 @@ def _run_report(args: argparse.Namespace) -> int:
 
 
 def _run_supervise(args: argparse.Namespace) -> int:
+    _validate_process_startup_timeout(args.process_startup_timeout_seconds)
     cwd = Path(args.cwd).expanduser().resolve()
     config = load_config(
         explicit_path=args.config,
@@ -463,7 +474,10 @@ def _run_supervise(args: argparse.Namespace) -> int:
         if args.process_state_dir
         else state_path.parent / "processes"
     )
-    process_driver = PosixProcessDriver(process_state_dir)
+    process_driver = PosixProcessDriver(
+        process_state_dir,
+        startup_timeout_seconds=args.process_startup_timeout_seconds,
+    )
     checkpoint_manager = _ExecutableCheckpointManager(
         capsule_command=capsule_command,
         durable_manager=DurableCheckpointManager(
@@ -860,12 +874,18 @@ def _resolve_executable(executable: str) -> str:
     return resolved
 
 
+def _validate_process_startup_timeout(value: float) -> None:
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("process startup timeout must be positive and finite")
+
+
 def _validate_supervise_intervals(
     args: argparse.Namespace,
     *,
     required_adapter_count: int,
     mirror_adapter_count: int,
 ) -> None:
+    _validate_process_startup_timeout(args.process_startup_timeout_seconds)
     if args.poll_seconds <= 0:
         raise ValueError("poll seconds must be positive")
     if args.lease_seconds <= 0:

@@ -71,10 +71,12 @@ def _interval_args(
     adapter_timeout_seconds: float = 5.0,
     lease_seconds: int = 60,
     poll_seconds: float = 1.0,
+    process_startup_timeout_seconds: float = 20.0,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         poll_seconds=poll_seconds,
         lease_seconds=lease_seconds,
+        process_startup_timeout_seconds=process_startup_timeout_seconds,
         stop_timeout_seconds=10.0,
         stale_after_seconds=None,
         max_ticks=0,
@@ -82,6 +84,81 @@ def _interval_args(
         heartbeat_interval_seconds=None,
         successor_retry_limit=1,
     )
+
+
+def _supervise_parser_args() -> list[str]:
+    return [
+        "supervise",
+        "--runtime",
+        "codex",
+        "--cwd",
+        ".",
+        "--chain-id",
+        "chain-1",
+        "--task-type",
+        "linear",
+        "--task-id",
+        "BOU-2304",
+        "--task-fingerprint",
+        "fingerprint",
+        "--state",
+        "state.json",
+    ]
+
+
+def test_supervise_parser_uses_bounded_process_startup_timeout_default() -> None:
+    args = cli._parser().parse_args(_supervise_parser_args())
+
+    assert args.process_startup_timeout_seconds == 20.0
+
+
+def test_supervise_parser_accepts_process_startup_timeout_override() -> None:
+    args = cli._parser().parse_args(
+        [
+            *_supervise_parser_args(),
+            "--process-startup-timeout-seconds",
+            "7.5",
+        ]
+    )
+
+    assert args.process_startup_timeout_seconds == 7.5
+
+
+@pytest.mark.parametrize(
+    "process_startup_timeout_seconds",
+    [0.0, -1.0, float("inf"), float("nan")],
+)
+def test_supervise_rejects_invalid_process_startup_timeout(
+    process_startup_timeout_seconds: float,
+) -> None:
+    with pytest.raises(ValueError, match="startup timeout must be positive and finite"):
+        cli._validate_supervise_intervals(
+            _interval_args(
+                process_startup_timeout_seconds=process_startup_timeout_seconds
+            ),
+            required_adapter_count=1,
+            mirror_adapter_count=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "process_startup_timeout_seconds",
+    [0.0, -1.0, float("inf"), float("nan")],
+)
+def test_supervise_check_rejects_invalid_process_startup_timeout(
+    process_startup_timeout_seconds: float,
+) -> None:
+    args = cli._parser().parse_args(
+        [
+            *_supervise_parser_args(),
+            "--check",
+            "--process-startup-timeout-seconds",
+            str(process_startup_timeout_seconds),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="startup timeout must be positive and finite"):
+        args.handler(args)
 
 
 def test_supervise_rejects_cumulative_checkpoint_adapter_budget() -> None:
