@@ -194,6 +194,7 @@ class SupervisorSnapshot(BaseModel):
     process_identity: str | None = None
     process_command_digest: str | None = None
     process_launch_nonce: str | None = None
+    process_supersedes_launch_nonce: str | None = None
     run_spec_fingerprint: str | None = Field(default=None, min_length=64, max_length=64)
     context_percent: float | None = Field(default=None, ge=0)
     context_confidence: Confidence = Confidence.UNKNOWN
@@ -1052,12 +1053,7 @@ class Supervisor:
                 self.snapshot = self.snapshot.model_copy(
                     update={
                         "phase": SupervisorPhase.STOPPED,
-                        "process_pid": None,
-                        "process_group_id": None,
-                        "process_registry_key": None,
-                        "process_identity": None,
-                        "process_command_digest": None,
-                        "process_launch_nonce": None,
+                        **self._cleared_process_fields(),
                     }
                 )
                 self._persist()
@@ -1480,6 +1476,7 @@ class Supervisor:
             "process_identity": process.identity,
             "process_command_digest": process.command_digest,
             "process_launch_nonce": process.launch_nonce,
+            "process_supersedes_launch_nonce": process.supersedes_launch_nonce,
         }
 
     @staticmethod
@@ -1491,6 +1488,7 @@ class Supervisor:
             "process_identity": None,
             "process_command_digest": None,
             "process_launch_nonce": None,
+            "process_supersedes_launch_nonce": None,
         }
 
     @staticmethod
@@ -1508,6 +1506,7 @@ class Supervisor:
             identity=snapshot.process_identity,
             command_digest=snapshot.process_command_digest,
             launch_nonce=snapshot.process_launch_nonce,
+            supersedes_launch_nonce=snapshot.process_supersedes_launch_nonce,
         )
 
 

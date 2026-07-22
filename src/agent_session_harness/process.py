@@ -58,6 +58,9 @@ _BASE_ENVIRONMENT = frozenset(
 )
 _ENVIRONMENT_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_ENVIRONMENT_PREFIX = "AGENT_SESSION_HARNESS_"
+_SUPERSEDES_LAUNCH_NONCE_ENVIRONMENT_KEY = (
+    "AGENT_SESSION_HARNESS_SUPERSEDES_LAUNCH_NONCE"
+)
 DEFAULT_PROCESS_STARTUP_TIMEOUT_SECONDS = 20.0
 
 
@@ -247,6 +250,7 @@ class ManagedProcess:
     identity: str | None = None
     command_digest: str | None = None
     launch_nonce: str | None = None
+    supersedes_launch_nonce: str | None = None
     handle: subprocess.Popen[bytes] | None = field(default=None, repr=False)
 
 
@@ -285,6 +289,7 @@ class PosixProcessDriver:
         if request.handoff_message:
             argv.append(request.handoff_message)
         request_environment = dict(request.environment)
+        request_environment.pop(_SUPERSEDES_LAUNCH_NONCE_ENVIRONMENT_KEY, None)
         request_environment.update(
             {
                 "AGENT_SESSION_HARNESS_MANAGED": "1",
@@ -321,12 +326,23 @@ class PosixProcessDriver:
                 raise RuntimeError("managed generation already has a different command")
             if existing is not None and self.is_alive(existing):
                 return existing
+            supersedes_launch_nonce = (
+                existing.launch_nonce if existing is not None else None
+            )
             if existing is not None and private_exists(registry_path):
                 private_unlink(registry_path)
 
             intent = self._read_intent(intent_path)
             if intent is not None and intent.get("command_digest") != command_digest:
                 raise RuntimeError("launch intent already has a different command")
+            if intent is not None:
+                intent_predecessor_nonce = intent.get("supersedes_launch_nonce")
+                if intent_predecessor_nonce is not None and not isinstance(
+                    intent_predecessor_nonce, str
+                ):
+                    raise RuntimeError("launch intent has invalid predecessor lineage")
+                if supersedes_launch_nonce is None:
+                    supersedes_launch_nonce = intent_predecessor_nonce
             nonce = str(intent.get("launch_nonce")) if intent else uuid.uuid4().hex
             should_spawn = intent is None
             if intent is not None:
@@ -345,6 +361,7 @@ class PosixProcessDriver:
                     key=key,
                     command_digest=command_digest,
                     launch_nonce=nonce,
+                    supersedes_launch_nonce=supersedes_launch_nonce,
                 )
 
         managed: ManagedProcess | None = None
@@ -361,6 +378,8 @@ class PosixProcessDriver:
                             current_intent is None
                             or current_intent.get("command_digest") != command_digest
                             or current_intent.get("launch_nonce") != nonce
+                            or current_intent.get("supersedes_launch_nonce")
+                            != supersedes_launch_nonce
                         ):
                             raise RuntimeError(
                                 "launch intent changed while awaiting registration"
@@ -376,6 +395,7 @@ class PosixProcessDriver:
                             key=key,
                             command_digest=command_digest,
                             launch_nonce=nonce,
+                            supersedes_launch_nonce=supersedes_launch_nonce,
                         )
                         should_spawn = True
         if should_spawn:
@@ -398,10 +418,25 @@ class PosixProcessDriver:
                 "--",
                 *argv,
             ]
+            guardian_environment = dict(environment)
+            if supersedes_launch_nonce is not None:
+                cwd_option = guardian_argv.index("--cwd")
+                guardian_argv[cwd_option:cwd_option] = [
+                    "--supersedes-launch-nonce",
+                    supersedes_launch_nonce,
+                ]
+                guardian_environment[_SUPERSEDES_LAUNCH_NONCE_ENVIRONMENT_KEY] = (
+                    supersedes_launch_nonce
+                )
+            else:
+                guardian_environment.pop(
+                    _SUPERSEDES_LAUNCH_NONCE_ENVIRONMENT_KEY,
+                    None,
+                )
             handle = subprocess.Popen(
                 guardian_argv,
                 cwd=request.cwd,
-                env=environment,
+                env=guardian_environment,
                 process_group=0,
             )
         if managed is None:
@@ -514,6 +549,8 @@ class PosixProcessDriver:
                 or payload.get("identity") != process.identity
                 or payload.get("command_digest") != process.command_digest
                 or payload.get("launch_nonce") != process.launch_nonce
+                or payload.get("supersedes_launch_nonce")
+                != process.supersedes_launch_nonce
             ):
                 return None
             return ProcessExit(
@@ -536,6 +573,8 @@ class PosixProcessDriver:
                 and payload.get("identity") == process.identity
                 and payload.get("command_digest") == process.command_digest
                 and payload.get("launch_nonce") == process.launch_nonce
+                and payload.get("supersedes_launch_nonce")
+                == process.supersedes_launch_nonce
             ):
                 private_unlink(path)
 
@@ -612,6 +651,12 @@ class PosixProcessDriver:
             payload = json.loads(read_private_text(path))
             if payload.get("registry_key") != key:
                 return None
+            supersedes_launch_nonce = payload.get("supersedes_launch_nonce")
+            if supersedes_launch_nonce is not None and (
+                not isinstance(supersedes_launch_nonce, str)
+                or not supersedes_launch_nonce
+            ):
+                return None
             return ManagedProcess(
                 pid=int(payload["pid"]),
                 process_group_id=int(payload["process_group_id"]),
@@ -619,6 +664,7 @@ class PosixProcessDriver:
                 identity=str(payload["identity"]),
                 command_digest=str(payload["command_digest"]),
                 launch_nonce=str(payload["launch_nonce"]),
+                supersedes_launch_nonce=supersedes_launch_nonce,
             )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             return None
@@ -649,7 +695,14 @@ class PosixProcessDriver:
             payload = json.loads(read_private_text(path))
         except (json.JSONDecodeError, OSError):
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        supersedes_launch_nonce = payload.get("supersedes_launch_nonce")
+        if supersedes_launch_nonce is not None and (
+            not isinstance(supersedes_launch_nonce, str) or not supersedes_launch_nonce
+        ):
+            return None
+        return payload
 
     @staticmethod
     def _write_intent(
@@ -658,7 +711,12 @@ class PosixProcessDriver:
         key: str,
         command_digest: str,
         launch_nonce: str,
+        supersedes_launch_nonce: str | None = None,
     ) -> None:
+        if supersedes_launch_nonce is not None and (
+            not isinstance(supersedes_launch_nonce, str) or not supersedes_launch_nonce
+        ):
+            raise ValueError("predecessor launch nonce must be a non-empty string")
         _atomic_private_json(
             path,
             {
@@ -666,6 +724,7 @@ class PosixProcessDriver:
                 "registry_key": key,
                 "command_digest": command_digest,
                 "launch_nonce": launch_nonce,
+                "supersedes_launch_nonce": supersedes_launch_nonce,
                 "created_at": time.time(),
             },
         )
@@ -735,6 +794,7 @@ class PosixProcessDriver:
             and left.identity == right.identity
             and left.command_digest == right.command_digest
             and left.launch_nonce == right.launch_nonce
+            and left.supersedes_launch_nonce == right.supersedes_launch_nonce
         )
 
 
@@ -745,6 +805,7 @@ def register_guarded_process(
     registry_key: str,
     command_digest: str,
     launch_nonce: str,
+    supersedes_launch_nonce: str | None = None,
     process_group_id: int | None = None,
 ) -> ManagedProcess:
     with exclusive_lock(registry_path.with_suffix(".lock")):
@@ -754,6 +815,7 @@ def register_guarded_process(
             or intent.get("registry_key") != registry_key
             or intent.get("command_digest") != command_digest
             or intent.get("launch_nonce") != launch_nonce
+            or intent.get("supersedes_launch_nonce") != supersedes_launch_nonce
         ):
             raise RuntimeError("launch guardian intent is no longer current")
         identity = PosixProcessDriver._process_identity(os.getpid())
@@ -768,6 +830,7 @@ def register_guarded_process(
             identity=identity,
             command_digest=command_digest,
             launch_nonce=launch_nonce,
+            supersedes_launch_nonce=supersedes_launch_nonce,
         )
         _atomic_private_json(
             registry_path,
@@ -778,6 +841,7 @@ def register_guarded_process(
                 "identity": process.identity,
                 "command_digest": process.command_digest,
                 "launch_nonce": process.launch_nonce,
+                "supersedes_launch_nonce": process.supersedes_launch_nonce,
             },
         )
     return process
@@ -802,6 +866,151 @@ def unregister_guarded_process(
             private_unlink(registry_path)
 
 
+@dataclass(frozen=True)
+class _GuardianOwner:
+    pid: int
+    registry_key: str
+    identity: str
+    command_digest: str
+    launch_nonce: str
+    supersedes_launch_nonce: str | None
+
+
+def _read_guardian_owner(path: Path, registry_key: str) -> ManagedProcess | None:
+    if not private_exists(path):
+        return None
+    try:
+        payload = json.loads(read_private_text(path))
+        if not isinstance(payload, dict):
+            return None
+        pid = payload["pid"]
+        process_group_id = payload["process_group_id"]
+        stored_registry_key = payload["registry_key"]
+        identity = payload["identity"]
+        command_digest = payload["command_digest"]
+        launch_nonce = payload["launch_nonce"]
+        supersedes_launch_nonce = payload.get("supersedes_launch_nonce")
+        if (
+            not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(process_group_id, int)
+            or isinstance(process_group_id, bool)
+            or process_group_id <= 0
+            or not isinstance(stored_registry_key, str)
+            or not stored_registry_key
+            or stored_registry_key != registry_key
+            or not isinstance(identity, str)
+            or not identity
+            or not isinstance(command_digest, str)
+            or not command_digest
+            or not isinstance(launch_nonce, str)
+            or not launch_nonce
+            or (
+                supersedes_launch_nonce is not None
+                and (
+                    not isinstance(supersedes_launch_nonce, str)
+                    or not supersedes_launch_nonce
+                )
+            )
+        ):
+            return None
+        return ManagedProcess(
+            pid=pid,
+            process_group_id=process_group_id,
+            registry_key=stored_registry_key,
+            identity=identity,
+            command_digest=command_digest,
+            launch_nonce=launch_nonce,
+            supersedes_launch_nonce=supersedes_launch_nonce,
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _is_proven_successor(
+    obsolete: ManagedProcess,
+    candidate: ManagedProcess | _GuardianOwner | None,
+) -> bool:
+    return (
+        isinstance(obsolete.identity, str)
+        and bool(obsolete.identity)
+        and isinstance(obsolete.launch_nonce, str)
+        and bool(obsolete.launch_nonce)
+        and isinstance(obsolete.command_digest, str)
+        and bool(obsolete.command_digest)
+        and candidate is not None
+        and isinstance(candidate.identity, str)
+        and bool(candidate.identity)
+        and isinstance(candidate.launch_nonce, str)
+        and bool(candidate.launch_nonce)
+        and isinstance(candidate.command_digest, str)
+        and bool(candidate.command_digest)
+        and candidate.registry_key == obsolete.registry_key
+        and candidate.command_digest == obsolete.command_digest
+        and candidate.identity != obsolete.identity
+        and candidate.launch_nonce != obsolete.launch_nonce
+        and candidate.supersedes_launch_nonce == obsolete.launch_nonce
+    )
+
+
+def _read_exit_owner(path: Path, registry_key: str) -> _GuardianOwner | None:
+    if not private_exists(path):
+        return None
+    try:
+        payload = json.loads(read_private_text(path))
+        if not isinstance(payload, dict):
+            return None
+        stored_registry_key = payload["registry_key"]
+        if (
+            not isinstance(stored_registry_key, str)
+            or not stored_registry_key
+            or stored_registry_key != registry_key
+        ):
+            return None
+        pid = payload["pid"]
+        identity = payload["identity"]
+        command_digest = payload["command_digest"]
+        launch_nonce = payload["launch_nonce"]
+        supersedes_launch_nonce = payload.get("supersedes_launch_nonce")
+        schema_version = payload["schema_version"]
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version != 1
+            or not isinstance(pid, int)
+            or isinstance(pid, bool)
+            or pid <= 0
+            or not isinstance(identity, str)
+            or not identity
+            or not isinstance(command_digest, str)
+            or not command_digest
+            or not isinstance(launch_nonce, str)
+            or not launch_nonce
+            or (
+                supersedes_launch_nonce is not None
+                and (
+                    not isinstance(supersedes_launch_nonce, str)
+                    or not supersedes_launch_nonce
+                )
+            )
+            or not isinstance(payload["return_code"], int)
+            or isinstance(payload["return_code"], bool)
+        ):
+            return None
+        ExitReason(payload["reason"])
+        return _GuardianOwner(
+            pid=pid,
+            registry_key=stored_registry_key,
+            identity=identity,
+            command_digest=command_digest,
+            launch_nonce=launch_nonce,
+            supersedes_launch_nonce=supersedes_launch_nonce,
+        )
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return None
+
+
 def record_guarded_exit(
     *,
     registry_path: Path,
@@ -811,14 +1020,29 @@ def record_guarded_exit(
     """Persist a guardian's exact terminal status before removing its registry."""
 
     with exclusive_lock(registry_path.with_suffix(".lock")):
-        registered = PosixProcessDriver._read_registry(
+        registry_exists = private_exists(registry_path)
+        registered = _read_guardian_owner(
             registry_path,
             process.registry_key,
         )
-        if registered is None or not PosixProcessDriver._same_process(
-            registered,
+        if registry_exists and registered is None:
+            raise RuntimeError("cannot record exit for a superseded guardian")
+        if registered is not None:
+            if PosixProcessDriver._same_process(registered, process):
+                pass
+            elif _is_proven_successor(process, registered):
+                return
+            else:
+                raise RuntimeError("cannot record exit for a superseded guardian")
+        elif _is_proven_successor(
             process,
+            _read_exit_owner(
+                registry_path.with_suffix(".exit.json"),
+                process.registry_key,
+            ),
         ):
+            return
+        else:
             raise RuntimeError("cannot record exit for a superseded guardian")
         _atomic_private_json(
             registry_path.with_suffix(".exit.json"),
@@ -829,6 +1053,7 @@ def record_guarded_exit(
                 "identity": process.identity,
                 "command_digest": process.command_digest,
                 "launch_nonce": process.launch_nonce,
+                "supersedes_launch_nonce": process.supersedes_launch_nonce,
                 "return_code": terminal.return_code,
                 "reason": terminal.reason.value,
             },
