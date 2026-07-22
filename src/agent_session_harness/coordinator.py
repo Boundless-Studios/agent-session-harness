@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .models import Runtime
 from .secure_files import (
     append_private_text,
+    atomic_write_private_text,
     exclusive_lock,
     private_exists,
     read_private_text,
@@ -62,13 +63,35 @@ class _SecureJsonlClaimStore(JsonlClaimStore):
         with exclusive_lock(self.lock_path):
             return self._read_secure()
 
+    def supports_atomic_compaction(self) -> bool:
+        return True
+
     def transact_event(
         self,
         build_event: Callable[[list[dict[str, Any]]], dict[str, Any]],
+        *,
+        compact_events: Callable[
+            [list[dict[str, Any]]], list[dict[str, Any]] | None
+        ]
+        | None = None,
     ) -> dict[str, Any]:
         with exclusive_lock(self.lock_path):
-            event = build_event(self._read_secure())
-            self._append_secure(event)
+            events = self._read_secure()
+            event = build_event(events)
+            if compact_events is None:
+                self._append_secure(event)
+                return event
+            compacted = compact_events([*events, event])
+            if compacted is None:
+                self._append_secure(event)
+            else:
+                atomic_write_private_text(
+                    self.path,
+                    "".join(
+                        json.dumps(item, sort_keys=True) + "\n"
+                        for item in compacted
+                    ),
+                )
             return event
 
     def _append_secure(self, event: dict[str, Any]) -> None:
