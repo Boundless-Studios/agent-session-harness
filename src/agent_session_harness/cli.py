@@ -249,6 +249,11 @@ def _parser() -> argparse.ArgumentParser:
     usage.add_argument("--claude-root", action="append")
     usage.add_argument("--codex-root", action="append")
     usage.add_argument(
+        "--claude-window-tokens",
+        type=int,
+        help="authoritative Claude context window selected at launch time",
+    )
+    usage.add_argument(
         "--claude-fallback-window-tokens",
         type=int,
         help=(
@@ -335,6 +340,7 @@ def _run_adapter(args: argparse.Namespace) -> int:
             cwd=args.cwd,
             claude_roots=args.claude_root,
             codex_roots=args.codex_root,
+            claude_window_tokens=args.claude_window_tokens,
             claude_fallback_window_tokens=args.claude_fallback_window_tokens,
             max_rollout_bytes=args.max_rollout_bytes,
         )

@@ -62,6 +62,7 @@ def sample_usage(
     cwd: str | os.PathLike[str] | None = None,
     claude_roots: Sequence[str | os.PathLike[str]] | None = None,
     codex_roots: Sequence[str | os.PathLike[str]] | None = None,
+    claude_window_tokens: int | None = None,
     claude_fallback_window_tokens: int | None = None,
     max_rollout_bytes: int = MAX_ROLLOUT_BYTES,
     claude_reader_factory: ReaderFactory | None = None,
@@ -94,6 +95,7 @@ def sample_usage(
         if runtime == "claude":
             window_tokens = _claude_window_tokens(
                 sanitized,
+                explicit=claude_window_tokens,
                 fallback=claude_fallback_window_tokens,
             )
         if claude_reader_factory is None or codex_reader_factory is None:
@@ -442,13 +444,20 @@ def _installed_reader_factories() -> tuple[ReaderFactory, ReaderFactory]:
     return ClaudeUsageReader, CodexUsageReader
 
 
-def _claude_window_tokens(sanitized: str, *, fallback: int | None) -> int:
-    """Resolve the window from the model the rollout names.
+def _claude_window_tokens(
+    sanitized: str, *, explicit: int | None, fallback: int | None
+) -> int:
+    """Resolve an authoritative or model-derived Claude context window.
 
-    The rollout is authoritative: `resolve_window_tokens` owns the model table
-    and the long-context suffix. `fallback` applies only to model identities
-    the table does not recognize, and never overrides a recognized one.
+    An explicit launch/config value is authoritative because Claude Code omits
+    context-variant suffixes from rollout model names. The model table and then
+    `fallback` apply only when no explicit value is available.
     """
+
+    if explicit is not None:
+        if explicit <= 0:
+            raise ValueError("Claude context window must be positive")
+        return explicit
 
     models: set[str] = set()
     for raw_line in sanitized.splitlines():
@@ -484,6 +493,7 @@ def main(
     cwd: str | os.PathLike[str] | None = None,
     claude_roots: Sequence[str] | None = None,
     codex_roots: Sequence[str] | None = None,
+    claude_window_tokens: int | None = None,
     claude_fallback_window_tokens: int | None = None,
     max_rollout_bytes: int = MAX_ROLLOUT_BYTES,
 ) -> int:
@@ -502,6 +512,7 @@ def main(
             cwd=cwd or Path.cwd(),
             claude_roots=claude_roots,
             codex_roots=codex_roots,
+            claude_window_tokens=claude_window_tokens,
             claude_fallback_window_tokens=claude_fallback_window_tokens,
             max_rollout_bytes=max_rollout_bytes,
         )

@@ -23,10 +23,10 @@ class ClaudeDiscovery(BaseModel):
     error: str | None = None
 
 
-# Context window per model identity, as recorded in `message.model`. The rollout
-# is authoritative: a caller-supplied window is only a fallback for identities
-# absent from this table, because measuring a 1M session against a 200k window
-# overstates usage ~5x and drains the session at ~14% of its real capacity.
+# Context window per model identity, as recorded in `message.model`. This is a
+# fallback when the caller has no authoritative launch/config window: Claude
+# Code omits the `[1m]` selection from rollout model names, so a bare identity
+# alone cannot distinguish 200k from 1M context.
 _BASE_CONTEXT_WINDOW_TOKENS = 200_000
 _LONG_CONTEXT_SUFFIX = "[1m]"
 _LONG_CONTEXT_WINDOW_TOKENS = 1_000_000
@@ -51,11 +51,11 @@ def resolve_window_tokens(model: str | None) -> int | None:
     normalized = model.strip()
     if not normalized:
         return None
+    if normalized.endswith(_LONG_CONTEXT_SUFFIX):
+        return _LONG_CONTEXT_WINDOW_TOKENS
     exact = CONTEXT_WINDOWS.get(normalized)
     if exact is not None:
         return exact
-    if normalized.endswith(_LONG_CONTEXT_SUFFIX):
-        return _LONG_CONTEXT_WINDOW_TOKENS
     return None
 
 
@@ -99,15 +99,14 @@ class _MessageUsage:
 
 
 class ClaudeUsageReader:
-    def __init__(self, *, window_tokens: int):
-        """`window_tokens` is a FALLBACK, not an override.
+    def __init__(self, *, window_tokens: int | None):
+        """Read Claude usage with an optional authoritative context window.
 
-        The model identity recorded in the rollout wins whenever it is
-        recognized (see `resolve_window_tokens`); this value applies only to
-        unrecognized identities. Callers cannot know the window ahead of time
-        because the operator may switch models mid-session.
+        Claude Code omits context-variant suffixes from rollout model names, so
+        an explicit launch/config window wins when present. Without one, the
+        latest rollout model is used as a fallback.
         """
-        if window_tokens <= 0:
+        if window_tokens is not None and window_tokens <= 0:
             raise ValueError("window_tokens must be positive")
         self.window_tokens = window_tokens
 
@@ -226,10 +225,12 @@ class ClaudeUsageReader:
             )
 
         latest = max(ordered, key=lambda item: (item.observed_at, item.order))
-        # The most recent assistant message names the model whose window is in
-        # force right now. A mid-session `/model` switch is routine, so a mixed
-        # rollout must resolve rather than refuse to produce a sample.
-        window_tokens = resolve_window_tokens(latest.model) or self.window_tokens
+        # An explicit launch/config window wins because the rollout may omit its
+        # context variant. Otherwise the latest assistant message is the best
+        # available fallback; a mid-session `/model` switch is routine.
+        window_tokens = self.window_tokens or resolve_window_tokens(latest.model)
+        if window_tokens is None:
+            raise ValueError("Claude context window is unknown")
         # Only findings that invalidate the figures being reported may degrade
         # the sample: a mixed rollout, an unreadable tail (so the numbers are
         # stale), or a latest record that could not be keyed by message id (so

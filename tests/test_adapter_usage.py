@@ -144,6 +144,28 @@ def test_usage_takes_the_window_from_the_model_the_rollout_names(tmp_path) -> No
     assert _ClaudeReader.observed_window_tokens == 1_000_000
 
 
+def test_usage_explicit_window_wins_over_bare_rollout_model(tmp_path) -> None:
+    """BOU-2237: launch-time context selection is authoritative when present."""
+    ledger = _write_ledger(
+        tmp_path, runtime="claude", conversation_id="claude-session-1"
+    )
+    root = tmp_path / "claude-projects"
+    _copy_rollout(root, "claude-rollout-v1.jsonl", "project/claude-session-1.jsonl")
+
+    usage.sample_usage(
+        _usage_request(),
+        ledger_paths=(ledger,),
+        cwd=tmp_path / "worktree",
+        claude_roots=(root,),
+        codex_roots=(),
+        claude_window_tokens=1_000_000,
+        claude_reader_factory=_ClaudeReader,
+        codex_reader_factory=_CodexReader,
+    )
+
+    assert _ClaudeReader.observed_window_tokens == 1_000_000
+
+
 def test_usage_maps_codex_incremental_burn_and_token_only_rollout(tmp_path) -> None:
     ledger = _write_ledger(tmp_path, runtime="codex", conversation_id="codex-session-1")
     root = tmp_path / "codex-sessions"
