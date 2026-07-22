@@ -98,6 +98,23 @@ def test_adapter_state_contains_only_fencing_identity(tmp_path) -> None:
     }
 
 
+def test_secure_store_participates_in_atomic_compaction(tmp_path) -> None:
+    harness, _coordinator = _modules()
+    store = harness._SecureJsonlClaimStore(tmp_path / "claims.jsonl")
+    store.append_event({"event": "old"})
+
+    store.transact_event(
+        lambda _events: {"event": "new"},
+        compact_events=lambda events: [events[-1], {"event": "compaction"}],
+    )
+
+    assert store.supports_atomic_compaction()
+    assert store.read_events() == [
+        {"event": "new"},
+        {"event": "compaction"},
+    ]
+
+
 def test_corrupt_latest_claim_record_blocks_a_competing_owner(tmp_path) -> None:
     harness, _coordinator = _modules()
     path = tmp_path / "claims.jsonl"
