@@ -200,7 +200,7 @@ def _coordinator_check() -> dict[str, object]:
     # pin and this constant are two halves of one decision: bumping only the
     # pin makes `doctor` report the harness incompatible with the library it
     # actually ships against.
-    expected = "0.3.0"
+    expected = "0.3.1"
     try:
         installed_version = metadata.version("agent-coordinator")
     except metadata.PackageNotFoundError:
