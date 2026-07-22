@@ -641,7 +641,9 @@ def test_exited_guardian_clears_matching_launch_intent(tmp_path, monkeypatch) ->
         def poll(self) -> int:
             return 17
 
-    monkeypatch.setattr(process.subprocess, "Popen", lambda *args, **kwargs: ExitedGuardian())
+    monkeypatch.setattr(
+        process.subprocess, "Popen", lambda *args, **kwargs: ExitedGuardian()
+    )
     monkeypatch.setattr(driver, "_await_registry", lambda *args, **kwargs: None)
 
     with pytest.raises(RuntimeError, match="guardian exited before becoming ready: 17"):
