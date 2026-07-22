@@ -524,6 +524,194 @@ def test_launch_guardian_rejects_a_superseded_intent(tmp_path, monkeypatch) -> N
     assert not registry_path.exists()
 
 
+def _superseded_guardians(process):
+    guardian_a = process.ManagedProcess(
+        pid=4101,
+        process_group_id=4101,
+        registry_key="chain-superseded:0",
+        identity="guardian-a-birth",
+        command_digest="shared-command-digest",
+        launch_nonce="guardian-a-nonce",
+    )
+    guardian_b = process.ManagedProcess(
+        pid=4202,
+        process_group_id=4202,
+        registry_key=guardian_a.registry_key,
+        identity="guardian-b-birth",
+        command_digest=guardian_a.command_digest,
+        launch_nonce="guardian-b-nonce",
+    )
+    return guardian_a, guardian_b
+
+
+def _write_guardian_registry(process, registry_path, guardian) -> None:
+    process._atomic_private_json(
+        registry_path,
+        {
+            "pid": guardian.pid,
+            "process_group_id": guardian.process_group_id,
+            "registry_key": guardian.registry_key,
+            "identity": guardian.identity,
+            "command_digest": guardian.command_digest,
+            "launch_nonce": guardian.launch_nonce,
+        },
+    )
+
+
+def _write_guardian_exit(process, registry_path, guardian, terminal) -> None:
+    process._atomic_private_json(
+        registry_path.with_suffix(".exit.json"),
+        {
+            "schema_version": 1,
+            "pid": guardian.pid,
+            "registry_key": guardian.registry_key,
+            "identity": guardian.identity,
+            "command_digest": guardian.command_digest,
+            "launch_nonce": guardian.launch_nonce,
+            "return_code": terminal.return_code,
+            "reason": terminal.reason.value,
+        },
+    )
+
+
+def test_superseded_guardian_exit_preserves_current_successor_registry(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    registry_path = tmp_path / "process.json"
+    guardian_a, guardian_b = _superseded_guardians(process)
+    _write_guardian_registry(process, registry_path, guardian_b)
+
+    process.record_guarded_exit(
+        registry_path=registry_path,
+        process=guardian_a,
+        terminal=process.ProcessExit(
+            return_code=0,
+            reason=process.ExitReason.NATURAL,
+        ),
+    )
+
+    assert process.PosixProcessDriver._read_registry(
+        registry_path,
+        guardian_b.registry_key,
+    ) == guardian_b
+    assert not registry_path.with_suffix(".exit.json").exists()
+
+
+def test_superseded_guardian_exit_preserves_terminal_successor_receipt(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    driver = process.PosixProcessDriver(tmp_path)
+    guardian_a, guardian_b = _superseded_guardians(process)
+    registry_path = driver._registry_path(guardian_a.registry_key)
+    exit_path = registry_path.with_suffix(".exit.json")
+    successor_terminal = process.ProcessExit(
+        return_code=23,
+        reason=process.ExitReason.WATCHDOG_EXPIRED,
+    )
+    _write_guardian_exit(process, registry_path, guardian_b, successor_terminal)
+    original_receipt = exit_path.read_bytes()
+
+    process.record_guarded_exit(
+        registry_path=registry_path,
+        process=guardian_a,
+        terminal=process.ProcessExit(
+            return_code=0,
+            reason=process.ExitReason.NATURAL,
+        ),
+    )
+
+    assert not registry_path.exists()
+    assert exit_path.read_bytes() == original_receipt
+    assert driver.exit_status(guardian_b) == successor_terminal
+
+
+@pytest.mark.parametrize(
+    "successor_changes",
+    [
+        pytest.param(
+            {"command_digest": "different-command-digest"},
+            id="changed-command-digest",
+        ),
+        pytest.param(
+            {"launch_nonce": "guardian-a-nonce"},
+            id="same-launch-nonce-different-process",
+        ),
+    ],
+)
+def test_guardian_exit_rejects_unproven_successor_registry(
+    tmp_path,
+    successor_changes,
+) -> None:
+    process, _supervisor_module = _modules()
+    registry_path = tmp_path / "process.json"
+    guardian_a, guardian_b = _superseded_guardians(process)
+    for field, value in successor_changes.items():
+        setattr(guardian_b, field, value)
+    _write_guardian_registry(process, registry_path, guardian_b)
+    original_registry = registry_path.read_bytes()
+    exit_path = registry_path.with_suffix(".exit.json")
+
+    with pytest.raises(RuntimeError, match="superseded guardian"):
+        process.record_guarded_exit(
+            registry_path=registry_path,
+            process=guardian_a,
+            terminal=process.ProcessExit(
+                return_code=0,
+                reason=process.ExitReason.NATURAL,
+            ),
+        )
+
+    assert registry_path.read_bytes() == original_registry
+    assert not exit_path.exists()
+
+
+def test_guardian_exit_rejects_malformed_registry(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    registry_path = tmp_path / "process.json"
+    guardian_a, _guardian_b = _superseded_guardians(process)
+    process._atomic_private_json(
+        registry_path,
+        {
+            "registry_key": guardian_a.registry_key,
+            "command_digest": guardian_a.command_digest,
+            "launch_nonce": "guardian-b-nonce",
+        },
+    )
+    malformed_registry = registry_path.read_bytes()
+    exit_path = registry_path.with_suffix(".exit.json")
+
+    with pytest.raises(RuntimeError, match="superseded guardian"):
+        process.record_guarded_exit(
+            registry_path=registry_path,
+            process=guardian_a,
+            terminal=process.ProcessExit(
+                return_code=0,
+                reason=process.ExitReason.NATURAL,
+            ),
+        )
+
+    assert registry_path.read_bytes() == malformed_registry
+    assert not exit_path.exists()
+
+
+def test_guardian_exit_rejects_missing_registry_and_receipt(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    guardian_a, _guardian_b = _superseded_guardians(process)
+    registry_path = tmp_path / "missing.json"
+    exit_path = registry_path.with_suffix(".exit.json")
+
+    with pytest.raises(RuntimeError, match="superseded guardian"):
+        process.record_guarded_exit(
+            registry_path=registry_path,
+            process=guardian_a,
+            terminal=process.ProcessExit(
+                return_code=0,
+                reason=process.ExitReason.NATURAL,
+            ),
+        )
+
+    assert not registry_path.exists()
+    assert not exit_path.exists()
+
+
 def test_launch_guardian_exec_failure_is_not_reported_as_active(tmp_path) -> None:
     process, _supervisor_module = _modules()
     driver = process.PosixProcessDriver(tmp_path)
