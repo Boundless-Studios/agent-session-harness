@@ -17,7 +17,7 @@ except ModuleNotFoundError:
 FIXTURES = Path(__file__).parent / "fixtures" / "claude"
 
 
-def _reader(*, window_tokens: int):
+def _reader(*, window_tokens: int | None):
     assert ClaudeUsageReader is not None, "ClaudeUsageReader is not implemented"
     return ClaudeUsageReader(window_tokens=window_tokens)
 
@@ -235,13 +235,8 @@ def _assistant_row(
     )
 
 
-def test_window_is_derived_from_a_1m_model_not_the_fallback(tmp_path) -> None:
-    """BOU-2211: a 1M-context model must not be measured against a 200k window.
-
-    The supervisor supplies a conservative fallback, but the model identity in
-    the rollout is authoritative and has to win. Otherwise a 1M session reports
-    ~5x its real usage and drains at ~14% of the real window.
-    """
+def test_window_is_derived_from_a_1m_model_without_an_explicit_window(tmp_path) -> None:
+    """BOU-2211: a suffixed rollout model remains a valid fallback signal."""
     rollout = tmp_path / "one-million.jsonl"
     rollout.write_text(
         _assistant_row(
@@ -254,11 +249,31 @@ def test_window_is_derived_from_a_1m_model_not_the_fallback(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    usage = _reader(window_tokens=200_000).read_file(rollout)
+    usage = _reader(window_tokens=None).read_file(rollout)
 
     assert usage.window_tokens == 1_000_000
     assert usage.context_percent == pytest.approx(20.0)
     assert usage.confidence is Confidence.CONFIDENT
+
+
+def test_explicit_window_wins_when_rollout_omits_the_1m_suffix(tmp_path) -> None:
+    """BOU-2237: Claude's bare rollout model cannot identify a 1M launch."""
+    rollout = tmp_path / "bare-model-from-1m-launch.jsonl"
+    rollout.write_text(
+        _assistant_row(
+            message_id="msg-bare-1m",
+            model="claude-opus-4-8",
+            timestamp="2026-07-20T03:00:00Z",
+            input_tokens=100_000,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    usage = _reader(window_tokens=1_000_000).read_file(rollout)
+
+    assert usage.window_tokens == 1_000_000
+    assert usage.context_percent == pytest.approx(10.0)
 
 
 def test_mixed_model_rollout_uses_the_most_recent_model(tmp_path) -> None:
@@ -287,14 +302,14 @@ def test_mixed_model_rollout_uses_the_most_recent_model(tmp_path) -> None:
         encoding="utf-8",
     )
 
-    usage = _reader(window_tokens=200_000).read_file(rollout)
+    usage = _reader(window_tokens=None).read_file(rollout)
 
     assert usage.window_tokens == 1_000_000
     assert usage.confidence is Confidence.CONFIDENT
 
 
-def test_unknown_model_falls_back_to_the_supplied_window(tmp_path) -> None:
-    """An unmapped model degrades to the caller's fallback rather than failing.
+def test_unknown_model_uses_the_explicit_window(tmp_path) -> None:
+    """An explicit window keeps an unmapped model usable rather than failing.
 
     Refusing to produce a sample would stop rotation entirely, which is the very
     failure BOU-2195 exists to prevent.
