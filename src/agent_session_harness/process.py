@@ -413,6 +413,13 @@ class PosixProcessDriver:
             )
         if managed is None:
             if handle is not None and handle.poll() is not None:
+                with exclusive_lock(lock_path):
+                    current_intent = self._read_intent(intent_path)
+                    if (
+                        current_intent is not None
+                        and current_intent.get("launch_nonce") == nonce
+                    ):
+                        private_unlink(intent_path)
                 raise RuntimeError(
                     f"launch guardian exited before becoming ready: {handle.returncode}"
                 )

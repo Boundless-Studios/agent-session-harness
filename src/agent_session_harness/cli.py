@@ -367,6 +367,7 @@ def _run_report(args: argparse.Namespace) -> int:
 
 
 def _run_supervise(args: argparse.Namespace) -> int:
+    _validate_process_startup_timeout(args.process_startup_timeout_seconds)
     cwd = Path(args.cwd).expanduser().resolve()
     config = load_config(
         explicit_path=args.config,
@@ -873,17 +874,18 @@ def _resolve_executable(executable: str) -> str:
     return resolved
 
 
+def _validate_process_startup_timeout(value: float) -> None:
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("process startup timeout must be positive and finite")
+
+
 def _validate_supervise_intervals(
     args: argparse.Namespace,
     *,
     required_adapter_count: int,
     mirror_adapter_count: int,
 ) -> None:
-    if (
-        not math.isfinite(args.process_startup_timeout_seconds)
-        or args.process_startup_timeout_seconds <= 0
-    ):
-        raise ValueError("process startup timeout must be positive and finite")
+    _validate_process_startup_timeout(args.process_startup_timeout_seconds)
     if args.poll_seconds <= 0:
         raise ValueError("poll seconds must be positive")
     if args.lease_seconds <= 0:

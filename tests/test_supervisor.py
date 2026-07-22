@@ -622,6 +622,35 @@ def test_await_registry_returns_early_when_guardian_exits(
     )
 
 
+def test_exited_guardian_clears_matching_launch_intent(tmp_path, monkeypatch) -> None:
+    process, _supervisor_module = _modules()
+    driver = process.PosixProcessDriver(tmp_path)
+    request = process.LaunchRequest(
+        runtime="codex",
+        chain_id="chain-exited-intent",
+        generation=0,
+        cwd=tmp_path,
+        executable=sys.executable,
+        runtime_args=("-c", "raise SystemExit(17)"),
+    )
+
+    class ExitedGuardian:
+        pid = 4242
+        returncode = 17
+
+        def poll(self) -> int:
+            return 17
+
+    monkeypatch.setattr(process.subprocess, "Popen", lambda *args, **kwargs: ExitedGuardian())
+    monkeypatch.setattr(driver, "_await_registry", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="guardian exited before becoming ready: 17"):
+        driver.start_fresh(request)
+
+    intent_path = driver._registry_path("chain-exited-intent:0").with_suffix(".intent")
+    assert not intent_path.exists()
+
+
 def test_guardian_persists_clean_exit_status_for_supervisor_recovery(tmp_path) -> None:
     process, _supervisor_module = _modules()
     driver = process.PosixProcessDriver(tmp_path)
