@@ -539,6 +539,89 @@ def test_launch_guardian_exec_failure_is_not_reported_as_active(tmp_path) -> Non
         driver.start_fresh(request)
 
 
+def test_process_driver_default_allows_delayed_guardian_registration(
+    tmp_path, monkeypatch
+) -> None:
+    process, _supervisor_module = _modules()
+    driver = process.PosixProcessDriver(tmp_path)
+    now = 0.0
+    managed = process.ManagedProcess(
+        pid=4242,
+        process_group_id=4242,
+        registry_key="chain-delayed:0",
+        identity="birth-identity",
+        command_digest="command-digest",
+        launch_nonce="delayed-nonce",
+    )
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    monkeypatch.setattr(process.time, "monotonic", monotonic)
+    monkeypatch.setattr(process.time, "sleep", sleep)
+    monkeypatch.setattr(
+        driver,
+        "_read_registry",
+        lambda _path, _key: managed if now >= 2.1 else None,
+    )
+
+    assert (
+        driver._await_registry(
+            tmp_path / "managed.json",
+            "chain-delayed:0",
+            "delayed-nonce",
+        )
+        is managed
+    )
+
+
+@pytest.mark.parametrize(
+    "startup_timeout_seconds", [0.0, -1.0, float("inf"), float("nan")]
+)
+def test_process_driver_rejects_invalid_startup_timeout(
+    tmp_path, startup_timeout_seconds
+) -> None:
+    process, _supervisor_module = _modules()
+
+    with pytest.raises(ValueError, match="startup timeout must be positive and finite"):
+        process.PosixProcessDriver(
+            tmp_path,
+            startup_timeout_seconds=startup_timeout_seconds,
+        )
+
+
+def test_await_registry_returns_early_when_guardian_exits(
+    tmp_path, monkeypatch
+) -> None:
+    process, _supervisor_module = _modules()
+    driver = process.PosixProcessDriver(tmp_path)
+
+    class ExitedGuardian:
+        def poll(self) -> int:
+            return 17
+
+    monkeypatch.setattr(driver, "_read_registry", lambda _path, _key: None)
+    monkeypatch.setattr(
+        process.time,
+        "sleep",
+        lambda _seconds: pytest.fail("exited guardian should stop registry polling"),
+    )
+
+    assert (
+        driver._await_registry(
+            tmp_path / "managed.json",
+            "chain-exited:0",
+            "exited-nonce",
+            guardian=ExitedGuardian(),
+        )
+        is None
+    )
+
+
 def test_guardian_persists_clean_exit_status_for_supervisor_recovery(tmp_path) -> None:
     process, _supervisor_module = _modules()
     driver = process.PosixProcessDriver(tmp_path)

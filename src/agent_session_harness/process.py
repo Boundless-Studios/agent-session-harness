@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -57,6 +58,7 @@ _BASE_ENVIRONMENT = frozenset(
 )
 _ENVIRONMENT_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_ENVIRONMENT_PREFIX = "AGENT_SESSION_HARNESS_"
+DEFAULT_PROCESS_STARTUP_TIMEOUT_SECONDS = 20.0
 
 
 class ExitReason(str, Enum):
@@ -267,10 +269,10 @@ class PosixProcessDriver:
         self,
         state_dir: str | os.PathLike[str],
         *,
-        startup_timeout_seconds: float = 2.0,
+        startup_timeout_seconds: float = DEFAULT_PROCESS_STARTUP_TIMEOUT_SECONDS,
     ):
-        if startup_timeout_seconds <= 0:
-            raise ValueError("startup timeout must be positive")
+        if not math.isfinite(startup_timeout_seconds) or startup_timeout_seconds <= 0:
+            raise ValueError("startup timeout must be positive and finite")
         self.state_dir = lexical_absolute(state_dir)
         self.startup_timeout_seconds = startup_timeout_seconds
 
@@ -403,7 +405,12 @@ class PosixProcessDriver:
                 process_group=0,
             )
         if managed is None:
-            managed = self._await_registry(registry_path, key, nonce)
+            managed = self._await_registry(
+                registry_path,
+                key,
+                nonce,
+                guardian=handle,
+            )
         if managed is None:
             if handle is not None and handle.poll() is not None:
                 raise RuntimeError(
@@ -614,12 +621,16 @@ class PosixProcessDriver:
         path: Path,
         key: str,
         nonce: str,
+        *,
+        guardian: subprocess.Popen[bytes] | None = None,
     ) -> ManagedProcess | None:
         deadline = time.monotonic() + self.startup_timeout_seconds
         while time.monotonic() < deadline:
             process = self._read_registry(path, key)
             if process is not None and process.launch_nonce == nonce:
                 return process
+            if guardian is not None and guardian.poll() is not None:
+                return None
             time.sleep(0.02)
         return None
 
