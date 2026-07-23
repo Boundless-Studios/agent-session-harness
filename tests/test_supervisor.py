@@ -969,7 +969,9 @@ def test_recent_unspawned_launch_intent_recovers_in_the_same_call(tmp_path) -> N
         driver.graceful_stop(managed, 1)
 
 
-def test_guardian_keeps_runtime_alive_after_supervisor_heartbeat_expires(tmp_path) -> None:
+def test_guardian_keeps_runtime_alive_after_supervisor_heartbeat_expires(
+    tmp_path,
+) -> None:
     state_path = tmp_path / "supervisor.json"
     claims_path = tmp_path / "claims.jsonl"
     process_state = tmp_path / "process-state"
