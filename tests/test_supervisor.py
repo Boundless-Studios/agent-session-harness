@@ -733,6 +733,44 @@ def test_guardian_marks_watchdog_termination_even_when_child_exits_zero(
     assert terminal.reason is process.ExitReason.STATE_INVALID
 
 
+def test_guardian_treats_expired_heartbeat_as_diagnostic_only(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    state_path = tmp_path / "supervisor.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "claim": {"owner_session_id": "chain-watchdog:0"},
+                "chain_id": "chain-watchdog",
+                "generation": 0,
+                "phase": "running",
+                "process_pid": 99999,
+                "last_heartbeat_at": (
+                    datetime.now(tz=timezone.utc) - timedelta(seconds=5)
+                ).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.2)"],
+        start_new_session=True,
+    )
+
+    terminal = guardian._watch_child(
+        child,
+        process_pid=99999,
+        chain_id="chain-watchdog",
+        generation=0,
+        state_path=state_path,
+        timeout_seconds=0.05,
+    )
+
+    assert terminal.return_code == 0
+    assert terminal.reason is process.ExitReason.NATURAL
+
+
 def test_guardian_marks_an_intentional_supervisor_stop(tmp_path) -> None:
     process, _supervisor_module = _modules()
     guardian = importlib.import_module("agent_session_harness.guardian")
@@ -931,7 +969,7 @@ def test_recent_unspawned_launch_intent_recovers_in_the_same_call(tmp_path) -> N
         driver.graceful_stop(managed, 1)
 
 
-def test_guardian_stops_runtime_after_supervisor_heartbeat_expires(tmp_path) -> None:
+def test_guardian_keeps_runtime_alive_after_supervisor_heartbeat_expires(tmp_path) -> None:
     state_path = tmp_path / "supervisor.json"
     claims_path = tmp_path / "claims.jsonl"
     process_state = tmp_path / "process-state"
@@ -1029,7 +1067,6 @@ def test_guardian_stops_runtime_after_supervisor_heartbeat_expires(tmp_path) -> 
             )
 
         deadline = time.monotonic() + 3
-        stopped_before_claim = False
         while True:
             try:
                 successor = competitor.claim(
@@ -1042,15 +1079,14 @@ def test_guardian_stops_runtime_after_supervisor_heartbeat_expires(tmp_path) -> 
                     worktree_path=str(tmp_path),
                     lease_seconds=2,
                 )
-                stopped_before_claim = stopped_path.exists()
                 break
             except ClaimConflictError:
                 if time.monotonic() >= deadline:
                     raise
                 time.sleep(0.02)
         assert successor.lease_epoch == 2
-        assert stopped_before_claim is True
-        assert stopped_path.read_text(encoding="utf-8") == "stopped"
+        assert stopped_path.exists() is False
+        os.kill(managed["pid"], 0)
     finally:
         if launcher_process.poll() is None:
             launcher_process.kill()

@@ -453,8 +453,7 @@ def test_hook_command_requires_managed_mode_and_appends_locally(tmp_path) -> Non
         command.run_hook(runtime="claude", stdin=stdin, stdout=stdout, environ=environ)
         == 0
     )
-    response = json.loads(stdout.getvalue())
-    assert response["ok"] is True
+    assert stdout.getvalue() == ""
     assert (tmp_path / "events.jsonl").read_text().count("session.started") == 1
 
     unmanaged_stdout = io.StringIO()

@@ -102,7 +102,7 @@ def run_hook(
                     environment=environment,
                 )
             raise
-        response = NativeHookResponse(exit_code=0, stdout={"ok": True})
+        response = NativeHookResponse(exit_code=0)
     elif event.event_type is not EventType.TURN_IDLE:
         if (
             event.event_type is EventType.TURN_STARTED
@@ -112,7 +112,7 @@ def run_hook(
             response = _blocked_successor_prompt(event.runtime)
         else:
             ledger.append(event)
-            response = NativeHookResponse(exit_code=0, stdout={"ok": True})
+            response = NativeHookResponse(exit_code=0)
     else:
         response = _handle_stop(
             runtime=Runtime(runtime),
