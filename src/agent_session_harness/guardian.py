@@ -91,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--intent", required=True)
     parser.add_argument("--registry-key", required=True)
     parser.add_argument("--launch-nonce", required=True)
+    parser.add_argument("--supersedes-launch-nonce")
     parser.add_argument("--command-digest", required=True)
     parser.add_argument("--cwd", required=True)
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -135,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
             registry_key=args.registry_key,
             command_digest=args.command_digest,
             launch_nonce=args.launch_nonce,
+            supersedes_launch_nonce=args.supersedes_launch_nonce,
             process_group_id=child.pid,
         )
         terminal_exit = _watch_child(
