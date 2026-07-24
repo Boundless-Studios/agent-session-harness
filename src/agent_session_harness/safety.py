@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from pathlib import Path
-import re
 from typing import Literal, Mapping, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
 
 from .activity import ActivitySnapshot, Quiescence
-
 
 _CREDENTIAL_ASSIGNMENT = re.compile(
     r"(?i)\b(?:[a-z0-9]+[-_])*(?:api[-_]?key|authorization|credential|password|secret|token)"

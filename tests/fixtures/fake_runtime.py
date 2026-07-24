@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import io
 import json
 import os
-from pathlib import Path
 import signal
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 from agent_session_harness.hooks.command import run_hook
 from agent_session_harness.hooks.native import normalize_native_event

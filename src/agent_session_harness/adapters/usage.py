@@ -8,19 +8,18 @@ resolves to an unknown observation so an automatic rotation never looks safe.
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
+from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from ..secure_files import read_private_text
 from .claude import resolve_window_tokens
 from .discovery import LIFECYCLE_SUFFIX, iter_files, select_conversation_rollout
-
 
 MAX_INPUT_BYTES = 1_048_576
 MAX_LEDGER_BYTES = 4 * 1_048_576

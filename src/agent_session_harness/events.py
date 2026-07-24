@@ -10,7 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .models import EventType, Runtime
 
-
 ACTIVITY_EVENT_TYPES = frozenset(
     {
         EventType.TURN_STARTED,

@@ -7,7 +7,6 @@ from typing import Self
 from platformdirs import user_config_path as platform_user_config_path
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 APPLICATION_NAME = "agent-session-harness"
 PROJECT_CONFIG_NAME = ".agent-session-harness.toml"
 USER_CONFIG_NAME = "config.toml"

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import importlib
-from pathlib import Path
 import stat
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
-
 
 NOW = datetime(2026, 7, 19, 3, 0, tzinfo=timezone.utc)
 

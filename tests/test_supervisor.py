@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import os
@@ -8,9 +7,9 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
-
 from agent_coordinator import ClaimConflictError
 
 from agent_session_harness.activity import (
@@ -25,7 +24,6 @@ from agent_session_harness.coordinator import (
     FenceResult,
 )
 from agent_session_harness.models import Confidence
-
 
 NOW = datetime(2026, 7, 19, 6, 0, tzinfo=timezone.utc)
 

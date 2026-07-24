@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import termios
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable, Mapping
 
 from .process import (
@@ -22,7 +22,6 @@ from .process import (
     unregister_guarded_process,
 )
 from .secure_files import lexical_absolute, read_private_text
-
 
 WATCHDOG_POLL_MAX_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 1.0

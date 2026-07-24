@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from hashlib import sha256
 import importlib
 import json
+from hashlib import sha256
 from pathlib import Path
 
 import pytest

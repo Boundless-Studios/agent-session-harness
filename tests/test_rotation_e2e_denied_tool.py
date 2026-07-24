@@ -13,18 +13,10 @@ reaches IDLE, and `DRAINING` only leaves for IDLE.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from agent_coordinator import JsonlClaimStore, TaskCoordinator
-
-from agent_session_harness.activity import Quiescence
-from agent_session_harness.capsule import HandoffCapsule
-from agent_session_harness.coordinator import CoordinatorAdapter
-from agent_session_harness.ledger import EventLedger
-from agent_session_harness.process import PosixProcessDriver
-from agent_session_harness.supervisor import Supervisor, acknowledgement_path
-
 from test_rotation_e2e import (  # type: ignore[import-not-found]
     FAKE_RUNTIME,
     CapsuleManager,
@@ -33,6 +25,13 @@ from test_rotation_e2e import (  # type: ignore[import-not-found]
     _wait_for,
     _wait_for_quiescence,
 )
+
+from agent_session_harness.activity import Quiescence
+from agent_session_harness.capsule import HandoffCapsule
+from agent_session_harness.coordinator import CoordinatorAdapter
+from agent_session_harness.ledger import EventLedger
+from agent_session_harness.process import PosixProcessDriver
+from agent_session_harness.supervisor import Supervisor, acknowledgement_path
 
 
 def test_rotation_completes_even_though_a_denied_tool_never_closed(tmp_path) -> None:

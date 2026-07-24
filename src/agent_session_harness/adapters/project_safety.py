@@ -10,20 +10,19 @@ leases, and sibling processes still occupying the runtime process group.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal, Mapping
 
 from ..safety import ProjectSafetyObservation, ProjectSafetyStatus
 from ..secure_files import UnsafePathError, read_private_text
-
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_GITDIR_BYTES = 4096

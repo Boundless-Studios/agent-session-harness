@@ -3,16 +3,14 @@ from __future__ import annotations
 import importlib
 import json
 import os
-from pathlib import Path
 import stat
 import sys
 import threading
+from pathlib import Path
 from typing import Callable
 
 import pytest
-
 from test_capsule import capsule_payload
-
 
 FAKE_ADAPTER = r"""
 import json

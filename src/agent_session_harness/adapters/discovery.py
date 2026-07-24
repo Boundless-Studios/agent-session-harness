@@ -10,7 +10,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-
 MAX_DISCOVERY_ENTRIES = 20_000
 
 ROLLOUT_SUFFIX = "*.jsonl"

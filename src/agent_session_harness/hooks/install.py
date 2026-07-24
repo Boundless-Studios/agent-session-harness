@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import shlex
 import stat
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ..models import Runtime
@@ -18,7 +18,6 @@ from ..secure_files import (
     private_file_mode,
     read_private_text,
 )
-
 
 OWNED_MARKER_PREFIX = "AGENT_SESSION_HARNESS_OWNED="
 OWNED_MARKER = f"{OWNED_MARKER_PREFIX}v1"

@@ -21,12 +21,11 @@ warden denials in the session transcript.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import importlib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-
 
 NOW = datetime(2026, 7, 21, 3, 0, tzinfo=timezone.utc)
 

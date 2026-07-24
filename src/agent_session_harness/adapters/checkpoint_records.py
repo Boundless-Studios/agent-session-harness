@@ -11,14 +11,13 @@ supervisor computed, never recompute or silently correct it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import re
 import sys
+from dataclasses import dataclass
 from typing import Any, Mapping, Pattern
 
 from .command import AdapterResponse, sanitize_error
-
 
 MAX_INPUT_BYTES = 1_048_576
 FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")

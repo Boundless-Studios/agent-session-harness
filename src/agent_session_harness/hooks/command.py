@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import signal
 import time
+from datetime import datetime
+from pathlib import Path
 from typing import Literal, Mapping, NoReturn, TextIO
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -35,7 +35,6 @@ from .native import (
     repeated_stop_idle_event,
     stop_handshake,
 )
-
 
 MAX_INPUT_BYTES = 1_048_576
 SUCCESSOR_READY_TIMEOUT_SECONDS = 2.0

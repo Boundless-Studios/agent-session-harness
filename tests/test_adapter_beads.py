@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import io
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 import pytest
 
 from agent_session_harness import cli
 from agent_session_harness.adapters import beads
 from agent_session_harness.adapters.command import sanitize_error
-
 
 FIXTURES = Path(__file__).parent / "fixtures" / "adapters"
 SUCCESS = {

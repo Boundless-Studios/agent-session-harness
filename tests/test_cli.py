@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import stat
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -19,7 +19,6 @@ from agent_session_harness.ledger import EventLedger
 from agent_session_harness.models import EventType
 from agent_session_harness.outbox import MirrorOutbox
 from agent_session_harness.supervisor import SupervisorPhase, SupervisorSnapshot
-
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

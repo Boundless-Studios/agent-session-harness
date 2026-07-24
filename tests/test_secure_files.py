@@ -4,12 +4,12 @@ import json
 
 import pytest
 
+from agent_session_harness.coordinator import CoordinatorAdapter
 from agent_session_harness.events import LifecycleEvent
 from agent_session_harness.hooks.install import HookInstaller
 from agent_session_harness.ledger import EventLedger
 from agent_session_harness.outbox import MirrorOutbox
 from agent_session_harness.process import PosixProcessDriver
-from agent_session_harness.coordinator import CoordinatorAdapter
 from agent_session_harness.report import build_report, doctor_report
 from agent_session_harness.secure_files import (
     UnsafePathError,

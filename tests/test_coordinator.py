@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import importlib
+from datetime import datetime, timedelta, timezone
 
 import pytest
-
 
 NOW = datetime(2026, 7, 19, 5, 0, tzinfo=timezone.utc)
 

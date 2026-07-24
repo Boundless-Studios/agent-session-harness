@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,7 +24,6 @@ from .secure_files import (
     private_exists,
     read_private_text,
 )
-
 
 MAX_CLAIM_LEDGER_BYTES = 16 * 1_048_576
 

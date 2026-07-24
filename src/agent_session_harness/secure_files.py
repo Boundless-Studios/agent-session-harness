@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 import os
-from pathlib import Path
 import secrets
 import stat
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Iterator
 
 

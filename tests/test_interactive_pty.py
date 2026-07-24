@@ -3,7 +3,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
-from pathlib import Path
 import pty
 import select
 import signal
@@ -11,6 +10,7 @@ import struct
 import sys
 import termios
 import time
+from pathlib import Path
 
 import pytest
 

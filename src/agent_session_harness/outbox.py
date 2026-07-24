@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Mapping
 
@@ -25,7 +25,6 @@ from agent_session_harness.secure_files import (
     read_private_text,
     try_exclusive_lock,
 )
-
 
 DEFAULT_REPLAY_ATTEMPTS = 100
 DEFAULT_MAX_QUEUE_BYTES = 8 * 1024 * 1024
