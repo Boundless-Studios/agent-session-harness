@@ -337,7 +337,7 @@ def test_hook_and_hook_installer_commands_round_trip(
     )
 
     assert cli.main(["hook", "--runtime", "codex"]) == 0
-    assert _json_stdout(capsys)["ok"] is True
+    assert capsys.readouterr().out == ""
     assert (
         cli.main(
             [

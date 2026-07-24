@@ -190,8 +190,6 @@ def _watch_child(
     process_group_session_id: int | None = None,
     acknowledgement_abort_requested: Callable[[], bool] | None = None,
 ) -> ProcessExit:
-    deadline = time.monotonic() + timeout_seconds
-    parent_pid = os.getppid()
     interval = min(WATCHDOG_POLL_MAX_SECONDS, timeout_seconds / 4)
     reason = ExitReason.NATURAL
     while child.poll() is None:
@@ -211,8 +209,9 @@ def _watch_child(
             except ProcessLookupError:
                 pass
         if state_path is None:
-            if os.getppid() == parent_pid:
-                deadline = time.monotonic() + timeout_seconds
+            # No supervisor state means there is no explicit fenced stop
+            # request to honor. Never infer one from elapsed wall-clock time.
+            pass
         else:
             abort_request = read_runtime_abort(state_path)
             if (
@@ -235,12 +234,6 @@ def _watch_child(
                 reason = status
                 _terminate_child(child)
                 break
-            if isinstance(status, float):
-                deadline = status
-        if time.monotonic() >= deadline:
-            reason = ExitReason.WATCHDOG_EXPIRED
-            _terminate_child(child)
-            break
         time.sleep(interval)
     return_code = int(child.wait())
     if reason is ExitReason.NATURAL and state_path is not None:
