@@ -808,7 +808,14 @@ def record_guarded_exit(
     process: ManagedProcess,
     terminal: ProcessExit,
 ) -> None:
-    """Persist a guardian's exact terminal status before removing its registry."""
+    """Persist a guardian's exact terminal status before removing its registry.
+
+    If the registry has been unlinked or replaced by a successor (a normal race
+    during supervisor-initiated stop), return silently — the supervisor already
+    owns cleanup and will record the exit through its own path.  BOU-2366: the
+    old hard assertion turned every such race into a guardian crash (exit 1)
+    even when the child session had finished successfully.
+    """
 
     with exclusive_lock(registry_path.with_suffix(".lock")):
         registered = PosixProcessDriver._read_registry(
@@ -819,7 +826,11 @@ def record_guarded_exit(
             registered,
             process,
         ):
-            raise RuntimeError("cannot record exit for a superseded guardian")
+            # Superseded: the supervisor already stopped this process or a new
+            # session took over the registry slot.  Either way, writing an exit
+            # record now would be orphaned (registry is gone) or stale
+            # (points at a different pid), so just return cleanly.
+            return
         _atomic_private_json(
             registry_path.with_suffix(".exit.json"),
             {
