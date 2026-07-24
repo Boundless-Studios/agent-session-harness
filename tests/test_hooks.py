@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import importlib
 import io
 import json
-from pathlib import Path
 import stat
 import threading
 import time
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
-
-NOW = datetime(2026, 7, 19, 4, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 19, 4, 0, tzinfo=UTC)
 FIXTURES = Path(__file__).parent / "fixtures" / "hooks"
 
 
@@ -453,8 +452,8 @@ def test_hook_command_requires_managed_mode_and_appends_locally(tmp_path) -> Non
         command.run_hook(runtime="claude", stdin=stdin, stdout=stdout, environ=environ)
         == 0
     )
-    response = json.loads(stdout.getvalue())
-    assert response["ok"] is True
+    # BOU-2366: hooks now emit empty stdout instead of {"ok": True}
+    assert stdout.getvalue() == ""
     assert (tmp_path / "events.jsonl").read_text().count("session.started") == 1
 
     unmanaged_stdout = io.StringIO()

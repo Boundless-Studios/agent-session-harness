@@ -10,7 +10,6 @@ import pytest
 from agent_session_harness import cli
 from agent_session_harness.adapters import usage
 
-
 FIXTURES = Path(__file__).parent / "fixtures" / "adapters"
 UNKNOWN = {
     "conversation_id": "unresolved",

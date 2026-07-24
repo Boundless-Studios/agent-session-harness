@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import importlib
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -42,7 +42,7 @@ def test_lifecycle_event_requires_sanitized_versioned_identity(tmp_path) -> None
     assert event.schema_version == 1
     assert event.event_type is models.EventType.TOOL_STARTED
     assert event.runtime is models.Runtime.CLAUDE
-    assert event.timestamp == datetime(2026, 7, 19, 3, 0, tzinfo=timezone.utc)
+    assert event.timestamp == datetime(2026, 7, 19, 3, 0, tzinfo=UTC)
     assert event.cwd == tmp_path.resolve()
 
     required = {

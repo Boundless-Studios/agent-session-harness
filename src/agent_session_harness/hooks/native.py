@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Mapping, Sequence
 
 from ..events import LifecycleEvent
 from ..models import EventType, Runtime
-
 
 _EVENT_TYPES = {
     "SessionStart": EventType.SESSION_STARTED,
@@ -280,10 +279,10 @@ def _normalized_name(value: object) -> str | None:
 def _timestamp(value: object) -> datetime:
     if isinstance(value, str):
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value)
             if parsed.tzinfo is None:
                 raise ValueError("native timestamp must include a timezone")
-            return parsed.astimezone(timezone.utc)
+            return parsed.astimezone(UTC)
         except ValueError as exc:
             raise ValueError("invalid native hook timestamp") from exc
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)

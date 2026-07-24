@@ -5,7 +5,6 @@ from pathlib import Path
 
 from agent_session_harness import cli
 
-
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "src" / "agent_session_harness"
 FORBIDDEN_IMPORT_ROOTS = {
     "agentic_pr_dash",

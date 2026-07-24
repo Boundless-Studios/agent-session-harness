@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import os
@@ -8,9 +7,9 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from agent_coordinator import ClaimConflictError
 
 from agent_session_harness.activity import (
@@ -26,8 +25,7 @@ from agent_session_harness.coordinator import (
 )
 from agent_session_harness.models import Confidence
 
-
-NOW = datetime(2026, 7, 19, 6, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 19, 6, 0, tzinfo=UTC)
 
 
 def _modules():
@@ -1280,7 +1278,7 @@ def test_guardian_marks_watchdog_termination_even_when_child_exits_zero(
                 "generation": 0,
                 "phase": "blocked",
                 "process_pid": None,
-                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
         ),
         encoding="utf-8",
@@ -1338,7 +1336,7 @@ def test_guardian_marks_an_intentional_supervisor_stop(tmp_path) -> None:
                 "generation": 0,
                 "phase": "blocked",
                 "process_pid": 99999,
-                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
         ),
         encoding="utf-8",
@@ -1373,7 +1371,7 @@ def test_guardian_terminates_unacknowledged_runtime_before_prompt_dispatch(
                 "generation": 1,
                 "phase": "awaiting_ack",
                 "process_pid": os.getpid(),
-                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
         ),
         encoding="utf-8",
@@ -1984,8 +1982,7 @@ def test_successor_ack_deadline_terminates_and_retries_same_generation(
     awaiting = managed.tick(_handoff_activity())
     managed.snapshot = awaiting.model_copy(
         update={
-            "successor_ack_deadline_at": datetime.now(tz=timezone.utc)
-            - timedelta(seconds=1)
+            "successor_ack_deadline_at": datetime.now(tz=UTC) - timedelta(seconds=1)
         }
     )
     managed._persist()
@@ -1997,7 +1994,7 @@ def test_successor_ack_deadline_terminates_and_retries_same_generation(
     assert retried.successor_attempt == 1
     assert retried.process_pid == 1101
     assert retried.successor_ack_deadline_at is not None
-    assert retried.successor_ack_deadline_at > datetime.now(tz=timezone.utc)
+    assert retried.successor_ack_deadline_at > datetime.now(tz=UTC)
     assert [call[0] for call in driver.calls][-2:] == ["stop", "start"]
 
 

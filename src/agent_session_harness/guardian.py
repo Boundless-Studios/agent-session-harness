@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import termios
 import time
-from typing import Callable, Mapping
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 
 from .process import (
     ExitReason,
@@ -22,7 +22,6 @@ from .process import (
     unregister_guarded_process,
 )
 from .secure_files import lexical_absolute, read_private_text
-
 
 WATCHDOG_POLL_MAX_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 1.0
@@ -296,7 +295,7 @@ def _read_watchdog_state(
         heartbeat = datetime.fromisoformat(str(payload["last_heartbeat_at"]))
         if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
             return None
-        age = (datetime.now(tz=timezone.utc) - heartbeat).total_seconds()
+        age = (datetime.now(tz=UTC) - heartbeat).total_seconds()
         if age < -5:
             return None
         return time.monotonic() + max(0.0, timeout_seconds - max(0.0, age))

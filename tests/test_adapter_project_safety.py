@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import io
 import json
 import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -32,7 +32,7 @@ def _marker(root: Path, **overrides: object) -> Path:
         "name": "deployment",
         "pid": os.getpid(),
         "process_identity": "a" * 64,
-        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "created_at": datetime.now(tz=UTC).isoformat(),
     }
     payload.update(overrides)
     if payload["schema_version"] == 1 and "process_identity" not in overrides:
@@ -160,11 +160,7 @@ def test_current_process_identity_is_stable() -> None:
         {"pid": "not-a-pid"},
         {"process_identity": "not-an-identity"},
         {"created_at": "not-a-time"},
-        {
-            "created_at": (
-                datetime.now(tz=timezone.utc) + timedelta(minutes=10)
-            ).isoformat()
-        },
+        {"created_at": (datetime.now(tz=UTC) + timedelta(minutes=10)).isoformat()},
         {"unexpected_private_field": "private"},
     ],
 )

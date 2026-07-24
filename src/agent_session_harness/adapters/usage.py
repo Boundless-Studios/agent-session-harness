@@ -8,19 +8,19 @@ resolves to an unknown observation so an automatic rotation never looks safe.
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import re
 import sys
 import tempfile
-from typing import Any, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 from ..secure_files import read_private_text
 from .claude import resolve_window_tokens
 from .discovery import LIFECYCLE_SUFFIX, iter_files, select_conversation_rollout
-
 
 MAX_INPUT_BYTES = 1_048_576
 MAX_LEDGER_BYTES = 4 * 1_048_576
@@ -375,7 +375,7 @@ def _safe_timestamp(value: object) -> str | None:
     if not isinstance(value, str) or len(value) > 64:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
     return value if parsed.tzinfo is not None else None

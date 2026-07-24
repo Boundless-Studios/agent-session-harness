@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from enum import Enum
 import json
 import os
 import re
@@ -11,12 +9,14 @@ import signal
 import subprocess
 import threading
 import time
-from typing import Literal, Mapping, Protocol
+from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import Enum
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from agent_session_harness.capsule import HandoffCapsule
-
 
 _SENSITIVE_ASSIGNMENT = re.compile(
     r"(?i)\b(?:[a-z0-9]+[-_])*(?:api[-_]?key|authorization|credential|password|secret|token)"

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
 import os
-from pathlib import Path
 import signal
 import time
-from typing import Literal, Mapping, NoReturn, TextIO
+from collections.abc import Mapping
+from datetime import datetime
+from pathlib import Path
+from typing import Literal, NoReturn, TextIO
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -35,7 +36,6 @@ from .native import (
     repeated_stop_idle_event,
     stop_handshake,
 )
-
 
 MAX_INPUT_BYTES = 1_048_576
 SUCCESSOR_READY_TIMEOUT_SECONDS = 2.0
@@ -102,7 +102,7 @@ def run_hook(
                     environment=environment,
                 )
             raise
-        response = NativeHookResponse(exit_code=0, stdout={"ok": True})
+        response = NativeHookResponse(exit_code=0)
     elif event.event_type is not EventType.TURN_IDLE:
         if (
             event.event_type is EventType.TURN_STARTED
@@ -112,7 +112,7 @@ def run_hook(
             response = _blocked_successor_prompt(event.runtime)
         else:
             ledger.append(event)
-            response = NativeHookResponse(exit_code=0, stdout={"ok": True})
+            response = NativeHookResponse(exit_code=0)
     else:
         response = _handle_stop(
             runtime=Runtime(runtime),
