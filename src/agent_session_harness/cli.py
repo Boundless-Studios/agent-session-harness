@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import math
 import os
-from pathlib import Path
 import re
 import shutil
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from .adapters import beads as beads_adapter
@@ -52,7 +52,6 @@ from .supervisor import (
     VerifiedCheckpoint,
     write_acknowledgement,
 )
-
 
 SYNCHRONOUS_ADAPTER_BUDGET_FRACTION = 0.8
 
@@ -540,7 +539,7 @@ def _run_supervise(args: argparse.Namespace) -> int:
                 # the hook behind a project probe, mirror replay, or the
                 # operator-configured poll interval.
                 activity = activity_ledger.materialize(
-                    now=datetime.now(tz=timezone.utc),
+                    now=datetime.now(tz=UTC),
                     stale_after_seconds=(
                         args.stale_after_seconds
                         if args.stale_after_seconds is not None
@@ -558,7 +557,7 @@ def _run_supervise(args: argparse.Namespace) -> int:
                 continue
             time.sleep(args.poll_seconds)
             activity = activity_ledger.materialize(
-                now=datetime.now(tz=timezone.utc),
+                now=datetime.now(tz=UTC),
                 stale_after_seconds=(
                     args.stale_after_seconds
                     if args.stale_after_seconds is not None

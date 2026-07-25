@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import re
 import signal
 import subprocess
 import sys
 import time
-from typing import Literal, Protocol
 import uuid
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -30,7 +30,6 @@ from .secure_files import (
     private_unlink,
     read_private_text,
 )
-
 
 _BASE_ENVIRONMENT = frozenset(
     {
@@ -110,7 +109,7 @@ def write_runtime_abort(
         chain_id=chain_id,
         generation=generation,
         owner_pid=owner_pid,
-        requested_at=datetime.now(tz=timezone.utc),
+        requested_at=datetime.now(tz=UTC),
     )
     with exclusive_lock(path.with_suffix(path.suffix + ".lock")):
         atomic_write_private_text(path, marker.model_dump_json() + "\n")
@@ -208,8 +207,7 @@ class LaunchRequest(BaseModel):
         if self.runtime is Runtime.CLAUDE:
             rejected = any(
                 argument in {"--continue", "-c", "--resume"}
-                or argument.startswith("--continue=")
-                or argument.startswith("--resume=")
+                or argument.startswith(("--continue=", "--resume="))
                 for argument in lowered
             )
         else:
@@ -593,7 +591,7 @@ class PosixProcessDriver:
         birth = PosixProcessDriver._kernel_process_birth(pid)
         if birth is None:
             return None
-        return hashlib.sha256(f"{pid}:{birth}".encode("utf-8")).hexdigest()
+        return hashlib.sha256(f"{pid}:{birth}".encode()).hexdigest()
 
     @staticmethod
     def _kernel_process_birth(pid: int) -> str | None:

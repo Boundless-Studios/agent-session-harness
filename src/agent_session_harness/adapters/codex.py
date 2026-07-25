@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -215,7 +216,7 @@ class CodexUsageReader:
                     )
                 )
 
-        fallback_time = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        fallback_time = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
         return _RawSession(
             path=path,
             session_id=session_id or path.stem,
@@ -352,10 +353,10 @@ def _parent_id(source: object) -> str | None:
 def _timestamp(value: Any, path: Path) -> datetime:
     if isinstance(value, str):
         try:
-            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value)
             if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc)
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed.astimezone(UTC)
         except ValueError:
             pass
-    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)

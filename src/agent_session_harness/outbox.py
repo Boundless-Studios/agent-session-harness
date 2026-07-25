@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -25,7 +26,6 @@ from agent_session_harness.secure_files import (
     read_private_text,
     try_exclusive_lock,
 )
-
 
 DEFAULT_REPLAY_ATTEMPTS = 100
 DEFAULT_MAX_QUEUE_BYTES = 8 * 1024 * 1024
@@ -106,7 +106,7 @@ class MirrorOutbox:
                 schema_version=1,
                 adapter=adapter,
                 request=request,
-                enqueued_at=datetime.now(timezone.utc),
+                enqueued_at=datetime.now(UTC),
             )
             encoded_size = len((self._encoded(entry) + "\n").encode("utf-8"))
             existing_size = sum(
@@ -257,7 +257,7 @@ class MirrorOutbox:
             adapter=entry.adapter,
             request=entry.request,
             enqueued_at=entry.enqueued_at,
-            failed_at=datetime.now(timezone.utc),
+            failed_at=datetime.now(UTC),
             error=error,
         )
 

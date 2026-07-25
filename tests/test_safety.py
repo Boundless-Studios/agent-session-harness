@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -17,8 +17,7 @@ from agent_session_harness.safety import (
     sample_project_safety,
 )
 
-
-NOW = datetime(2026, 7, 19, 8, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 19, 8, 0, tzinfo=UTC)
 
 
 def _activity(quiescence: Quiescence) -> ActivitySnapshot:

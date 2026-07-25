@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from importlib import metadata
 import os
-from pathlib import Path
 import shutil
 import stat
 import subprocess
 import sys
-from typing import Literal, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
+from importlib import metadata
+from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -90,7 +91,7 @@ def build_report(
     reaped_tools = 0
     if ledger_path is not None:
         snapshot = EventLedger(ledger_path).materialize(
-            now=now or datetime.now(tz=timezone.utc),
+            now=now or datetime.now(tz=UTC),
             stale_after_seconds=stale_after_seconds,
         )
         quiescence = snapshot.quiescence
@@ -232,8 +233,7 @@ def _runtime_check(runtime: Runtime) -> dict[str, object]:
         completed = subprocess.run(
             [executable, "--version"],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             check=False,
             timeout=5,
             shell=False,
@@ -441,5 +441,5 @@ def _doctor_capsule(
         decisions=("use the read operation for a non-mutating probe",),
         blockers=(),
         process_summaries={},
-        created_at=datetime(2000, 1, 1, tzinfo=timezone.utc),
+        created_at=datetime(2000, 1, 1, tzinfo=UTC),
     )

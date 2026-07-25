@@ -4,12 +4,12 @@ import json
 
 import pytest
 
+from agent_session_harness.coordinator import CoordinatorAdapter
 from agent_session_harness.events import LifecycleEvent
 from agent_session_harness.hooks.install import HookInstaller
 from agent_session_harness.ledger import EventLedger
 from agent_session_harness.outbox import MirrorOutbox
 from agent_session_harness.process import PosixProcessDriver
-from agent_session_harness.coordinator import CoordinatorAdapter
 from agent_session_harness.report import build_report, doctor_report
 from agent_session_harness.secure_files import (
     UnsafePathError,
@@ -67,9 +67,8 @@ def test_private_lock_rejects_a_symlink_target(tmp_path) -> None:
     lock = tmp_path / "state.lock"
     lock.symlink_to(victim)
 
-    with pytest.raises(UnsafePathError, match="symlink"):
-        with exclusive_lock(lock):
-            pytest.fail("symlink lock must never be acquired")
+    with pytest.raises(UnsafePathError, match="symlink"), exclusive_lock(lock):
+        pytest.fail("symlink lock must never be acquired")
 
     assert victim.read_text(encoding="utf-8") == "keep\n"
 

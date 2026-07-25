@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import io
 import json
 import os
-from pathlib import Path
 import signal
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 from agent_session_harness.hooks.command import run_hook
 from agent_session_harness.hooks.native import normalize_native_event
@@ -33,7 +33,7 @@ def main() -> int:
     if owner_pid <= 0:
         raise RuntimeError("managed owner PID is invalid")
     conversation_id = f"native-conversation-{generation}"
-    now = datetime.now(tz=timezone.utc).isoformat()
+    now = datetime.now(tz=UTC).isoformat()
     ledger = EventLedger(os.environ["AGENT_SESSION_HARNESS_LEDGER"])
 
     def emit(hook_event_name: str, **metadata: object) -> None:
@@ -44,7 +44,7 @@ def main() -> int:
                     "hook_event_name": hook_event_name,
                     "session_id": conversation_id,
                     "cwd": str(Path.cwd()),
-                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    "timestamp": datetime.now(tz=UTC).isoformat(),
                     **metadata,
                 },
                 chain_id=chain_id,
@@ -64,7 +64,7 @@ def main() -> int:
                         "hook_event_name": "Stop",
                         "session_id": conversation_id,
                         "cwd": str(Path.cwd()),
-                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
                         "turn_id": "turn-0",
                     }
                 )
@@ -92,7 +92,7 @@ def main() -> int:
                         "hook_event_name": "SessionStart",
                         "session_id": conversation_id,
                         "cwd": str(Path.cwd()),
-                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                        "timestamp": datetime.now(tz=UTC).isoformat(),
                     }
                 )
             ),
@@ -154,7 +154,7 @@ def main() -> int:
     latest = 130 if generation == 0 else 30
     rows.append(
         {
-            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
             "type": "event_msg",
             "payload": {
                 "type": "token_count",
@@ -193,7 +193,7 @@ def main() -> int:
                 "conversation_id": conversation_id,
                 "generation": generation,
                 "pid": os.getpid(),
-                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                "timestamp": datetime.now(tz=UTC).isoformat(),
             },
         )
         raise SystemExit(0)

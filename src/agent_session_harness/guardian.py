@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import termios
 import time
-from typing import Callable, Mapping
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
+from pathlib import Path
 
 from .process import (
     ExitReason,
@@ -23,7 +23,6 @@ from .process import (
 )
 from .secure_files import lexical_absolute, read_private_text
 
-
 WATCHDOG_POLL_MAX_SECONDS = 0.1
 TERMINATE_GRACE_SECONDS = 1.0
 KILL_WAIT_SECONDS = 1.0
@@ -34,6 +33,12 @@ WATCHDOG_SHUTDOWN_MARGIN_SECONDS = (
     + KILL_WAIT_SECONDS
     + WATCHDOG_SHUTDOWN_SLACK_SECONDS
 )
+
+# BOU-2366: minimum remaining deadline when a stale heartbeat would otherwise
+# set an immediate watchdog expiry.  A temporarily stalled supervisor loop
+# should not kill a healthy interactive runtime — only enforce a hard ceiling
+# after the grace window elapses with no recovery.
+WATCHDOG_HEARTBEAT_GRACE_SECONDS = 5.0
 
 
 class _TerminalLease:
@@ -236,7 +241,12 @@ def _watch_child(
                 _terminate_child(child)
                 break
             if isinstance(status, float):
-                deadline = status
+                # BOU-2366: never enforce a deadline tighter than the grace
+                # window.  A fresh heartbeat pushes status far forward; a
+                # stale one converges to (now + grace), not instant death.
+                deadline = max(
+                    status, time.monotonic() + WATCHDOG_HEARTBEAT_GRACE_SECONDS
+                )
         if time.monotonic() >= deadline:
             reason = ExitReason.WATCHDOG_EXPIRED
             _terminate_child(child)
@@ -296,7 +306,7 @@ def _read_watchdog_state(
         heartbeat = datetime.fromisoformat(str(payload["last_heartbeat_at"]))
         if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
             return None
-        age = (datetime.now(tz=timezone.utc) - heartbeat).total_seconds()
+        age = (datetime.now(tz=UTC) - heartbeat).total_seconds()
         if age < -5:
             return None
         return time.monotonic() + max(0.0, timeout_seconds - max(0.0, age))

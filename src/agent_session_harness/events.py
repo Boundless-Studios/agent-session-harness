@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .models import EventType, Runtime
-
 
 ACTIVITY_EVENT_TYPES = frozenset(
     {
@@ -67,7 +66,7 @@ class LifecycleEvent(BaseModel):
     def require_aware_utc_timestamp(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("timestamp must include a timezone")
-        return value.astimezone(timezone.utc)
+        return value.astimezone(UTC)
 
     @field_validator("cwd", mode="before")
     @classmethod
@@ -88,7 +87,7 @@ class LifecycleEvent(BaseModel):
         return normalized
 
     @model_validator(mode="after")
-    def require_activity_identity(self) -> "LifecycleEvent":
+    def require_activity_identity(self) -> LifecycleEvent:
         if self.event_type in ACTIVITY_EVENT_TYPES and self.activity_id is None:
             raise ValueError("activity_id is required for activity events")
         if (

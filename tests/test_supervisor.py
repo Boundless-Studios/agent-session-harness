@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import importlib
 import json
 import os
@@ -8,9 +7,9 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 
 import pytest
-
 from agent_coordinator import ClaimConflictError
 
 from agent_session_harness.activity import (
@@ -26,8 +25,7 @@ from agent_session_harness.coordinator import (
 )
 from agent_session_harness.models import Confidence
 
-
-NOW = datetime(2026, 7, 19, 6, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 19, 6, 0, tzinfo=UTC)
 
 
 def _modules():
@@ -1280,7 +1278,7 @@ def test_guardian_marks_watchdog_termination_even_when_child_exits_zero(
                 "generation": 0,
                 "phase": "blocked",
                 "process_pid": None,
-                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
         ),
         encoding="utf-8",
@@ -1338,7 +1336,7 @@ def test_guardian_marks_an_intentional_supervisor_stop(tmp_path) -> None:
                 "generation": 0,
                 "phase": "blocked",
                 "process_pid": 99999,
-                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
         ),
         encoding="utf-8",
@@ -1373,7 +1371,7 @@ def test_guardian_terminates_unacknowledged_runtime_before_prompt_dispatch(
                 "generation": 1,
                 "phase": "awaiting_ack",
                 "process_pid": os.getpid(),
-                "last_heartbeat_at": datetime.now(tz=timezone.utc).isoformat(),
+                "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
         ),
         encoding="utf-8",
@@ -1984,8 +1982,7 @@ def test_successor_ack_deadline_terminates_and_retries_same_generation(
     awaiting = managed.tick(_handoff_activity())
     managed.snapshot = awaiting.model_copy(
         update={
-            "successor_ack_deadline_at": datetime.now(tz=timezone.utc)
-            - timedelta(seconds=1)
+            "successor_ack_deadline_at": datetime.now(tz=UTC) - timedelta(seconds=1)
         }
     )
     managed._persist()
@@ -1997,7 +1994,7 @@ def test_successor_ack_deadline_terminates_and_retries_same_generation(
     assert retried.successor_attempt == 1
     assert retried.process_pid == 1101
     assert retried.successor_ack_deadline_at is not None
-    assert retried.successor_ack_deadline_at > datetime.now(tz=timezone.utc)
+    assert retried.successor_ack_deadline_at > datetime.now(tz=UTC)
     assert [call[0] for call in driver.calls][-2:] == ["stop", "start"]
 
 
@@ -2171,6 +2168,93 @@ def test_watchdog_zero_exit_never_completes(tmp_path) -> None:
         managed.tick(_activity(Quiescence.IDLE))
 
     assert managed.snapshot.phase is _supervisor_module.SupervisorPhase.BLOCKED
+
+
+def test_guardian_heartbeats_are_diagnostic_not_lethal_with_grace(
+    tmp_path,
+) -> None:
+    """BOU-2366: a stale heartbeat should not kill a healthy runtime immediately.
+
+    The grace period floor means the guardian enforces at least
+    WATCHDOG_HEARTBEAT_GRACE_SECONDS before terminating, giving a stalled
+    supervisor loop time to advance its heartbeat.  A short timeout (0.05s)
+    is overridden by the grace floor, so the child completes naturally."""
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    state_path = tmp_path / "supervisor.json"
+    # Heartbeat 5 seconds ago — stale but not dead.
+    old_heartbeat = datetime.now(tz=UTC) - timedelta(seconds=5)
+    state_path.write_text(
+        json.dumps(
+            {
+                "claim": {"owner_session_id": "chain-grace:0"},
+                "chain_id": "chain-grace",
+                "generation": 0,
+                "phase": "running",
+                "process_pid": 99999,
+                "last_heartbeat_at": old_heartbeat.isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.1)"],
+        start_new_session=True,
+    )
+
+    terminal = guardian._watch_child(
+        child,
+        process_pid=99999,
+        chain_id="chain-grace",
+        generation=0,
+        state_path=state_path,
+        timeout_seconds=0.05,  # Would normally expire instantly — grace overrides.
+    )
+
+    assert terminal.return_code == 0
+    assert terminal.reason is process.ExitReason.NATURAL
+
+
+def test_guardian_still_honors_explicit_supervisor_stop(tmp_path) -> None:
+    """BOU-2366: explicit fenced stop requests (blocked/stopping phase) terminate
+    regardless of heartbeat freshness — the grace floor only applies to stale
+    heartbeats, not explicit shutdown requests."""
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    state_path = tmp_path / "supervisor.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "claim": {"owner_session_id": "chain-stop-grace:0"},
+                "chain_id": "chain-stop-grace",
+                "generation": 0,
+                "phase": "blocked",  # Explicit stop request.
+                "process_pid": 88888,
+                "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    state_path.chmod(0o600)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+
+    terminal = guardian._watch_child(
+        child,
+        process_pid=88888,
+        chain_id="chain-stop-grace",
+        generation=0,
+        state_path=state_path,
+        timeout_seconds=60,  # Long timeout — should NOT matter; explicit stop wins.
+    )
+
+    assert (
+        terminal.return_code != 0 or terminal.reason is not process.ExitReason.NATURAL
+    )
+    assert terminal.reason is process.ExitReason.SUPERVISOR_STOP
 
 
 def test_exit_status_read_failure_is_persisted_fail_closed(tmp_path) -> None:

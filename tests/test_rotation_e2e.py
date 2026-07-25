@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import sys
 import time
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
-
 from agent_coordinator import JsonlClaimStore, TaskCoordinator
 
 from agent_session_harness.activity import Quiescence
+from agent_session_harness.adapters.codex import CodexUsageReader
 from agent_session_harness.adapters.command import (
     AdapterOperation,
     AdapterResponse,
 )
-from agent_session_harness.adapters.codex import CodexUsageReader
 from agent_session_harness.capsule import HandoffCapsule
 from agent_session_harness.checkpoint import CheckpointManager
 from agent_session_harness.coordinator import CoordinatorAdapter
@@ -30,7 +29,6 @@ from agent_session_harness.supervisor import (
     VerifiedCheckpoint,
     acknowledgement_path,
 )
-
 
 FAKE_RUNTIME = Path(__file__).parent / "fixtures" / "fake_runtime.py"
 
@@ -134,7 +132,7 @@ class CapsuleManager:
             decisions=("fresh successor only",),
             blockers=(),
             process_summaries={"pytest": "idle"},
-            created_at=datetime.now(tz=timezone.utc),
+            created_at=datetime.now(tz=UTC),
         )
         result = self.manager.checkpoint(
             capsule,
@@ -169,7 +167,7 @@ def _wait_for_quiescence(
 ):
     deadline = time.monotonic() + timeout
     while True:
-        now = datetime.now(tz=timezone.utc)
+        now = datetime.now(tz=UTC)
         snapshot = ledger.materialize(now=now, stale_after_seconds=30)
         if snapshot.quiescence is expected:
             return snapshot

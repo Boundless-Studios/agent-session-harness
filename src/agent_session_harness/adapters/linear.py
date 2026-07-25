@@ -12,10 +12,11 @@ has no network dependency and is fully exercisable with a fake transport.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import os
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
+from typing import Any
 
 from .checkpoint_records import (
     bounded_line,
@@ -25,7 +26,6 @@ from .checkpoint_records import (
     success,
     validate_checkpoint_request,
 )
-
 
 COMMENT_PAGE_SIZE = 100
 MAX_COMMENT_PAGES = 10

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import stat
 import sys
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -19,7 +19,6 @@ from agent_session_harness.ledger import EventLedger
 from agent_session_harness.models import EventType
 from agent_session_harness.outbox import MirrorOutbox
 from agent_session_harness.supervisor import SupervisorPhase, SupervisorSnapshot
-
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -422,7 +421,7 @@ def test_acknowledge_writes_bounded_durable_record(tmp_path, capsys) -> None:
         decisions=("bind acknowledgement to the child",),
         blockers=(),
         process_summaries={"pytest": "running"},
-        created_at=datetime(2026, 7, 19, 7, 0, tzinfo=timezone.utc),
+        created_at=datetime(2026, 7, 19, 7, 0, tzinfo=UTC),
     )
     capsule_path = tmp_path / "capsule.json"
     capsule_path.write_bytes(capsule.canonical_bytes() + b"\n")
@@ -939,7 +938,7 @@ def test_supervise_merges_busy_project_safety_before_tick(
             conversation_id="conversation-0",
             generation=0,
             event_type=EventType.SESSION_STARTED,
-            timestamp=datetime.now(tz=timezone.utc),
+            timestamp=datetime.now(tz=UTC),
             cwd=tmp_path,
             owner_pid=os.getpid(),
         )
@@ -1201,7 +1200,7 @@ def test_supervise_routes_capsule_required_and_mirror_adapters(
             conversation_id="conversation-0",
             generation=0,
             event_type=EventType.SESSION_STARTED,
-            timestamp=datetime.now(tz=timezone.utc),
+            timestamp=datetime.now(tz=UTC),
             cwd=tmp_path,
             owner_pid=os.getpid(),
         )
@@ -1215,7 +1214,7 @@ def test_supervise_routes_capsule_required_and_mirror_adapters(
             conversation_id="conversation-0",
             generation=0,
             event_type=EventType.HANDOFF_REQUESTED,
-            timestamp=datetime.now(tz=timezone.utc),
+            timestamp=datetime.now(tz=UTC),
             cwd=tmp_path,
             owner_pid=os.getpid(),
         )

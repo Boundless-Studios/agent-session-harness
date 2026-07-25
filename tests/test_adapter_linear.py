@@ -10,7 +10,6 @@ from agent_session_harness import cli
 from agent_session_harness.adapters import linear
 from agent_session_harness.adapters.command import sanitize_error
 
-
 FIXTURES = Path(__file__).parent / "fixtures" / "adapters"
 SUCCESS = {
     "ok": True,
