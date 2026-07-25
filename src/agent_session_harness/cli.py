@@ -55,6 +55,28 @@ from .supervisor import (
 
 SYNCHRONOUS_ADAPTER_BUDGET_FRACTION = 0.8
 
+# BOU-2389: `_run_supervise` records the detached projection here when it leaves
+# a live runtime running, and `main()` -- which handles the very exception that
+# caused the detach -- folds it into the single error document it emits. Module
+# scope because the two are in the same process with nothing writing between
+# them, and one document per invocation is a contract consumers depend on.
+_detached_projection: dict[str, Any] | None = None
+
+
+def _record_detached_projection(payload: dict[str, Any]) -> None:
+    global _detached_projection
+    _detached_projection = payload
+
+
+def _detached_runtime_owns_terminal() -> bool:
+    """True when a runtime we detached is still drawing on this terminal.
+
+    The guardian hands the terminal foreground to the runtime's process group
+    and restores it only when that runtime exits, so a detached runtime still
+    owns the screen this process would otherwise print on.
+    """
+    return _detached_projection is not None
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
@@ -64,21 +86,27 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, RuntimeError) as exc:
         message = sanitize_error(str(exc), max_length=500)
         if getattr(args, "json_output", False):
-            print(
-                json.dumps(
-                    {
-                        "schema_version": 1,
-                        "ok": False,
-                        "error": {
-                            "type": type(exc).__name__,
-                            "message": message,
-                        },
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            )
-        else:
+            payload: dict[str, Any] = {
+                "schema_version": 1,
+                "ok": False,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": message,
+                },
+            }
+            # BOU-2389: when this exception is the one that detached a runtime,
+            # the runtime is STILL ALIVE and still the user's. Saying so in the
+            # same document is the difference between "my session crashed" and
+            # "my session is no longer being managed" -- and the raw error alone
+            # was exactly what made the original fault unreadable.
+            if _detached_projection is not None:
+                payload["supervision"] = _detached_projection
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        elif not _detached_runtime_owns_terminal():
+            # BOU-2389: same rule as the payload — a runtime we detached is
+            # still drawing on this terminal, so an error line here lands on
+            # its canvas. The failure is already durable in the snapshot, the
+            # effect ledger and the status projection.
             print(f"agent-session-harness: {message}", file=sys.stderr)
         return 2
 
@@ -521,6 +549,7 @@ def _run_supervise(args: argparse.Namespace) -> int:
     ticks = 0
     activity_ledger = EventLedger(managed.lifecycle_path)
     interrupted = False
+    failed = False
     mirror_replay_error: str | None = None
     try:
         mirror_replay_error = _replay_mirrors_fail_open(
@@ -586,11 +615,64 @@ def _run_supervise(args: argparse.Namespace) -> int:
                 mirror_replay_error = replay_error
     except KeyboardInterrupt:
         interrupted = True
+    except BaseException:
+        # BOU-2389: the fault this whole change is about -- an adapter error or
+        # a stalled tick -- leaves `tick()` raising, and the payload below is
+        # skipped. The operator then sees only main()'s generic error and never
+        # learns their session is still alive. Project the detached state from
+        # `finally` (after the shutdown that sets it) and let the exception
+        # continue: the diagnosis is extra output, never a swallowed failure.
+        failed = True
+        raise
     finally:
         managed.shutdown()
+        # Only a DETACH needs projecting here. Every other failure already
+        # reports itself through main()'s error payload, and emitting a second
+        # JSON document would break the one-document-per-invocation contract
+        # that every consumer of these commands relies on.
+        if failed and _runtime_is_detached(managed):
+            _record_detached_projection(
+                _supervise_payload(
+                    managed,
+                    ticks=ticks,
+                    interrupted=False,
+                    mirror_replay_error=mirror_replay_error,
+                )
+            )
 
+    _emit(
+        _supervise_payload(
+            managed,
+            ticks=ticks,
+            interrupted=interrupted,
+            mirror_replay_error=mirror_replay_error,
+        ),
+        json_output=args.json_output,
+        runtime_owns_terminal=_runtime_is_detached(managed),
+    )
+    return 130 if interrupted else 0
+
+
+def _runtime_is_detached(managed: Supervisor) -> bool:
+    """True when a live runtime was left running and still owns the terminal.
+
+    The guardian hands the terminal foreground to the runtime's process group
+    and only restores it when the runtime exits. A detached runtime is by
+    definition still running, so anything this process prints lands on a
+    full-screen TUI's canvas -- the BOU-2246 hazard, from a new direction.
+    """
+    return managed.snapshot.supervision_alarm is not None
+
+
+def _supervise_payload(
+    managed: Supervisor,
+    *,
+    ticks: int,
+    interrupted: bool,
+    mirror_replay_error: str | None,
+) -> dict[str, Any]:
     snapshot = managed.snapshot
-    payload = {
+    return {
         "schema_version": 1,
         "mode": "managed",
         "ticks": ticks,
@@ -615,8 +697,6 @@ def _run_supervise(args: argparse.Namespace) -> int:
         # crashed" and "my session is no longer being managed".
         "supervision_alarm": snapshot.supervision_alarm,
     }
-    _emit(payload, json_output=args.json_output)
-    return 130 if interrupted else 0
 
 
 def _run_acknowledge(args: argparse.Namespace) -> int:
@@ -704,7 +784,20 @@ def _run_outbox(args: argparse.Namespace) -> int:
     return 0
 
 
-def _emit(payload: Any, *, json_output: bool) -> None:
+def _emit(
+    payload: Any,
+    *,
+    json_output: bool,
+    runtime_owns_terminal: bool = False,
+) -> None:
+    # BOU-2389: a detached runtime is still drawing on this terminal. Writing a
+    # status blob onto a full-screen TUI does not append a line, it overwrites
+    # whatever the runtime owns -- in practice the text the user is mid-way
+    # through typing. The payload is durable in the snapshot and the status
+    # projection, so staying quiet here costs no signal (the same trade
+    # `_announce_alarm` already makes).
+    if runtime_owns_terminal and _stdio_belongs_to_someone_else(json_output):
+        return
     if json_output:
         print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
         return
@@ -716,6 +809,22 @@ def _emit(payload: Any, *, json_output: bool) -> None:
             print(f"{key}: {value}", file=sys.stderr)
         return
     print(payload, file=sys.stderr)
+
+
+def _stdio_belongs_to_someone_else(json_output: bool) -> bool:
+    """True when the stream `_emit` would use is a terminal someone else owns.
+
+    Deliberately conservative, matching `_stderr_belongs_to_someone_else`: an
+    unusable or lying stream counts as someone else's, so the fallback is "stay
+    quiet" rather than "risk corrupting a UI".
+    """
+    stream = sys.stdout if json_output else sys.stderr
+    if stream is None:
+        return True
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return True
 
 
 class _ExecutableUsageReader:

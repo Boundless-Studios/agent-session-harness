@@ -306,6 +306,77 @@ def test_losing_the_claim_does_not_stop_a_live_runtime(tmp_path) -> None:
     assert launched.pid in driver.active_pids
 
 
+def test_a_failed_successor_abort_still_terminates_its_runtime(tmp_path) -> None:
+    """`BLOCKED` alone must not be read as "this is the user's session".
+
+    Review finding on PR #21: when `_retry_successor_unlocked()` cannot stop a
+    live successor it persists BLOCKED and raises, and the CLI's `finally`
+    then calls shutdown. Classifying adoption from the phase alone made that
+    BLOCKED look adopted, so the abort silently became a detach and the
+    successor that never became the user's session was left running.
+    """
+    _process, supervisor_module = _modules()
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    launched = managed.current_process
+    assert launched is not None
+
+    # Stand in for "the abort could not stop its runtime": these two lines are
+    # exactly what the except branch in _retry_successor_unlocked leaves behind.
+    managed._successor_abort_pending = True
+    managed.snapshot = managed.snapshot.model_copy(
+        update={"phase": supervisor_module.SupervisorPhase.BLOCKED}
+    )
+
+    managed.shutdown()
+
+    assert ("stop", launched.pid) in driver.calls, (
+        "an aborted successor must still be stopped, not detached"
+    )
+    assert launched.pid not in driver.active_pids
+
+
+def test_detach_survives_an_unwritable_announcement(tmp_path, monkeypatch) -> None:
+    """A cosmetic print must never strand the claim.
+
+    Review finding on PR #21: `_announce_alarm` runs inside shutdown, ahead of
+    coordinator fencing. A redirected stderr whose reader has exited raises
+    BrokenPipeError on write, which would abort the shutdown and leave the
+    claim held until lease expiry -- failing OPEN on the claim.
+    """
+    _process, supervisor_module = _modules()
+    managed, _kwargs, _driver, coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    def explode(_message: str) -> None:
+        raise BrokenPipeError("stderr consumer has exited")
+
+    monkeypatch.setattr(
+        supervisor_module, "_stderr_belongs_to_someone_else", lambda: False
+    )
+    monkeypatch.setattr(supervisor_module.sys, "stderr", _ExplodingStream())
+
+    managed.shutdown()
+
+    assert coordinator.active is None, (
+        "the claim must be fenced even when the detach announcement cannot print"
+    )
+    assert managed.snapshot.claim is None
+
+
+class _ExplodingStream:
+    """A stderr whose reader has gone away."""
+
+    def isatty(self) -> bool:
+        return False
+
+    def write(self, _text: str) -> int:
+        raise BrokenPipeError("stderr consumer has exited")
+
+    def flush(self) -> None:
+        raise BrokenPipeError("stderr consumer has exited")
+
+
 def test_terminal_shutdown_leaves_a_live_runtime_running(tmp_path) -> None:
     """The supervisor going down must not take the user's session with it.
 

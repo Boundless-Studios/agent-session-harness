@@ -110,11 +110,20 @@ def _announce_alarm(message: str) -> None:
     Kept for the redirected case (daemon logs, captured output, CI), where it is
     both safe and the most direct way to see an alarm — which is what made the
     fault loud instead of silent in the first place.
+
+    Best-effort by construction. This runs inside shutdown, ahead of coordinator
+    fencing, and a redirected stderr whose reader has already exited raises
+    BrokenPipeError on write. Letting a cosmetic announcement abort the shutdown
+    would strand the claim until its lease expired — failing OPEN on the claim,
+    which is the one thing this design does not do.
     """
 
     if _stderr_belongs_to_someone_else():
         return
-    print(f"agent-session-harness alarm: {message}", file=sys.stderr, flush=True)
+    try:
+        print(f"agent-session-harness alarm: {message}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        return
 
 
 # BOU-2389: the runtime outlived its supervisor. Distinct from every other
@@ -379,6 +388,14 @@ class Supervisor:
         ).hexdigest()
         self.snapshot = self._load()
         self.current_process = self._restore_process(self.snapshot)
+        # BOU-2389: a successor abort that could not stop its runtime persists
+        # BLOCKED and raises, which erases the launch provenance shutdown would
+        # otherwise read off the phase. Without this, that runtime is
+        # misclassified as the user's adopted session and left running -- the
+        # exact opposite of the abort's intent. In-memory is the right scope:
+        # it describes THIS supervisor's in-flight abort, and the CLI's
+        # `finally: shutdown()` runs in the same process.
+        self._successor_abort_pending = False
         if (
             self.snapshot.phase is SupervisorPhase.AWAITING_ACK
             and self.snapshot.successor_ack_deadline_at is None
@@ -522,8 +539,11 @@ class Supervisor:
         # One exception: a generation that never reached RUNNING never became
         # the user's session — it is a successor that failed to launch or
         # acknowledge, so stopping it is the successor-abort path, not a
-        # session kill.  Read the phase BEFORE the BLOCKED overwrite below.
-        adopted = self.snapshot.phase not in {
+        # session kill.  Read the phase BEFORE the BLOCKED overwrite below, and
+        # consult the abort flag too: a successor abort that could not stop its
+        # runtime has ALREADY persisted BLOCKED, which would otherwise read as
+        # an adopted session and detach the very process it was aborting.
+        adopted = not self._successor_abort_pending and self.snapshot.phase not in {
             SupervisorPhase.LAUNCHING,
             SupervisorPhase.AWAITING_ACK,
         }
@@ -802,6 +822,11 @@ class Supervisor:
                     raise RuntimeError("failed successor remains live")
                 self.process_driver.clear_exit_status(process)
             except Exception as stop_error:
+                # Remember WHY we are blocking. `_persist_blocked()` replaces the
+                # phase that told shutdown this runtime never became the user's
+                # session, so without this flag the abort silently turns into a
+                # detach and the failed successor is left running.
+                self._successor_abort_pending = True
                 self._persist_blocked()
                 raise RuntimeError(
                     "failed successor could not be terminated safely"
