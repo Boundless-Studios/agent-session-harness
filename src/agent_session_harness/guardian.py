@@ -10,7 +10,6 @@ import subprocess
 import termios
 import time
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
 from pathlib import Path
 
 from .process import (
@@ -34,11 +33,27 @@ WATCHDOG_SHUTDOWN_MARGIN_SECONDS = (
     + WATCHDOG_SHUTDOWN_SLACK_SECONDS
 )
 
-# BOU-2366: minimum remaining deadline when a stale heartbeat would otherwise
-# set an immediate watchdog expiry.  A temporarily stalled supervisor loop
-# should not kill a healthy interactive runtime — only enforce a hard ceiling
-# after the grace window elapses with no recovery.
-WATCHDOG_HEARTBEAT_GRACE_SECONDS = 5.0
+# BOU-2389: the managed runtime's lifetime belongs to the user.  The guardian
+# watches, reports, and reaps; it terminates only for a *deliberate* request.
+#
+# Everything a supervisor's timing can tell the guardian describes the
+# *supervisor's* health, not the runtime's.  The heartbeat is written by the same
+# single thread that runs every blocking adapter, so "supervisor is dead" and
+# "supervisor is slow" produce an identical stale heartbeat — and a machine
+# suspend or a network outage produces one for every session at once.  BOU-2366
+# widened the margin; the margin was never the problem, the inference was.  So
+# the guardian no longer reads `last_heartbeat_at` at all: fail open on the
+# runtime, and let the claim be fenced separately so a degraded chain still
+# releases its lease.
+#
+# `SUPERVISOR_STOP` (rotation's `stopping` phase) and `ACKNOWLEDGEMENT_FAILED`
+# (a successor that never became the user's session) stay lethal by design.
+LETHAL_EXIT_REASONS = frozenset(
+    {
+        ExitReason.SUPERVISOR_STOP,
+        ExitReason.ACKNOWLEDGEMENT_FAILED,
+    }
+)
 
 
 class _TerminalLease:
@@ -216,8 +231,17 @@ def _watch_child(
             except ProcessLookupError:
                 pass
         if state_path is None:
+            # Unmanaged mode: there is no supervisor state to consult, so the
+            # only ownership signal is the process that spawned this guardian.
+            # Losing it leaves the runtime *unowned*, which is a different
+            # condition from the merely *unsupervised* one BOU-2389 is about —
+            # nothing will ever fence its claim or reap it. Keep the watchdog.
             if os.getppid() == parent_pid:
                 deadline = time.monotonic() + timeout_seconds
+            if time.monotonic() >= deadline:
+                reason = ExitReason.WATCHDOG_EXPIRED
+                _terminate_child(child)
+                break
         else:
             abort_request = read_runtime_abort(state_path)
             if (
@@ -234,23 +258,13 @@ def _watch_child(
                 process_pid=process_pid,
                 chain_id=chain_id,
                 generation=generation,
-                timeout_seconds=timeout_seconds,
             )
-            if isinstance(status, ExitReason):
+            # Anything the state file says other than a deliberate stop is a
+            # report on the supervisor, not on the runtime. Keep watching.
+            if status in LETHAL_EXIT_REASONS:
                 reason = status
                 _terminate_child(child)
                 break
-            if isinstance(status, float):
-                # BOU-2366: never enforce a deadline tighter than the grace
-                # window.  A fresh heartbeat pushes status far forward; a
-                # stale one converges to (now + grace), not instant death.
-                deadline = max(
-                    status, time.monotonic() + WATCHDOG_HEARTBEAT_GRACE_SECONDS
-                )
-        if time.monotonic() >= deadline:
-            reason = ExitReason.WATCHDOG_EXPIRED
-            _terminate_child(child)
-            break
         time.sleep(interval)
     return_code = int(child.wait())
     if reason is ExitReason.NATURAL and state_path is not None:
@@ -259,9 +273,11 @@ def _watch_child(
             process_pid=process_pid,
             chain_id=chain_id,
             generation=generation,
-            timeout_seconds=timeout_seconds,
         )
-        if isinstance(final_status, ExitReason):
+        # A child that exited on its own must still be reported as terminated
+        # when a deliberate stop raced its exit — but a degraded observation
+        # never rewrites a natural exit into a termination.
+        if final_status in LETHAL_EXIT_REASONS:
             reason = final_status
     if not _drain_process_group(
         child.pid,
@@ -287,8 +303,14 @@ def _read_watchdog_state(
     process_pid: int,
     chain_id: str,
     generation: int,
-    timeout_seconds: float,
-) -> float | ExitReason | None:
+) -> ExitReason | None:
+    """Classify what the supervisor's state file asks of this runtime.
+
+    Only one answer is a request: rotation's `stopping` phase. Everything else —
+    a torn read, an identity mismatch, a supervisor that faulted into `blocked` —
+    is a report about the supervisor, and BOU-2389 makes those non-lethal.
+    """
+
     try:
         payload = json.loads(read_private_text(path))
         claim = payload["claim"]
@@ -300,16 +322,17 @@ def _read_watchdog_state(
             or claim.get("owner_session_id") != owner_session_id
             or payload.get("process_pid") not in {None, process_pid}
         ):
-            return ExitReason.STATE_INVALID
-        if payload.get("phase") in {"blocked", "stopping"}:
+            # BOU-2389: a torn or mismatched state file is a supervisor
+            # bookkeeping fault. It says nothing about the runtime.
+            return ExitReason.SUPERVISION_DEGRADED
+        # `stopping` is rotation deliberately ending this generation so a
+        # successor can carry its context. `blocked` is where a supervisor
+        # *lands after a fault* — collapsing the two made every fault lethal.
+        if payload.get("phase") == "stopping":
             return ExitReason.SUPERVISOR_STOP
-        heartbeat = datetime.fromisoformat(str(payload["last_heartbeat_at"]))
-        if heartbeat.tzinfo is None or heartbeat.utcoffset() is None:
-            return None
-        age = (datetime.now(tz=UTC) - heartbeat).total_seconds()
-        if age < -5:
-            return None
-        return time.monotonic() + max(0.0, timeout_seconds - max(0.0, age))
+        if payload.get("phase") == "blocked":
+            return ExitReason.SUPERVISION_DEGRADED
+        return None
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
 

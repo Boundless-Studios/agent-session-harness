@@ -31,6 +31,12 @@ from agent_session_harness.supervisor import (
 )
 
 FAKE_RUNTIME = Path(__file__).parent / "fixtures" / "fake_runtime.py"
+# The fake runtime is a *subprocess*, so pytest's `pythonpath = ["src"]` does not
+# reach it — without this it imports whatever `agent_session_harness` build is
+# installed on the machine and the rotation half of this test silently exercises
+# someone else's code. It surfaced when a new snapshot field made the installed
+# (older) model reject the state file this repo's supervisor had just written.
+RUNTIME_ENVIRONMENT = {"PYTHONPATH": str(Path(__file__).parents[1] / "src")}
 
 
 class RolloutUsageReader:
@@ -174,7 +180,7 @@ def _wait_for_quiescence(
         if time.monotonic() >= deadline:
             raise AssertionError(
                 f"timed out waiting for lifecycle quiescence {expected.value}: "
-                f"{snapshot.model_dump()}"
+                f"{snapshot}"
             )
         time.sleep(0.02)
 
@@ -224,6 +230,7 @@ def test_fake_runtime_rotates_once_to_a_fresh_acknowledged_successor(tmp_path) -
             )
         ),
         stop_timeout_seconds=2,
+        runtime_environment=dict(RUNTIME_ENVIRONMENT),
     )
 
     try:
@@ -364,6 +371,7 @@ def test_successor_cannot_run_when_required_ack_adapter_is_unavailable(
             )
         ),
         stop_timeout_seconds=2,
+        runtime_environment=dict(RUNTIME_ENVIRONMENT),
     )
 
     try:

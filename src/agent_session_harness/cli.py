@@ -609,6 +609,11 @@ def _run_supervise(args: argparse.Namespace) -> int:
         # firing never rotates, and without this it looks healthy until it runs
         # out of context (BOU-2222).
         "liveness_alarm": snapshot.liveness_alarm,
+        # BOU-2389: this payload is the last thing an operator sees when a run
+        # ends. When the supervisor detached, the runtime is still alive and
+        # still theirs — saying so here is the difference between "my session
+        # crashed" and "my session is no longer being managed".
+        "supervision_alarm": snapshot.supervision_alarm,
     }
     _emit(payload, json_output=args.json_output)
     return 130 if interrupted else 0

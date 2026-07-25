@@ -68,6 +68,9 @@ class ExitReason(str, Enum):
     SUPERVISOR_STOP = "supervisor_stop"
     WATCHDOG_EXPIRED = "watchdog_expired"
     STATE_INVALID = "state_invalid"
+    # BOU-2389: supervision is faulted, but the runtime is fine and still the
+    # user's. Never a termination reason — only an observation.
+    SUPERVISION_DEGRADED = "supervision_degraded"
     PROCESS_GROUP_UNVERIFIED = "process_group_unverified"
     ACKNOWLEDGEMENT_FAILED = "acknowledgement_failed"
     UNKNOWN = "unknown"

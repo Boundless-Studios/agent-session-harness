@@ -67,6 +67,12 @@ class StatusReport(BaseModel):
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
     liveness_alarm: str | None = None
     usage_alarm: str | None = None
+    # BOU-2389: set when supervision ended while the runtime kept running. The
+    # session is still usable, but nothing will rotate it before it fills its
+    # context window, and silence about that is what made the original fault so
+    # confusing: the user saw a raw RuntimeError and no indication the session
+    # was still there.
+    supervision_alarm: str | None = None
     # BOU-2236: how many tool starts the last turn-idle had to reconcile because
     # a permission gate denied them at PreToolUse, so no finish could ever
     # arrive. Zero on runtimes without such a gate. Non-zero is expected, not a
@@ -123,6 +129,7 @@ def build_report(
         runtime_liveness=runtime_liveness,
         liveness_alarm=state.liveness_alarm,
         usage_alarm=state.usage_alarm,
+        supervision_alarm=state.supervision_alarm,
     )
 
 

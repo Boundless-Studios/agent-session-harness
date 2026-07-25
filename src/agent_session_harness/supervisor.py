@@ -104,6 +104,28 @@ def _stderr_belongs_to_someone_else() -> bool:
         return True
 
 
+def _announce_alarm(message: str) -> None:
+    """Print an alarm only where it cannot land on a surface someone else owns.
+
+    Kept for the redirected case (daemon logs, captured output, CI), where it is
+    both safe and the most direct way to see an alarm — which is what made the
+    fault loud instead of silent in the first place.
+    """
+
+    if _stderr_belongs_to_someone_else():
+        return
+    print(f"agent-session-harness alarm: {message}", file=sys.stderr, flush=True)
+
+
+# BOU-2389: the runtime outlived its supervisor. Distinct from every other
+# alarm in that the session is still *usable* — it simply stopped being
+# context-managed, so nothing will rotate it before it fills its window.
+_DETACHED_ALARM = (
+    "supervision ended while the runtime is still running; the session is "
+    "alive but no longer context-managed"
+)
+
+
 class SupervisorPhase(str, Enum):
     INITIAL = "initial"
     RUNNING = "running"
@@ -211,6 +233,10 @@ class SupervisorSnapshot(BaseModel):
     runtime_silence_streak: int = Field(default=0, ge=0)
     runtime_silence_since: datetime | None = None
     liveness_alarm: str | None = Field(default=None, max_length=320)
+    # BOU-2389: set when supervision ended while the runtime kept running. The
+    # session is alive but no longer context-managed, and silence about that is
+    # exactly what made the original fault so confusing to diagnose.
+    supervision_alarm: str | None = Field(default=None, max_length=320)
 
 
 class Supervisor:
@@ -484,12 +510,46 @@ class Supervisor:
                 if journal_error is None:
                     journal_error = exc
 
+        # BOU-2389: the supervisor going down must not take the user's session
+        # with it.  A live runtime is *detached* — left running, unsupervised —
+        # not stopped.  BOU-2208 documented this wound from the other end: an
+        # unhandled adapter error unwound `tick()` into the CLI's
+        # `finally: managed.shutdown()`, which killed the runtime.  That fixed
+        # one trigger; this removes the kill.  The claim is still fenced below,
+        # so the task stays reclaimable: fail open on the runtime, fail closed
+        # on the claim.
+        #
+        # One exception: a generation that never reached RUNNING never became
+        # the user's session — it is a successor that failed to launch or
+        # acknowledge, so stopping it is the successor-abort path, not a
+        # session kill.  Read the phase BEFORE the BLOCKED overwrite below.
+        adopted = self.snapshot.phase not in {
+            SupervisorPhase.LAUNCHING,
+            SupervisorPhase.AWAITING_ACK,
+        }
         if process is not None:
             self.snapshot = self.snapshot.model_copy(
                 update={"phase": SupervisorPhase.BLOCKED}
             )
             self._persist()
-        if process is not None and self.process_driver.is_alive(process):
+        runtime_live = process is not None and self.process_driver.is_alive(process)
+        runtime_detached = runtime_live and adopted
+        if runtime_detached:
+            # Journal through `record_effect` rather than `_raise_alarm`: a
+            # detach must still complete when the effect ledger is unwritable,
+            # and the alarm text is carried on the snapshot below either way.
+            record_effect("detach", "started")
+            self.snapshot = self.snapshot.model_copy(
+                update={"supervision_alarm": _DETACHED_ALARM}
+            )
+            self._persist()
+            _announce_alarm(_DETACHED_ALARM)
+            record_effect("detach", "completed")
+        elif runtime_live:
+            # The successor-abort path still kills, so it keeps the guarantee
+            # that made it safe: a successor that survives its own stop is a
+            # fault worth failing on, not something to leave running behind a
+            # generation that has already been abandoned.
             record_effect("stop", "started")
             try:
                 self.process_driver.graceful_stop(
@@ -508,7 +568,7 @@ class Supervisor:
                 ) from stop_error
             record_effect("stop", "completed")
 
-        if process is not None:
+        if process is not None and not runtime_detached:
             try:
                 self.process_driver.clear_exit_status(process)
             except (OSError, RuntimeError, ValueError) as exc:
@@ -978,14 +1038,7 @@ class Supervisor:
         # (persisted above), the effect ledger, and the status projection that
         # feeds the statusline. So the print adds no signal a consumer can't
         # already reach — it only adds a way to corrupt someone's screen.
-        #
-        # Kept for the redirected case (daemon logs, captured output, CI), where
-        # it is both safe and the most direct way to see an alarm, which is what
-        # made the fault loud instead of silent in the first place.
-        if not _stderr_belongs_to_someone_else():
-            print(
-                f"agent-session-harness alarm: {bounded}", file=sys.stderr, flush=True
-            )
+        _announce_alarm(bounded)
 
     def _advance_rotation(self) -> SupervisorSnapshot:
         while True:
@@ -1360,23 +1413,28 @@ class Supervisor:
         )
         self._persist()
         process = self.current_process
+        # BOU-2389: losing the lease means this supervisor must stop
+        # *supervising*.  The claim is already gone, so the task is reclaimable
+        # without touching the runtime — and the runtime is the user's.  Only a
+        # runtime observed to be gone gets its exit record reaped; one that
+        # cannot be observed is treated as live, because the fault that loses a
+        # lease is exactly the fault that makes liveness unreadable.
         if process is None:
             return
         try:
-            self.process_driver.graceful_stop(process, self.stop_timeout_seconds)
-        finally:
-            if not self.process_driver.is_alive(process):
-                try:
-                    self.process_driver.clear_exit_status(process)
-                except (OSError, RuntimeError, ValueError):
-                    # Keep the process identity in the blocked snapshot so a
-                    # later shutdown can retry exact-record cleanup.
-                    return
-                self.current_process = None
-                self.snapshot = self.snapshot.model_copy(
-                    update=self._cleared_process_fields()
-                )
-                self._persist()
+            if self.process_driver.is_alive(process):
+                return
+        except (OSError, RuntimeError, ValueError):
+            return
+        try:
+            self.process_driver.clear_exit_status(process)
+        except (OSError, RuntimeError, ValueError):
+            # Keep the process identity in the blocked snapshot so a later
+            # shutdown can retry exact-record cleanup.
+            return
+        self.current_process = None
+        self.snapshot = self.snapshot.model_copy(update=self._cleared_process_fields())
+        self._persist()
 
     def _persist_blocked(self) -> None:
         self.snapshot = self.snapshot.model_copy(
