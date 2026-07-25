@@ -10,20 +10,20 @@ leases, and sibling processes still occupying the runtime process group.
 from __future__ import annotations
 
 import ctypes
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import stat
 import sys
-from typing import Literal, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Literal
 
 from ..safety import ProjectSafetyObservation, ProjectSafetyStatus
 from ..secure_files import UnsafePathError, read_private_text
-
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_GITDIR_BYTES = 4096
@@ -199,7 +199,7 @@ def read_critical_markers(
 
     active: list[str] = []
     warnings: list[str] = []
-    observed_at = now or datetime.now(tz=timezone.utc)
+    observed_at = now or datetime.now(tz=UTC)
     for path in entries:
         marker = _read_marker(path, observed_at)
         if marker is None:
@@ -475,19 +475,17 @@ def _read_marker(path: Path, now: datetime) -> CriticalMarker | None:
     if not isinstance(created_at, str) or len(created_at) > 64:
         return None
     try:
-        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        created = datetime.fromisoformat(created_at)
     except ValueError:
         return None
     if created.tzinfo is None or created.utcoffset() is None:
         return None
-    if created.astimezone(timezone.utc) > now.astimezone(timezone.utc) + timedelta(
-        minutes=5
-    ):
+    if created.astimezone(UTC) > now.astimezone(UTC) + timedelta(minutes=5):
         return None
     return CriticalMarker(
         name=name,
         pid=pid,
-        created_at=created.astimezone(timezone.utc),
+        created_at=created.astimezone(UTC),
         process_identity=marker_identity,
     )
 

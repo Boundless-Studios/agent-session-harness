@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from enum import Enum
 import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
 import sys
+from datetime import UTC, datetime, timedelta
+from enum import Enum
+from pathlib import Path
 from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -23,11 +23,11 @@ from .guardian import WATCHDOG_SHUTDOWN_MARGIN_SECONDS
 from .ledger import EventLedger
 from .models import Confidence, EventType, Runtime
 from .process import (
-    clear_runtime_abort,
     ExitReason,
     LaunchRequest,
     ManagedProcess,
     ProcessDriver,
+    clear_runtime_abort,
 )
 from .secure_files import (
     append_private_text,
@@ -38,7 +38,6 @@ from .secure_files import (
     private_unlink,
     read_private_text,
 )
-
 
 # BOU-2208: consecutive usage-sampling failures before the supervisor announces
 # that it can no longer see context growth. Sampling never tears the chain down,
@@ -1404,7 +1403,7 @@ class Supervisor:
 
     @staticmethod
     def _now() -> datetime:
-        return datetime.now(tz=timezone.utc)
+        return datetime.now(tz=UTC)
 
     def _load(self) -> SupervisorSnapshot:
         if not private_exists(self.state_path):
@@ -1446,7 +1445,7 @@ class Supervisor:
             "status": status,
             "chain_id": self.chain_id,
             "generation": generation,
-            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
         }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         with exclusive_lock(

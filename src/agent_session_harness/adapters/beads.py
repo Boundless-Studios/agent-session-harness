@@ -6,14 +6,15 @@ dependency and carries no Python packages of its own.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import os
-from pathlib import Path
 import re
 import subprocess
 import tempfile
-from typing import Any, Mapping
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from .checkpoint_records import (
     bounded_line,
@@ -24,7 +25,6 @@ from .checkpoint_records import (
     validate_checkpoint_request,
 )
 from .command import sanitize_error
-
 
 MAX_BD_OUTPUT_BYTES = 4 * 1_048_576
 _BEAD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")

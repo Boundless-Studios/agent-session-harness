@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
-import json
-import os
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -17,11 +17,10 @@ from .models import EventType
 from .secure_files import (
     append_private_text,
     exclusive_lock,
-    private_file_size,
     private_exists,
+    private_file_size,
     read_private_text_incremental,
 )
-
 
 MAX_LEDGER_BYTES = 16 * 1_048_576
 MAX_LEDGER_EVENTS = 50_000

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import json
+from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from agent_coordinator import (
     JsonlClaimStore,
@@ -24,7 +25,6 @@ from .secure_files import (
     private_exists,
     read_private_text,
 )
-
 
 MAX_CLAIM_LEDGER_BYTES = 16 * 1_048_576
 

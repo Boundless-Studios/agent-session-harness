@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import json
 import os
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -201,9 +201,7 @@ class ClaudeUsageReader:
 
         ordered = sorted(records.values(), key=lambda item: item.order)
         if not ordered:
-            observed_at = datetime.fromtimestamp(
-                rollout_path.stat().st_mtime, tz=timezone.utc
-            )
+            observed_at = datetime.fromtimestamp(rollout_path.stat().st_mtime, tz=UTC)
             return UsageSample(
                 runtime=Runtime.CLAUDE,
                 conversation_id=conversation_id or rollout_path.stem,
@@ -326,12 +324,12 @@ class ClaudeUsageReader:
     def _timestamp(raw: object, path: Path) -> datetime:
         if isinstance(raw, str):
             try:
-                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                parsed = datetime.fromisoformat(raw)
                 if parsed.tzinfo is not None:
-                    return parsed.astimezone(timezone.utc)
+                    return parsed.astimezone(UTC)
             except ValueError:
                 pass
-        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 
     @staticmethod
     def _usage_values(usage: dict[str, Any]) -> tuple[int, int, int, int]:

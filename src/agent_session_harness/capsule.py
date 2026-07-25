@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from hashlib import sha256
 import hmac
 import json
-from pathlib import Path
 import re
+from datetime import UTC, datetime
+from hashlib import sha256
+from pathlib import Path
 from typing import Literal
 
 from pydantic import (
@@ -18,7 +18,6 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-
 
 ProcessState = Literal[
     "idle",
@@ -109,7 +108,7 @@ class HandoffCapsule(BaseModel):
     def require_aware_utc_time(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("created_at must include a timezone")
-        return value.astimezone(timezone.utc)
+        return value.astimezone(UTC)
 
     @field_validator(
         "chain_id",
@@ -188,7 +187,7 @@ class HandoffCapsule(BaseModel):
         return values
 
     @model_validator(mode="after")
-    def calculate_and_verify_fingerprint(self) -> "HandoffCapsule":
+    def calculate_and_verify_fingerprint(self) -> HandoffCapsule:
         expected = sha256(self.fingerprint_payload_bytes()).hexdigest()
         if self.fingerprint and not hmac.compare_digest(self.fingerprint, expected):
             raise ValueError("capsule fingerprint does not match its canonical payload")
