@@ -40,5 +40,6 @@ testpaths = ["tests"]
 # TRY004: ValueError for JSON format validation is intentional — the input is
 # text, not a type mismatch.  BLE001: broad exception catches are deliberate
 # resiliency patterns in async/out-of-process code.  RUF009: Path.cwd() in
-# dataclass defaults captures caller context at instantiation time.
+# dataclass defaults captures caller context at instantiation time.  SIM117:
+# nested with statements for HTTP streams have correct error scoping.
 ignore = ["TRY004", "BLE001", "RUF009", "SIM117"]

@@ -34,6 +34,12 @@ WATCHDOG_SHUTDOWN_MARGIN_SECONDS = (
     + WATCHDOG_SHUTDOWN_SLACK_SECONDS
 )
 
+# BOU-2366: minimum remaining deadline when a stale heartbeat would otherwise
+# set an immediate watchdog expiry.  A temporarily stalled supervisor loop
+# should not kill a healthy interactive runtime — only enforce a hard ceiling
+# after the grace window elapses with no recovery.
+WATCHDOG_HEARTBEAT_GRACE_SECONDS = 5.0
+
 
 class _TerminalLease:
     """Temporarily hand the controlling terminal to one runtime process group."""
@@ -235,7 +241,12 @@ def _watch_child(
                 _terminate_child(child)
                 break
             if isinstance(status, float):
-                deadline = status
+                # BOU-2366: never enforce a deadline tighter than the grace
+                # window.  A fresh heartbeat pushes status far forward; a
+                # stale one converges to (now + grace), not instant death.
+                deadline = max(
+                    status, time.monotonic() + WATCHDOG_HEARTBEAT_GRACE_SECONDS
+                )
         if time.monotonic() >= deadline:
             reason = ExitReason.WATCHDOG_EXPIRED
             _terminate_child(child)
