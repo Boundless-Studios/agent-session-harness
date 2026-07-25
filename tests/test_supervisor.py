@@ -10,7 +10,6 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from agent_coordinator import ClaimConflictError
 
 from agent_session_harness.activity import (
     ActivitySnapshot,
@@ -20,7 +19,6 @@ from agent_session_harness.activity import (
 from agent_session_harness.capsule import HandoffCapsule
 from agent_session_harness.coordinator import (
     ClaimHandle,
-    CoordinatorAdapter,
     FenceResult,
 )
 from agent_session_harness.models import Confidence
