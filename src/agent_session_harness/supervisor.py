@@ -506,6 +506,37 @@ class Supervisor:
                 ) from refresh_error
             return snapshot
 
+    def _runtime_was_adopted(self) -> bool:
+        """True when the live runtime is the user's session, not one being ended.
+
+        Two shapes are deliberate terminations and must NOT be detached:
+
+        * **A successor that never acknowledged.** `LAUNCHING`/`AWAITING_ACK`
+          name it directly, but the abort path persists `BLOCKED` and raises
+          when it cannot stop the successor, erasing that evidence. So the test
+          also reads durable state: past generation 0, a null `conversation_id`
+          means this generation never acknowledged, and only an acknowledgement
+          makes a successor the user's session. That survives a supervisor
+          restart, which the in-memory flag alone cannot -- a supervisor killed
+          between `_persist_blocked()` and the CLI's `finally` would otherwise
+          come back, see BLOCKED, and detach the successor it was aborting.
+        * **A predecessor being rotated out.** `STOPPING` is rotation ending
+          this generation so a successor can carry its context. If
+          `graceful_stop()` raises with the predecessor still live, shutdown
+          must retry that termination, not cancel the rotation by detaching it.
+        """
+        if self._successor_abort_pending:
+            return False
+        if self.snapshot.phase in {
+            SupervisorPhase.LAUNCHING,
+            SupervisorPhase.AWAITING_ACK,
+            SupervisorPhase.STOPPING,
+        }:
+            return False
+        return not (
+            self.snapshot.generation > 0 and self.snapshot.conversation_id is None
+        )
+
     def _shutdown_unlocked(self) -> SupervisorSnapshot:
         if self.snapshot.phase is SupervisorPhase.COMPLETED:
             self._finalize_completed_cleanup()
@@ -536,17 +567,9 @@ class Supervisor:
         # so the task stays reclaimable: fail open on the runtime, fail closed
         # on the claim.
         #
-        # One exception: a generation that never reached RUNNING never became
-        # the user's session — it is a successor that failed to launch or
-        # acknowledge, so stopping it is the successor-abort path, not a
-        # session kill.  Read the phase BEFORE the BLOCKED overwrite below, and
-        # consult the abort flag too: a successor abort that could not stop its
-        # runtime has ALREADY persisted BLOCKED, which would otherwise read as
-        # an adopted session and detach the very process it was aborting.
-        adopted = not self._successor_abort_pending and self.snapshot.phase not in {
-            SupervisorPhase.LAUNCHING,
-            SupervisorPhase.AWAITING_ACK,
-        }
+        # Two exceptions, both deliberate terminations rather than session kills.
+        # Read them BEFORE the BLOCKED overwrite below.
+        adopted = self._runtime_was_adopted()
         if process is not None:
             self.snapshot = self.snapshot.model_copy(
                 update={"phase": SupervisorPhase.BLOCKED}

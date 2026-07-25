@@ -63,7 +63,7 @@ SYNCHRONOUS_ADAPTER_BUDGET_FRACTION = 0.8
 _detached_projection: dict[str, Any] | None = None
 
 
-def _record_detached_projection(payload: dict[str, Any]) -> None:
+def _record_detached_projection(payload: dict[str, Any] | None) -> None:
     global _detached_projection
     _detached_projection = payload
 
@@ -81,11 +81,25 @@ def _detached_runtime_owns_terminal() -> bool:
 def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    # BOU-2389: the projection describes ONE invocation's detach. Callers run
+    # `main()` repeatedly in a single process (the test suite does), so leaving
+    # it set would attach a stale `supervision` document to an unrelated later
+    # failure -- and silently suppress that failure's diagnostics.
+    _record_detached_projection(None)
     try:
         return int(args.handler(args))
     except (OSError, ValueError, RuntimeError) as exc:
         message = sanitize_error(str(exc), max_length=500)
-        if getattr(args, "json_output", False):
+        json_output = bool(getattr(args, "json_output", False))
+        # BOU-2389: a runtime we detached is still drawing on this terminal, so
+        # ANY write here lands on its canvas -- the JSON document just as much
+        # as the plain line. The failure is already durable in the snapshot, the
+        # effect ledger and the status projection, so silence costs no signal.
+        if _detached_runtime_owns_terminal() and _stdio_belongs_to_someone_else(
+            json_output
+        ):
+            return 2
+        if json_output:
             payload: dict[str, Any] = {
                 "schema_version": 1,
                 "ok": False,
@@ -94,19 +108,15 @@ def main(argv: list[str] | None = None) -> int:
                     "message": message,
                 },
             }
-            # BOU-2389: when this exception is the one that detached a runtime,
-            # the runtime is STILL ALIVE and still the user's. Saying so in the
-            # same document is the difference between "my session crashed" and
-            # "my session is no longer being managed" -- and the raw error alone
-            # was exactly what made the original fault unreadable.
+            # When this exception is the one that detached a runtime, that
+            # runtime is STILL ALIVE and still the user's. Saying so in the same
+            # document is the difference between "my session crashed" and "my
+            # session is no longer being managed" -- and the raw error alone was
+            # exactly what made the original fault unreadable.
             if _detached_projection is not None:
                 payload["supervision"] = _detached_projection
             print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-        elif not _detached_runtime_owns_terminal():
-            # BOU-2389: same rule as the payload — a runtime we detached is
-            # still drawing on this terminal, so an error line here lands on
-            # its canvas. The failure is already durable in the snapshot, the
-            # effect ledger and the status projection.
+        else:
             print(f"agent-session-harness: {message}", file=sys.stderr)
         return 2
 

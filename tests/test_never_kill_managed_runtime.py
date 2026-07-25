@@ -306,6 +306,71 @@ def test_losing_the_claim_does_not_stop_a_live_runtime(tmp_path) -> None:
     assert launched.pid in driver.active_pids
 
 
+def test_successor_abort_intent_survives_a_supervisor_restart(tmp_path) -> None:
+    """The abort must outlive the process that started it.
+
+    Second-round review finding on PR #21: the in-memory provenance flag is
+    reinitialized by a fresh `Supervisor`, so a supervisor killed between
+    `_persist_blocked()` and the CLI's `finally` came back, saw BLOCKED with a
+    live process, and detached the unacknowledged successor it had been
+    aborting. Adoption is now also derived from durable state -- past
+    generation 0, a null `conversation_id` means this generation never
+    acknowledged, and only an acknowledgement makes a successor the user's.
+    """
+    _process, supervisor_module = _modules()
+    managed, kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    launched = managed.current_process
+    assert launched is not None
+
+    # A successor generation that never acknowledged, blocked by a failed abort.
+    managed.snapshot = managed.snapshot.model_copy(
+        update={
+            "phase": supervisor_module.SupervisorPhase.BLOCKED,
+            "generation": 1,
+            "conversation_id": None,
+        }
+    )
+    managed._persist()
+
+    # A brand new Supervisor over the same state: the flag resets to False.
+    restarted = type(managed)(**kwargs)
+    assert restarted._successor_abort_pending is False
+    restarted.current_process = launched
+
+    restarted.shutdown()
+
+    assert ("stop", launched.pid) in driver.calls, (
+        "a restarted supervisor must still finish the abort, not detach it"
+    )
+
+
+def test_a_predecessor_being_rotated_out_is_never_detached(tmp_path) -> None:
+    """`STOPPING` is a deliberate rotation stop, not a session to preserve.
+
+    Second-round review finding on PR #21: if `graceful_stop()` raises while
+    the predecessor is still live, the CLI's `finally` reached shutdown with
+    STOPPING persisted. Treating that as adopted cancelled the rotation and
+    left the superseded predecessor running.
+    """
+    _process, supervisor_module = _modules()
+    managed, _kwargs, driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    launched = managed.current_process
+    assert launched is not None
+
+    managed.snapshot = managed.snapshot.model_copy(
+        update={"phase": supervisor_module.SupervisorPhase.STOPPING}
+    )
+    managed._persist()  # shutdown() re-reads the snapshot from disk
+
+    managed.shutdown()
+
+    assert ("stop", launched.pid) in driver.calls, (
+        "a predecessor mid-rotation must still be stopped, not detached"
+    )
+
+
 def test_a_failed_successor_abort_still_terminates_its_runtime(tmp_path) -> None:
     """`BLOCKED` alone must not be read as "this is the user's session".
 
@@ -362,6 +427,59 @@ def test_detach_survives_an_unwritable_announcement(tmp_path, monkeypatch) -> No
         "the claim must be fenced even when the detach announcement cannot print"
     )
     assert managed.snapshot.claim is None
+
+
+def test_a_detached_projection_does_not_leak_into_the_next_invocation(
+    tmp_path, capsys
+) -> None:
+    """The projection describes ONE invocation's detach.
+
+    Second-round review finding on PR #21: nothing cleared the module-global,
+    so a later unrelated failure in the same process gained a stale
+    `supervision` document -- and, worse, had its own diagnostics suppressed as
+    if a runtime still owned the terminal. The test suite runs `main()`
+    repeatedly in one process, which is exactly the shape that exposes it.
+    """
+    cli = importlib.import_module("agent_session_harness.cli")
+    cli._record_detached_projection({"supervision_alarm": "stale from an old run"})
+
+    # Any failing invocation will do; this one cannot find its state file.
+    assert (
+        cli.main(["report", "--state", str(tmp_path / "missing.json"), "--json"]) == 2
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert "supervision" not in payload, (
+        "a stale detach must not be attributed to an unrelated later failure"
+    )
+
+
+def test_json_errors_are_suppressed_while_a_detached_runtime_owns_the_tty(
+    monkeypatch, capsys
+) -> None:
+    """The JSON error path needs the same terminal guard as every other write.
+
+    Second-round review finding on PR #21: the plain-text branch honoured
+    terminal ownership but the JSON branch printed unconditionally, so
+    `supervise --json` still wrote over the detached runtime's foreground TUI.
+    """
+    cli = importlib.import_module("agent_session_harness.cli")
+    monkeypatch.setattr(cli, "_stdio_belongs_to_someone_else", lambda _json: True)
+
+    def explode(_args):
+        # What `_run_supervise` does on the detach path: record the projection,
+        # then let the exception continue. Recording it before `main()` would
+        # not survive -- main() clears the projection on entry by design.
+        cli._record_detached_projection({"supervision_alarm": "still running"})
+        raise RuntimeError("adapter timed out")
+
+    monkeypatch.setattr(cli, "_run_report", explode)
+    assert cli.main(["report", "--state", "/nonexistent", "--json"]) == 2
+
+    assert capsys.readouterr().out == "", (
+        "nothing may be written while a detached runtime owns the terminal"
+    )
 
 
 class _ExplodingStream:

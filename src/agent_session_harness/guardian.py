@@ -94,12 +94,26 @@ class _TerminalLease:
             return
         previous = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
         try:
-            os.tcsetpgrp(self.fd, self.supervisor_pgid)
-            termios.tcsetattr(self.fd, termios.TCSANOW, self.attributes)
-        except OSError as exc:
-            raise RuntimeError(
-                "interactive guardian cannot restore terminal ownership"
-            ) from exc
+            # BOU-2389: the two halves are restored independently, because a
+            # detached runtime can outlive the supervisor whose process group
+            # is recorded here. In a job-control shell that group is gone by the
+            # time this runs, so `tcsetpgrp` fails with ESRCH -- and doing it in
+            # one try block meant the failure skipped `tcsetattr` and left the
+            # terminal in the runtime's raw mode, with no echo and no line
+            # discipline. Handing the foreground back is best-effort; restoring
+            # the saved attributes is not, because that is what makes the shell
+            # usable again.
+            foreground_error: OSError | None = None
+            try:
+                os.tcsetpgrp(self.fd, self.supervisor_pgid)
+            except OSError as exc:
+                foreground_error = exc
+            try:
+                termios.tcsetattr(self.fd, termios.TCSANOW, self.attributes)
+            except OSError as exc:
+                raise RuntimeError(
+                    "interactive guardian cannot restore terminal ownership"
+                ) from (foreground_error or exc)
         finally:
             signal.signal(signal.SIGTTOU, previous)
         self.restored = True
