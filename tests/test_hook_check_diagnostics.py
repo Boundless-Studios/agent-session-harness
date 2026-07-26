@@ -178,6 +178,105 @@ def test_a_manifest_with_other_hooks_but_none_owned_names_each_event(tmp_path) -
 
 
 # ---------------------------------------------------------------------------
+# Silence is the bug — `installed: false` must never come back explanation-free
+# ---------------------------------------------------------------------------
+
+
+def test_a_stale_owned_entry_is_not_silently_accepted(tmp_path) -> None:
+    """PR #23 review: every event correct, plus one stale owned entry.
+
+    `_is_installed` counts owned entries globally, so the extra one fails the
+    check — while a per-event exact-match scan sees nothing wrong and returns
+    no problems. That reproduces the exact silence this diagnosis exists to end.
+    """
+    path = _installed_manifest(tmp_path)
+    manifest = _load(path)
+    manifest["hooks"]["Stop"].append(
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": "AGENT_SESSION_HARNESS_OWNED=v1 /old/path/harness hook",
+                    "timeout": 5,
+                }
+            ],
+        }
+    )
+    _save(path, manifest)
+
+    result = _installer(path).check()
+
+    assert result.installed is False
+    assert result.problems, "a failing check must never report zero problems"
+    problems = {p.event: p for p in result.problems}
+    assert problems["Stop"].reason == "stale owned entry"
+
+
+def test_an_owned_entry_on_an_unknown_event_is_reported(tmp_path) -> None:
+    path = _installed_manifest(tmp_path)
+    manifest = _load(path)
+    manifest["hooks"]["NotAnEvent"] = [
+        {
+            "matcher": "*",
+            "hooks": [
+                {"type": "command", "command": "AGENT_SESSION_HARNESS_OWNED=v1 x"}
+            ],
+        }
+    ]
+    _save(path, manifest)
+
+    result = _installer(path).check()
+
+    assert result.installed is False
+    problems = {p.event: p.reason for p in result.problems}
+    assert problems["NotAnEvent"] == "owned entry on an unknown event"
+
+
+def test_every_failing_check_explains_itself(tmp_path) -> None:
+    """The invariant behind all of the above, asserted directly."""
+    path = _installed_manifest(tmp_path)
+    manifest = _load(path)
+    manifest["hooks"]["Stop"].append(
+        {
+            "matcher": "*",
+            "hooks": [
+                {"type": "command", "command": "AGENT_SESSION_HARNESS_OWNED=v1 stale"}
+            ],
+        }
+    )
+    _save(path, manifest)
+
+    result = _installer(path).check()
+
+    assert (result.installed is False) == bool(result.problems)
+
+
+def test_a_group_with_two_faults_reports_both(tmp_path) -> None:
+    """PR #23 review: fixing the named fault must not reveal an unnamed one.
+
+    A group can hold a foreign hook AND a drifted owned entry. Reporting only
+    the foreign hook sends the operator to fix it, re-run, and fail again on
+    drift that was never mentioned.
+    """
+    path = _installed_manifest(tmp_path)
+    manifest = _load(path)
+    group = manifest["hooks"]["Stop"][0]
+    group["hooks"][0]["timeout"] = 999
+    group["hooks"].append(
+        {"type": "command", "command": "python3 intruder.py", "timeout": 10}
+    )
+    _save(path, manifest)
+
+    problem = {p.event: p for p in _installer(path).check().problems}["Stop"]
+
+    assert "owned hook shares its group" in problem.reason
+    assert "timeout drift" in problem.reason
+    assert "intruder.py" in problem.detail
+    assert "999" in problem.detail
+
+
+# ---------------------------------------------------------------------------
 # CLI surface
 # ---------------------------------------------------------------------------
 
@@ -223,6 +322,20 @@ def test_human_mode_puts_the_diagnosis_on_stderr(tmp_path, capsys) -> None:
     assert exit_code == 1
     assert "PostToolUse" in captured.err
     assert "intruder.py" in captured.err
+
+
+def test_human_mode_says_it_once(tmp_path, capsys) -> None:
+    """PR #23 review: `problems` in the human payload made `_emit` print the
+    same diagnoses again as a raw JSON line, on top of the readable form."""
+    from agent_session_harness.cli import main
+
+    path = _break_post_tool_use(tmp_path)
+
+    main(["hooks", "check", "--runtime", "claude", "--path", str(path)])
+    captured = capsys.readouterr()
+
+    assert captured.out.count("intruder.py") + captured.err.count("intruder.py") == 1
+    assert "problems" not in captured.out
 
 
 def test_a_passing_cli_check_stays_quiet(tmp_path, capsys) -> None:

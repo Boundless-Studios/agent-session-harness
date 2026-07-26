@@ -762,7 +762,12 @@ def _run_hooks(args: argparse.Namespace) -> int:
         "changed": result.changed,
         "installed": result.installed,
     }
-    if result.problems:
+    # Each mode carries the diagnosis exactly once. In JSON mode it rides in the
+    # payload and stderr stays empty — this CLI's contract. In human mode it goes
+    # to stderr in the readable form; putting it in the payload TOO would make
+    # `_emit` print the same diagnoses again as a raw `problems:` JSON line
+    # (PR #23 review).
+    if result.problems and args.json_output:
         payload["problems"] = [
             {
                 "event": problem.event,
@@ -773,9 +778,6 @@ def _run_hooks(args: argparse.Namespace) -> int:
         ]
     _emit(payload, json_output=args.json_output)
     if args.hook_action == "check" and not result.installed:
-        # In JSON mode the payload above carries the diagnosis and stderr stays
-        # empty — that split is this CLI's contract. In human mode there is no
-        # payload to read, so the reasons go to stderr.
         if not args.json_output:
             for problem in result.problems:
                 print(f"hooks check: {problem.render()}", file=sys.stderr)
