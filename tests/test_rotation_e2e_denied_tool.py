@@ -19,6 +19,7 @@ from pathlib import Path
 from agent_coordinator import JsonlClaimStore, TaskCoordinator
 from test_rotation_e2e import (  # type: ignore[import-not-found]
     FAKE_RUNTIME,
+    RUNTIME_ENVIRONMENT,
     CapsuleManager,
     RolloutUsageReader,
     _set_context_tokens,
@@ -63,6 +64,7 @@ def test_rotation_completes_even_though_a_denied_tool_never_closed(tmp_path) -> 
             )
         ),
         stop_timeout_seconds=2,
+        runtime_environment=dict(RUNTIME_ENVIRONMENT),
     )
 
     try:

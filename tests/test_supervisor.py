@@ -1262,19 +1262,61 @@ def test_clear_exit_status_keeps_receipt_owned_by_different_lineage(tmp_path) ->
     assert not exit_path.exists()
 
 
+def _sigterm_trapping_child(tmp_path) -> subprocess.Popen:
+    """Spawn a child that exits 0 on SIGTERM, and wait until it really can.
+
+    Sleeping a fixed 50ms instead was a flake: interpreter start-up regularly
+    exceeds that on a loaded machine, the guardian's SIGTERM then lands before
+    `signal.signal` has run, and the default disposition kills the child with
+    -15 — failing an assertion about the *handled* exit code. The child now says
+    when its handler is installed.
+    """
+
+    ready = tmp_path / "sigterm-handler-installed"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,signal,sys,time; "
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                f"pathlib.Path({str(ready)!r}).write_text('1'); "
+                "time.sleep(30)"
+            ),
+        ],
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while not ready.exists():
+        if child.poll() is not None:
+            raise AssertionError("SIGTERM-trapping child exited before arming")
+        if time.monotonic() >= deadline:
+            raise AssertionError("timed out waiting for the child to arm SIGTERM")
+        time.sleep(0.01)
+    return child
+
+
 def test_guardian_marks_watchdog_termination_even_when_child_exits_zero(
     tmp_path,
 ) -> None:
+    """A terminated child must never be reported as a clean exit.
+
+    BOU-2389 moved the trigger from `blocked` to `stopping`: `blocked` is where
+    a supervisor lands after a fault and is no longer lethal, while `stopping`
+    is rotation deliberately ending this generation.  The property under test —
+    a SIGTERM-trapping child that exits 0 is still reported as terminated — is
+    unchanged.
+    """
     process, _supervisor_module = _modules()
     guardian = importlib.import_module("agent_session_harness.guardian")
     state_path = tmp_path / "supervisor.json"
     state_path.write_text(
         json.dumps(
             {
-                "claim": {},
+                "claim": {"owner_session_id": "chain-watchdog:0"},
                 "chain_id": "chain-watchdog",
                 "generation": 0,
-                "phase": "blocked",
+                "phase": "stopping",
                 "process_pid": None,
                 "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
@@ -1282,19 +1324,7 @@ def test_guardian_marks_watchdog_termination_even_when_child_exits_zero(
         encoding="utf-8",
     )
     state_path.chmod(0o600)
-    child = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import signal,sys,time; "
-                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
-                "time.sleep(30)"
-            ),
-        ],
-        start_new_session=True,
-    )
-    time.sleep(0.05)
+    child = _sigterm_trapping_child(tmp_path)
 
     terminal = guardian._watch_child(
         child,
@@ -1306,25 +1336,13 @@ def test_guardian_marks_watchdog_termination_even_when_child_exits_zero(
     )
 
     assert terminal.return_code == 0
-    assert terminal.reason is process.ExitReason.STATE_INVALID
+    assert terminal.reason is process.ExitReason.SUPERVISOR_STOP
 
 
 def test_guardian_marks_an_intentional_supervisor_stop(tmp_path) -> None:
     process, _supervisor_module = _modules()
     guardian = importlib.import_module("agent_session_harness.guardian")
-    child = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            (
-                "import signal,sys,time; "
-                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
-                "time.sleep(30)"
-            ),
-        ],
-        start_new_session=True,
-    )
-    time.sleep(0.05)
+    child = _sigterm_trapping_child(tmp_path)
     state_path = tmp_path / "supervisor.json"
     state_path.write_text(
         json.dumps(
@@ -1332,7 +1350,9 @@ def test_guardian_marks_an_intentional_supervisor_stop(tmp_path) -> None:
                 "claim": {"owner_session_id": "chain-stop:0"},
                 "chain_id": "chain-stop",
                 "generation": 0,
-                "phase": "blocked",
+                # BOU-2389: `stopping` is the deliberate stop; `blocked` is a
+                # supervisor fault and no longer terminates the runtime.
+                "phase": "stopping",
                 "process_pid": 99999,
                 "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
@@ -1937,7 +1957,9 @@ def test_periodic_heartbeat_and_stale_owner_failure_are_fail_closed(tmp_path) ->
         stale.tick(_activity(Quiescence.BUSY))
 
     assert stale.snapshot.phase.value == "blocked"
-    assert driver.active_pids == set()
+    # BOU-2389: fail closed on the claim, fail open on the runtime. Losing the
+    # lease blocks the supervisor; it does not kill the user's session.
+    assert driver.active_pids != set()
 
 
 def test_dead_managed_process_is_detected_before_more_dispatch(tmp_path) -> None:
@@ -2040,12 +2062,11 @@ def test_watchdog_zero_exit_never_completes(tmp_path) -> None:
 def test_guardian_heartbeats_are_diagnostic_not_lethal_with_grace(
     tmp_path,
 ) -> None:
-    """BOU-2366: a stale heartbeat should not kill a healthy runtime immediately.
+    """A stale heartbeat never kills a healthy runtime.
 
-    The grace period floor means the guardian enforces at least
-    WATCHDOG_HEARTBEAT_GRACE_SECONDS before terminating, giving a stalled
-    supervisor loop time to advance its heartbeat.  A short timeout (0.05s)
-    is overridden by the grace floor, so the child completes naturally."""
+    BOU-2366 bought time with a grace floor; BOU-2389 removed the inference
+    entirely, so a heartbeat that is stale by any amount — here far past a 0.05s
+    timeout — leaves the child to finish on its own."""
     process, _supervisor_module = _modules()
     guardian = importlib.import_module("agent_session_harness.guardian")
     state_path = tmp_path / "supervisor.json"
@@ -2084,9 +2105,11 @@ def test_guardian_heartbeats_are_diagnostic_not_lethal_with_grace(
 
 
 def test_guardian_still_honors_explicit_supervisor_stop(tmp_path) -> None:
-    """BOU-2366: explicit fenced stop requests (blocked/stopping phase) terminate
-    regardless of heartbeat freshness — the grace floor only applies to stale
-    heartbeats, not explicit shutdown requests."""
+    """An explicit fenced stop request terminates regardless of heartbeat state.
+
+    BOU-2389 narrowed the trigger to the `stopping` phase alone — `blocked` is a
+    supervisor fault — but a deliberate stop is still the one thing the guardian
+    acts on."""
     process, _supervisor_module = _modules()
     guardian = importlib.import_module("agent_session_harness.guardian")
     state_path = tmp_path / "supervisor.json"
@@ -2096,7 +2119,7 @@ def test_guardian_still_honors_explicit_supervisor_stop(tmp_path) -> None:
                 "claim": {"owner_session_id": "chain-stop-grace:0"},
                 "chain_id": "chain-stop-grace",
                 "generation": 0,
-                "phase": "blocked",  # Explicit stop request.
+                "phase": "stopping",  # Explicit stop request.
                 "process_pid": 88888,
                 "last_heartbeat_at": datetime.now(tz=UTC).isoformat(),
             }
@@ -2171,7 +2194,9 @@ def test_terminal_shutdown_is_persisted_and_clears_owned_process(tmp_path) -> No
     assert snapshot.claim is None
     assert snapshot.process_pid is None
     assert managed.current_process is None
-    assert driver.active_pids == set()
+    # BOU-2389: the supervisor releases the claim and forgets the process, but
+    # the runtime keeps running. Ending supervision is not ending the session.
+    assert driver.active_pids == {1000}
     assert coordinator.active is None
 
     recovered = type(managed)(**kwargs)
@@ -2201,7 +2226,9 @@ def test_terminal_shutdown_recovers_resources_after_initial_effect_failure(
 
     assert snapshot.phase.value == "blocked"
     assert snapshot.claim is None
-    assert driver.active_pids == set()
+    # BOU-2389: a failed `claim` never launched a runtime; a failed `launch`
+    # completion leaves a live one, which is detached rather than killed.
+    assert driver.active_pids == (set() if failed_effect == "claim" else {1000})
     assert coordinator.active is None
 
 
@@ -2244,7 +2271,9 @@ def test_terminal_shutdown_retains_claim_until_fencing_can_be_retried(tmp_path) 
     assert managed.snapshot.phase.value == "blocked"
     assert managed.snapshot.claim is not None
     assert managed.snapshot.process_pid is None
-    assert driver.active_pids == set()
+    # BOU-2389: fencing is retried until it succeeds, but the runtime is never
+    # held hostage to it — it was detached on the first shutdown.
+    assert driver.active_pids == {1000}
 
     recovered = managed.shutdown()
     assert recovered.claim is None
@@ -2276,7 +2305,10 @@ def test_terminal_shutdown_stops_successor_after_launch_completion_failure(
     assert coordinator.active is None
 
 
-@pytest.mark.parametrize("failed_effect", ["stop", "fence"])
+# BOU-2389: an adopted runtime is detached rather than stopped, so `detach` is
+# now the shutdown effect that brackets the runtime — `stop` is only emitted on
+# the successor-abort path.
+@pytest.mark.parametrize("failed_effect", ["detach", "fence"])
 def test_terminal_shutdown_cleans_resources_when_effect_journaling_fails(
     tmp_path, monkeypatch, failed_effect
 ) -> None:
@@ -2285,7 +2317,8 @@ def test_terminal_shutdown_cleans_resources_when_effect_journaling_fails(
     original_effect = managed._effect
 
     def fail_started_effect(effect, status, *, generation):
-        if effect == failed_effect and status == "started":
+        # `detach` is journalled as completed; `fence` as started.
+        if effect == failed_effect:
             raise OSError(f"{failed_effect} journal unavailable")
         original_effect(effect, status, generation=generation)
 
@@ -2296,7 +2329,7 @@ def test_terminal_shutdown_cleans_resources_when_effect_journaling_fails(
 
     assert managed.snapshot.claim is None
     assert managed.snapshot.process_pid is None
-    assert driver.active_pids == set()
+    assert driver.active_pids == {1000}
     assert coordinator.active is None
 
 
@@ -2310,7 +2343,9 @@ def test_terminal_shutdown_uses_known_resources_when_state_is_corrupt(tmp_path) 
 
     assert managed.snapshot.claim is None
     assert managed.snapshot.process_pid is None
-    assert driver.active_pids == set()
+    # BOU-2389: a corrupt state file is a supervisor fault; the runtime it was
+    # tracking is still healthy and is left running.
+    assert driver.active_pids == {1000}
     assert coordinator.active is None
 
 

@@ -306,6 +306,8 @@ def test_report_projects_supervisor_state_without_model_work(tmp_path, capsys) -
         "runtime_liveness": "never_reported",
         "schema_version": 1,
         "state": "awaiting_ack",
+        # BOU-2389: the supervisor is still attached, so nothing to announce.
+        "supervision_alarm": None,
         "usage_alarm": None,
         "window_tokens": None,
     }
@@ -803,12 +805,19 @@ def test_non_check_supervise_runs_a_real_bounded_supervisor_loop(
 
     assert cli.main(arguments) == 0
 
-    payload = _json_stdout(capsys)
+    # BOU-2389: the tick budget runs out while the runtime is still alive, so
+    # supervision ends by *detaching*. That is announced rather than silent —
+    # stderr is redirected under capsys, which is the case the announcement is
+    # kept for.
+    captured = capsys.readouterr()
+    assert "no longer context-managed" in captured.err
+    payload = json.loads(captured.out)
     assert payload["mode"] == "managed"
     assert payload["ticks"] == 1
     assert payload["state"] == "blocked"
     assert payload["generation"] == 0
     assert payload["process_pid"] is None
+    assert "no longer context-managed" in str(payload["supervision_alarm"])
     persisted = SupervisorSnapshot.model_validate_json(
         (tmp_path / "supervisor.json").read_text(encoding="utf-8")
     )
