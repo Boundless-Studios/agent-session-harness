@@ -758,11 +758,27 @@ def _run_hooks(args: argparse.Namespace) -> int:
         result = installer.uninstall(dry_run=args.dry_run)
     else:
         result = installer.check()
-    _emit(
-        {"changed": result.changed, "installed": result.installed},
-        json_output=args.json_output,
-    )
+    payload: dict[str, object] = {
+        "changed": result.changed,
+        "installed": result.installed,
+    }
+    if result.problems:
+        payload["problems"] = [
+            {
+                "event": problem.event,
+                "reason": problem.reason,
+                "detail": problem.detail,
+            }
+            for problem in result.problems
+        ]
+    _emit(payload, json_output=args.json_output)
     if args.hook_action == "check" and not result.installed:
+        # In JSON mode the payload above carries the diagnosis and stderr stays
+        # empty — that split is this CLI's contract. In human mode there is no
+        # payload to read, so the reasons go to stderr.
+        if not args.json_output:
+            for problem in result.problems:
+                print(f"hooks check: {problem.render()}", file=sys.stderr)
         return 1
     return 0
 
