@@ -41,6 +41,31 @@ SESSION_START_HOOK_TIMEOUT_SECONDS = 35
 class HookInstallResult:
     changed: bool
     installed: bool
+    # Per-event explanation, present only for `check` and only when something
+    # is wrong. `installed: false` on its own is undiagnosable: it names
+    # neither the event nor what differed, so the only way to find out is to
+    # read this module's source. See `HookInstaller.diagnose`.
+    problems: tuple[HookProblem, ...] = ()
+
+
+def _describe_command(entry: Any) -> str:
+    """A short, recognizable label for a foreign hook entry."""
+    if not isinstance(entry, dict):
+        return repr(entry)
+    command = entry.get("command")
+    if not isinstance(command, str) or not command:
+        return repr(entry)
+    return command if len(command) <= 80 else command[:77] + "..."
+
+
+@dataclass(frozen=True)
+class HookProblem:
+    event: str
+    reason: str
+    detail: str
+
+    def render(self) -> str:
+        return f"{self.event}: {self.reason} — {self.detail}"
 
 
 class HookInstaller:
@@ -73,7 +98,188 @@ class HookInstaller:
 
     def check(self) -> HookInstallResult:
         manifest = self._read()
-        return HookInstallResult(changed=False, installed=self._is_installed(manifest))
+        installed = self._is_installed(manifest)
+        return HookInstallResult(
+            changed=False,
+            installed=installed,
+            problems=() if installed else self.diagnose(manifest),
+        )
+
+    def diagnose(
+        self, manifest: dict[str, Any] | None = None
+    ) -> tuple[HookProblem, ...]:
+        """Explain, per event, why ownership does not verify.
+
+        `_is_installed` compares each event's group for EXACT equality against
+        a single-owned-hook group, so any of several unrelated conditions
+        produces the same `false`: the event is missing, the owned entry was
+        never installed, its timeout drifted, its command drifted, or — the one
+        that is genuinely surprising — another hook was appended into the
+        harness's own group. That last case cost a real debugging session in
+        gaia, where a response-budget guard had been added alongside the owned
+        entry for PostToolUse and PreCompact and the only output was
+        `{"changed":false,"installed":false}`.
+        """
+        if manifest is None:
+            manifest = self._read()
+        hooks = manifest.get("hooks")
+        if not isinstance(hooks, dict):
+            return (
+                HookProblem(
+                    event="*",
+                    reason="no hook manifest",
+                    detail=f"{self.path} has no 'hooks' object",
+                ),
+            )
+
+        problems: list[HookProblem] = []
+        for event_name in HOOK_EVENTS:
+            groups = hooks.get(event_name)
+            if not isinstance(groups, list):
+                problems.append(
+                    HookProblem(
+                        event=event_name,
+                        reason="event missing",
+                        detail="no hook groups registered for this event",
+                    )
+                )
+                continue
+
+            expected = self._expected_group(event_name)
+            matches = [group for group in groups if group == expected]
+            owned = self._owned_entry_count(groups)
+            if len(matches) == 1:
+                # An exact match is NOT sufficient. `_is_installed` also counts
+                # owned entries GLOBALLY and rejects a manifest holding more
+                # than one per event, so a stale owned entry alongside a correct
+                # group fails the check while every event looks fine here —
+                # `installed: false` with no problems at all, which is the exact
+                # silence this diagnosis exists to end (PR #23 review).
+                if owned > 1:
+                    problems.append(
+                        HookProblem(
+                            event=event_name,
+                            reason="stale owned entry",
+                            detail=(
+                                f"{owned} harness-owned entries registered for this "
+                                "event; the correct group is present, so remove the "
+                                "extra (usually left by an older install)"
+                            ),
+                        )
+                    )
+                continue
+            if len(matches) > 1:
+                problems.append(
+                    HookProblem(
+                        event=event_name,
+                        reason="duplicate owned group",
+                        detail=f"{len(matches)} identical owned groups; expected exactly 1",
+                    )
+                )
+                continue
+
+            problems.append(self._near_miss_problem(event_name, groups, expected))
+
+        # Owned entries filed under an event the harness does not use also break
+        # the global count, and no per-event pass above would ever look there.
+        for event_name, groups in hooks.items():
+            if event_name in HOOK_EVENTS or not isinstance(groups, list):
+                continue
+            if self._owned_entry_count(groups):
+                problems.append(
+                    HookProblem(
+                        event=event_name,
+                        reason="owned entry on an unknown event",
+                        detail=(
+                            "a harness-owned hook is registered for an event the "
+                            "harness does not install; remove it"
+                        ),
+                    )
+                )
+
+        return tuple(problems)
+
+    def _owned_entry_count(self, groups: list[Any]) -> int:
+        """How many harness-owned entries are registered across these groups."""
+        total = 0
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            total += sum(1 for entry in group["hooks"] if self._owned_entry(entry))
+        return total
+
+    def _near_miss_problem(
+        self,
+        event_name: str,
+        groups: list[Any],
+        expected: dict[str, object],
+    ) -> HookProblem:
+        """Name the closest thing to the expected group and how it differs.
+
+        Reports EVERY discrepancy it finds, not the first. A group can hold both
+        a foreign hook and a drifted owned entry; naming only the foreign hook
+        sends the operator to fix one thing, re-run, and fail again on the drift
+        that was never mentioned (PR #23 review).
+        """
+        expected_entry = expected["hooks"][0]  # type: ignore[index]
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            owned = [entry for entry in group["hooks"] if self._owned_entry(entry)]
+            if not owned:
+                continue
+
+            reasons: list[str] = []
+            details: list[str] = []
+
+            # The surprising case: correct entry, wrong company.
+            if len(group["hooks"]) > 1:
+                others = [
+                    _describe_command(entry)
+                    for entry in group["hooks"]
+                    if not self._owned_entry(entry)
+                ]
+                reasons.append("owned hook shares its group")
+                details.append(
+                    "the owned entry must be the ONLY hook in its "
+                    f"matcher:'*' group; also present: {', '.join(others)}. "
+                    "Move the other hook(s) into their own group — two "
+                    "groups both matching '*' both run."
+                )
+            if group.get("matcher") != "*":
+                reasons.append("wrong matcher")
+                details.append(f"expected matcher '*', found {group.get('matcher')!r}")
+
+            entry = owned[0]
+            if entry.get("timeout") != expected_entry.get("timeout"):  # type: ignore[union-attr]
+                reasons.append("timeout drift")
+                details.append(
+                    f"expected timeout {expected_entry.get('timeout')}, "  # type: ignore[union-attr]
+                    f"found {entry.get('timeout')!r}"
+                )
+            if entry.get("command") != expected_entry.get("command"):  # type: ignore[union-attr]
+                reasons.append("command drift")
+                details.append(
+                    "owned entry's command does not match the expected command"
+                )
+
+            if reasons:
+                return HookProblem(
+                    event=event_name,
+                    reason=" + ".join(reasons),
+                    detail=" ".join(details),
+                )
+            return HookProblem(
+                event=event_name,
+                reason="group mismatch",
+                detail=f"owned group is not equal to the expected group: {group!r}",
+            )
+
+        return HookProblem(
+            event=event_name,
+            reason="not installed",
+            detail="no harness-owned hook entry registered for this event",
+        )
 
     def install(self, *, dry_run: bool = False) -> HookInstallResult:
         manifest = self._read()
