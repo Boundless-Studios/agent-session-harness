@@ -10,6 +10,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from agent_session_harness.activity import (
     ActivitySnapshot,
@@ -22,7 +23,6 @@ from agent_session_harness.coordinator import (
     FenceResult,
 )
 from agent_session_harness.models import Confidence, Runtime
-from pydantic import ValidationError
 
 NOW = datetime(2026, 7, 19, 6, 0, tzinfo=UTC)
 
