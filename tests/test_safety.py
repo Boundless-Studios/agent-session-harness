@@ -251,6 +251,7 @@ def test_merge_preserves_every_runtime_derived_field() -> None:
         last_event_at=NOW,
         integrity_warnings=(),
         handoff_requested_generations=frozenset({7}),
+        handoff_requested_seen=3,
         pre_compact_generations=frozenset({7}),
         pre_compact_seen=2,
         reaped_tool_ids=frozenset({"tool-denied"}),
@@ -262,3 +263,4 @@ def test_merge_preserves_every_runtime_derived_field() -> None:
     assert merged.pre_compact_seen == 2
     assert merged.reaped_tool_ids == frozenset({"tool-denied"})
     assert merged.handoff_requested_generations == frozenset({7})
+    assert merged.handoff_requested_seen == 3

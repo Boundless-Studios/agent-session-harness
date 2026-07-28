@@ -114,6 +114,7 @@ class EventLedger:
         active_critical_sections: Counter[str] = Counter()
         reaped_tools: set[str] = set()
         handoff_requested_generations: set[int] = set()
+        handoff_requested_seen = 0
         pre_compact_generations: set[int] = set()
         pre_compact_seen = 0
         last_event_at: datetime | None = None
@@ -197,6 +198,7 @@ class EventLedger:
                     active_tools.clear()
             elif event.event_type is EventType.HANDOFF_REQUESTED:
                 handoff_requested_generations.add(event.generation)
+                handoff_requested_seen += 1
             elif event.event_type is EventType.PRE_COMPACT:
                 pre_compact_generations.add(event.generation)
                 pre_compact_seen += 1
@@ -231,6 +233,7 @@ class EventLedger:
             integrity_warnings=tuple(warning.message for warning in warnings),
             reaped_tool_ids=frozenset(reaped_tools),
             handoff_requested_generations=frozenset(handoff_requested_generations),
+            handoff_requested_seen=handoff_requested_seen,
             pre_compact_generations=frozenset(pre_compact_generations),
             pre_compact_seen=pre_compact_seen,
         )

@@ -242,6 +242,10 @@ class SupervisorSnapshot(BaseModel):
     # would otherwise re-consume every retained compaction event and cancel the
     # next legitimate rotation.
     pre_compact_consumed: int = Field(default=0, ge=0)
+    # Handoff requests at or below this count predate a drain cancellation and no
+    # longer authorise a rotation. Consent given before a self-compaction is about
+    # work the runtime has since replaced (BOU-2565 review).
+    handoff_consent_invalidated_at: int = Field(default=0, ge=0)
     usage_sample_failure_streak: int = Field(default=0, ge=0)
     non_confident_sample_streak: int = Field(default=0, ge=0)
     usage_alarm: str | None = Field(default=None, max_length=320)
@@ -710,6 +714,12 @@ class Supervisor:
                 if (
                     self.snapshot.generation
                     not in activity.handoff_requested_generations
+                    # ...and the request must POSTDATE any drain this generation
+                    # already cancelled. Membership alone is retained forever, so
+                    # pre-compaction consent would otherwise authorise a
+                    # post-compaction rotation (BOU-2565 review).
+                    or activity.handoff_requested_seen
+                    <= self.snapshot.handoff_consent_invalidated_at
                     or activity.quiescence is not Quiescence.IDLE
                 ):
                     return self.snapshot
@@ -986,26 +996,55 @@ class Supervisor:
         supervisor already acted on, which also means a genuine SECOND
         compaction in the same generation still releases (review round 1).
         """
-        if self.snapshot.phase is not SupervisorPhase.DRAINING:
-            return
         if self.snapshot.generation not in activity.pre_compact_generations:
             return
         if activity.pre_compact_seen <= self.snapshot.pre_compact_consumed:
             # Already acted on every compaction the ledger has reported.
             return
-        self.snapshot = self.snapshot.model_copy(
-            update={
-                "phase": SupervisorPhase.RUNNING,
-                "warning_emitted": False,
-                "pre_compact_consumed": activity.pre_compact_seen,
-            }
-        )
+
+        # Consume FIRST, and regardless of phase. A compaction observed while
+        # RUNNING or WARNING (usage sampling is often UNKNOWN right when the
+        # runtime auto-compacts) cannot cancel anything — but if it is left
+        # unconsumed, a later drain in the same generation is cancelled by that
+        # stale event, which is the same defect as the repeat case one path over
+        # (review round 2).
+        updates: dict[str, object] = {"pre_compact_consumed": activity.pre_compact_seen}
+        releasing = self.snapshot.phase is SupervisorPhase.DRAINING
+        if releasing:
+            updates["phase"] = SupervisorPhase.RUNNING
+            updates["warning_emitted"] = False
+            # Consent to rotate does not survive the compaction it preceded.
+            # `handoff_requested_generations` is a retained fold, so without this
+            # a Stop that requested handoff BEFORE the compaction would still
+            # authorise a rotation after it — in the same generation, about work
+            # the runtime has since replaced. Invalidate anything already
+            # requested; a genuine later request advances the count past this.
+            updates["handoff_consent_invalidated_at"] = activity.handoff_requested_seen
+        self.snapshot = self.snapshot.model_copy(update=updates)
         self._persist()
+        if not releasing:
+            return
+        # The Stop-request marker keys on (chain_id, generation), which this
+        # cancellation preserves — so leaving it would make the next Stop report
+        # "already requested" and skip asking the runtime to persist its NEW next
+        # action. Clear it so the next drain asks fresh.
+        self._clear_stop_request_marker()
         self._effect(
             "rotation",
             "canceled-by-self-compaction",
             generation=self.snapshot.generation,
         )
+
+    def _clear_stop_request_marker(self) -> None:
+        """Drop the `.stop-request` marker; best-effort by design."""
+        from .hooks.command import stop_request_path  # noqa: PLC0415
+
+        marker = stop_request_path(self.state_path)
+        try:
+            with exclusive_lock(marker.with_suffix(marker.suffix + ".lock")):
+                private_unlink(marker)
+        except (OSError, ValueError):
+            return
 
     def _apply_usage_thresholds(self, context_percent: float) -> None:
         # BOU-2565 deliberately does NOT add a "context fell back below

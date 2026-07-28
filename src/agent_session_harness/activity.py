@@ -58,6 +58,11 @@ class ActivitySnapshot:
     # per event needs a watermark it can compare against what it already acted
     # on; this is that watermark. Monotonic and bounded (BOU-2565 review).
     pre_compact_seen: int = 0
+    # Same watermark treatment for handoff requests. `handoff_requested_generations`
+    # is also a retained fold, so consent given BEFORE a self-compaction would
+    # otherwise still authorise a rotation AFTER it — in the same generation, off
+    # a request the runtime made about different work (BOU-2565 review).
+    handoff_requested_seen: int = 0
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
     # Tool starts closed by turn-idle reconciliation rather than by their own
     # finish event (BOU-2236). Reported for observability only -- these are NOT

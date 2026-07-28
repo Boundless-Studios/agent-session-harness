@@ -39,6 +39,7 @@ def _activity(
     quiescence: Quiescence,
     *,
     handoff_requested_generations: frozenset[int] = frozenset(),
+    handoff_requested_seen: int | None = None,
     pre_compact_generations: frozenset[int] = frozenset(),
     pre_compact_seen: int | None = None,
 ) -> ActivitySnapshot:
@@ -53,6 +54,9 @@ def _activity(
         last_event_at=NOW,
         integrity_warnings=(),
         handoff_requested_generations=handoff_requested_generations,
+        handoff_requested_seen=handoff_requested_seen
+        if handoff_requested_seen is not None
+        else len(handoff_requested_generations),
         pre_compact_generations=pre_compact_generations,
         pre_compact_seen=pre_compact_seen
         if pre_compact_seen is not None
@@ -2865,3 +2869,87 @@ def test_a_second_real_compaction_still_releases(tmp_path) -> None:
     assert after.phase.value == "running", (
         "a second genuine compaction is a new signal and must release the drain"
     )
+
+
+def test_compaction_observed_while_running_cannot_release_a_later_drain(
+    tmp_path,
+) -> None:
+    """A non-draining observation still consumes the retained event."""
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    compacted = _activity(
+        Quiescence.BUSY,
+        pre_compact_generations=frozenset({0}),
+        pre_compact_seen=1,
+    )
+
+    observed = managed.tick(compacted)
+    assert observed.phase.value == "running"
+    assert observed.pre_compact_consumed == 1
+
+    managed.usage_reader.percent = 70.0
+    redrained = managed.tick(compacted)
+
+    assert redrained.phase.value == "draining", (
+        "the retained compaction was already observed before this drain and "
+        "must not cancel it"
+    )
+
+
+def test_cancelled_drain_requires_a_fresh_handoff_and_clears_stop_marker(
+    tmp_path,
+) -> None:
+    """Pre-compaction handoff state cannot authorize a later rotation."""
+    _process, supervisor = _modules()
+    command = importlib.import_module("agent_session_harness.hooks.command")
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    marker = command.stop_request_path(managed.state_path)
+    marker.write_text('{"stale": true}\n', encoding="utf-8")
+
+    managed.usage_reader.percent = 70.0
+    assert (
+        managed.tick(
+            _activity(
+                Quiescence.BUSY,
+                handoff_requested_generations=frozenset({0}),
+                handoff_requested_seen=1,
+            )
+        ).phase
+        is supervisor.SupervisorPhase.DRAINING
+    )
+
+    released = managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_generations=frozenset({0}),
+            handoff_requested_seen=1,
+            pre_compact_generations=frozenset({0}),
+            pre_compact_seen=1,
+        )
+    )
+    assert released.phase is supervisor.SupervisorPhase.RUNNING
+    assert not marker.exists()
+
+    managed.usage_reader.percent = 70.0
+    retained = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_generations=frozenset({0}),
+            handoff_requested_seen=1,
+            pre_compact_generations=frozenset({0}),
+            pre_compact_seen=1,
+        )
+    )
+    assert retained.phase is supervisor.SupervisorPhase.DRAINING
+
+    fresh = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_generations=frozenset({0}),
+            handoff_requested_seen=2,
+            pre_compact_generations=frozenset({0}),
+            pre_compact_seen=1,
+        )
+    )
+    assert fresh.phase is not supervisor.SupervisorPhase.DRAINING

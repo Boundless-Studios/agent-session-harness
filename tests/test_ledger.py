@@ -474,6 +474,30 @@ def test_pre_compact_events_are_folded_per_generation(tmp_path) -> None:
     assert snapshot.pre_compact_generations == frozenset({3})
 
 
+def test_handoff_requests_expose_a_monotonic_watermark(tmp_path) -> None:
+    """Retained generation membership cannot distinguish newer consent."""
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "event-1", "handoff.requested"))
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "event-2",
+            "handoff.requested",
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.handoff_requested_generations == frozenset({0})
+    assert snapshot.handoff_requested_seen == 2
+
+
 def test_pre_compact_is_absent_when_the_runtime_never_compacted(tmp_path) -> None:
     """Control: the set stays empty, so a drain is never released by accident."""
     _models, events, ledger_module, _activity = _modules()

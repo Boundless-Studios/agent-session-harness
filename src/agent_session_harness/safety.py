@@ -128,6 +128,7 @@ def merge_project_safety(
         last_event_at=activity.last_event_at,
         integrity_warnings=activity.integrity_warnings + observation.warnings,
         handoff_requested_generations=activity.handoff_requested_generations,
+        handoff_requested_seen=activity.handoff_requested_seen,
         # The project probe observes the WORKTREE, not the runtime's hooks, so
         # every runtime-derived field must pass through untouched — the probe
         # has no basis to alter any of them. Dropping one silently substitutes
