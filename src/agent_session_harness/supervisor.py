@@ -237,7 +237,7 @@ class SupervisorSnapshot(BaseModel):
     @classmethod
     def read_forward_compatible(
         cls, payload: dict[str, object]
-    ) -> tuple["SupervisorSnapshot", tuple[str, ...]]:
+    ) -> tuple[SupervisorSnapshot, tuple[str, ...]]:
         """Validate persisted state, tolerating fields written by a newer build.
 
         Returns the snapshot plus the sorted names of any dropped keys, so a
