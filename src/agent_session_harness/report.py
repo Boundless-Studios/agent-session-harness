@@ -95,7 +95,7 @@ def build_report(
     # `gaia supervise status` is exactly what an operator reaches for when a
     # session is misbehaving, so it has to survive version skew rather than
     # become another casualty of it (BOU-2245 was this same fallout gaia-side).
-    state, _unknown = SupervisorSnapshot.read_forward_compatible(
+    state, _unknown, _preserved = SupervisorSnapshot.read_forward_compatible(
         json.loads(read_private_text(state_path))
     )
     quiescence = Quiescence.UNKNOWN

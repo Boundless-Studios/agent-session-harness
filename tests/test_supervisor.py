@@ -2759,13 +2759,19 @@ def test_snapshot_read_tolerates_and_reports_a_field_from_a_newer_build() -> Non
     payload["a_field_from_the_future"] = {"nested": True}
     payload["another_one"] = 7
 
-    snapshot, unknown = supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+    snapshot, unknown, preserved = (
+        supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+    )
 
     assert snapshot.chain_id == "chain-1"
     assert unknown == ("a_field_from_the_future", "another_one"), (
         "unknown keys must be REPORTED, not silently swallowed — version skew is "
         "exactly what an operator debugging odd behaviour needs to be told"
     )
+    assert preserved == {
+        "a_field_from_the_future": {"nested": True},
+        "another_one": 7,
+    }
 
 
 def test_snapshot_read_still_rejects_a_corrupt_known_field() -> None:
@@ -2859,13 +2865,87 @@ def test_an_additive_field_inside_a_nested_model_is_also_tolerated() -> None:
     payload = snapshot.model_dump(mode="json")
     payload["claim"]["a_nested_future_field"] = "surprise"
 
-    restored, unknown = supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+    restored, unknown, preserved = (
+        supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+    )
 
     assert restored.claim is not None
     assert restored.claim.claim_id == "claim-1"
     assert unknown == ("claim.a_nested_future_field",), (
         "the dropped key must be reported with its path, so an operator can see "
         f"WHERE the skew is. Got: {unknown}"
+    )
+    assert preserved == {"claim": {"a_nested_future_field": "surprise"}}
+
+
+def test_supervisor_preserves_unknown_fields_when_rewriting_state(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["future_top_level"] = {"enabled": True}
+    payload["claim"] = None
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    managed.snapshot = managed._load()
+    managed._persist()
+
+    rewritten = json.loads(state_path.read_text(encoding="utf-8"))
+    assert rewritten["future_top_level"] == {"enabled": True}
+
+
+def test_mismatched_state_is_rejected_before_skew_is_recorded(tmp_path) -> None:
+    """Identity is checked BEFORE anything is journaled (review round 2).
+
+    A `--state` pointing at another runtime or chain's snapshot must be rejected
+    without writing beside it — otherwise the skew record lands in an unrelated
+    file's history stamped with OUR chain_id, from a supervisor that never
+    accepted the state.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    effects_path = tmp_path / "supervisor.json.events"
+    # `start()` legitimately writes effects, so the assertion below is about the
+    # SKEW record specifically, not about the file being absent.
+    before = effects_path.read_text(encoding="utf-8") if effects_path.exists() else ""
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["chain_id"] = "some-other-chain"
+    payload["future_field"] = 1
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime/chain"):
+        managed._load()
+
+    after = effects_path.read_text(encoding="utf-8") if effects_path.exists() else ""
+    assert "version-skew" not in after, (
+        "skew was journaled for a snapshot this supervisor rejected on identity"
+    )
+    assert after == before, "nothing at all should have been appended"
+
+
+def test_unsafe_skew_diagnostic_does_not_abort_state_recovery(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["future_field"] = 1
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    # `start()` already created the real lock, so replace it with a symlink —
+    # the shape `exclusive_lock` refuses with UnsafePathError (a RuntimeError,
+    # NOT an OSError, which is exactly why the best-effort guard missed it).
+    lock = tmp_path / "supervisor.json.events.lock"
+    lock.unlink(missing_ok=True)
+    lock.symlink_to(tmp_path / "redirected.lock")
+
+    restored = managed._load()
+
+    assert restored.chain_id == managed.chain_id, (
+        "an unwritable diagnostic must not abort recovery of a perfectly valid "
+        "snapshot — the annotation cannot take down the thing it annotates"
     )
 
 

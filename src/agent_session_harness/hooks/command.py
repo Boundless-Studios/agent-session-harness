@@ -400,7 +400,7 @@ def _read_snapshot(path: Path) -> SupervisorSnapshot:
         # field, a strict read here would raise `extra_forbidden` and block the
         # hook — and therefore the handoff — even when the supervisor itself
         # loaded the file successfully.
-        snapshot, _unknown = SupervisorSnapshot.read_forward_compatible(
+        snapshot, _unknown, _preserved = SupervisorSnapshot.read_forward_compatible(
             json.loads(encoded)
         )
         return snapshot
