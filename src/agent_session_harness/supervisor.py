@@ -10,7 +10,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -30,6 +30,7 @@ from .process import (
     clear_runtime_abort,
 )
 from .secure_files import (
+    UnsafePathError,
     append_private_text,
     atomic_write_private_text,
     exclusive_lock,
@@ -135,6 +136,78 @@ _DETACHED_ALARM = (
 )
 
 
+def _model_type_of(annotation: object) -> type[BaseModel] | None:
+    """The BaseModel a field annotation resolves to, unwrapping `X | None`."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    for arg in get_args(annotation):
+        if isinstance(arg, type) and issubclass(arg, BaseModel):
+            return arg
+    return None
+
+
+def _merge_preserved(payload: dict, preserved: dict) -> dict:
+    """Re-apply preserved unknown values onto a freshly dumped payload.
+
+    Known fields always win — this build's current values are authoritative for
+    everything it models. Only keys it does NOT model are restored, so a merge
+    can never resurrect a stale value for a field this build owns.
+    """
+    if not preserved:
+        return payload
+    merged = dict(payload)
+    for key, value in preserved.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_preserved(merged[key], value)
+        elif key not in merged:
+            merged[key] = value
+    return merged
+
+
+def _strip_unknown_fields(
+    model: type[BaseModel],
+    payload: object,
+    *,
+    path: str,
+    found: list[str],
+    preserved: dict | None = None,
+) -> object:
+    """Recursively drop keys ``model`` does not declare, recording dotted names.
+
+    Non-mapping payloads are returned untouched so Pydantic — not this function
+    — decides they are invalid. That keeps a corrupt state file raising
+    `ValidationError` (a `ValueError` the CLI already handles) rather than a
+    `TypeError` from iterating `null` or an `AttributeError` from a string
+    (BOU-2407 review round 1).
+    """
+    if not isinstance(payload, dict):
+        return payload
+    fields = model.model_fields
+    cleaned: dict[str, object] = {}
+    for key, value in payload.items():
+        name = str(key)
+        dotted = f"{path}{name}"
+        field = fields.get(name)
+        if field is None:
+            found.append(dotted)
+            # Keep the VALUE, not just the name: `_persist` merges these back so
+            # an older build cannot erase a newer one's durable state on rewrite.
+            if preserved is not None:
+                preserved[name] = value
+            continue
+        nested = _model_type_of(field.annotation)
+        if nested is None:
+            cleaned[name] = value
+            continue
+        nested_preserved: dict = {}
+        cleaned[name] = _strip_unknown_fields(
+            nested, value, path=f"{dotted}.", found=found, preserved=nested_preserved
+        )
+        if nested_preserved and preserved is not None:
+            preserved[name] = nested_preserved
+    return cleaned
+
+
 class SupervisorPhase(str, Enum):
     INITIAL = "initial"
     RUNNING = "running"
@@ -207,7 +280,70 @@ class CheckpointManager(Protocol):
 
 
 class SupervisorSnapshot(BaseModel):
+    """Durable supervisor state.
+
+    **Evolution policy (BOU-2407).** Adding an OPTIONAL field with a default is
+    always allowed and is not a schema change. `schema_version` gates only
+    incompatible reshaping — a renamed or removed field, or a changed meaning —
+    never an additive one.
+
+    `extra="forbid"` is kept deliberately: it catches a typo'd keyword at
+    construction, which is a real bug in our own code. But it must NOT be how
+    persisted state is read. `_persist` writes every field, so the moment a
+    newer build writes the state file, an OLDER reader that forbids the new key
+    cannot validate it at all — `ValidationError: Extra inputs are not
+    permitted` — and mixed-version execution and rollback both break exactly
+    when a live session may need recovery. This is not hypothetical: it fired
+    during BOU-2389 development when `supervision_alarm` was added, and
+    BOU-2222's `liveness_alarm`/`usage_alarm` had the same property.
+
+    So every read of a persisted snapshot goes through
+    :meth:`read_forward_compatible`, which drops keys this build does not know
+    and REPORTS them rather than swallowing them. That cannot rescue readers
+    already installed today — no change to new code can make an old binary
+    tolerant of a field it was compiled to forbid — but it stops the bleeding
+    permanently, so the next field addition is a non-event.
+    """
+
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @classmethod
+    def read_forward_compatible(
+        cls, payload: object
+    ) -> tuple[SupervisorSnapshot, tuple[str, ...], dict]:
+        """Validate persisted state, tolerating fields written by a newer build.
+
+        Returns the snapshot, the sorted dotted names of any dropped keys (so a
+        caller can surface version skew instead of silently discarding it), and
+        the dropped VALUES so a caller that rewrites the file can merge them
+        back. Reads being tolerant while writes are destructive would be worse
+        than the original bug — the next `_persist` would erase a newer build's
+        durable state rather than merely failing loudly (review round 2).
+
+        Only UNKNOWN keys are forgiven. A torn or corrupt file still fails: bad
+        JSON raises in `json.loads` before this is reached, and a known field
+        carrying a wrong type still raises here. The single behaviour that
+        changes is that "a key I don't recognise" stops being fatal — and that
+        case is indistinguishable from "written by a newer build", which is
+        precisely why it must not be.
+
+        The strip is RECURSIVE. Nested persisted models (`claim`) declare their
+        own ``extra="forbid"``, so filtering only the top level would still let
+        an additive field inside `ClaimHandle` block mixed-version recovery —
+        the top-level `claim` key is known, and validation then delegates into a
+        model that rejects the addition anyway (review round 1).
+
+        A non-mapping payload is handed straight to Pydantic rather than
+        iterated, so a corrupt state file holding `null`, a string, or an array
+        still raises `ValidationError` — a `ValueError` the CLI already handles —
+        instead of a `TypeError`/`AttributeError` traceback.
+        """
+        unknown: list[str] = []
+        preserved: dict = {}
+        cleaned = _strip_unknown_fields(
+            cls, payload, path="", found=unknown, preserved=preserved
+        )
+        return cls.model_validate(cleaned), tuple(sorted(unknown)), preserved
 
     schema_version: Literal[1] = 1
     runtime: Runtime
@@ -334,6 +470,13 @@ class Supervisor:
         self.effect_path = self.state_path.with_suffix(
             self.state_path.suffix + ".events"
         )
+        # Last version-skew field set already reported, so `_load` announces once
+        # per distinct set rather than on every tick (BOU-2407 review).
+        self._announced_version_skew: tuple[str, ...] = ()
+        # Values a newer build wrote that this one does not model, merged back on
+        # every `_persist` so an older supervisor cannot erase them (BOU-2407
+        # review round 2).
+        self._preserved_unknown: dict = {}
         self.transition_lock_path = self.state_path.with_suffix(
             self.state_path.suffix + ".transition.lock"
         )
@@ -1522,26 +1665,91 @@ class Supervisor:
             self.state_path.with_suffix(self.state_path.suffix + ".lock")
         ):
             payload = json.loads(read_private_text(self.state_path))
-        snapshot = SupervisorSnapshot.model_validate(payload)
+        snapshot, unknown_fields, preserved = (
+            SupervisorSnapshot.read_forward_compatible(payload)
+        )
+        # Identity FIRST. A `--state` pointing at another runtime or chain's file
+        # must be rejected before anything is written beside it — journaling skew
+        # there would stamp an unrelated snapshot's history with OUR chain_id,
+        # from a supervisor that never accepted the state (review round 2).
         if snapshot.runtime is not self.runtime or snapshot.chain_id != self.chain_id:
             raise ValueError("supervisor state does not match requested runtime/chain")
         if snapshot.run_spec_fingerprint != self.run_spec_fingerprint:
             raise ValueError("supervisor state run specification does not match")
+        self._preserved_unknown = preserved
+        if unknown_fields and unknown_fields != self._announced_version_skew:
+            # Report ONCE per distinct field set, not once per read. `_refresh`
+            # calls `_load` on every tick, and in AWAITING_ACK the CLI polls at
+            # SUCCESSOR_READY_POLL_SECONDS — repeating this would bury the
+            # acknowledgement failure it is meant to sit beside (review round 1).
+            self._announced_version_skew = unknown_fields
+            detail = (
+                "supervisor state contains field(s) this build does not know "
+                f"({', '.join(unknown_fields)}); it was written by a newer "
+                "agent-session-harness. Their values are preserved on rewrite. "
+                "The installed build is behind the one that wrote this state."
+            )
+            # Durable FIRST, announced second. `_announce_alarm` deliberately
+            # stays silent whenever stderr belongs to someone else — a terminal
+            # or a managed session — which is most of the time, so it alone
+            # cannot satisfy the reporting guarantee this change claims. The
+            # effect ledger is the surface that survives that (review round 1).
+            self._record_version_skew(unknown_fields)
+            _announce_alarm(detail)
         return snapshot
 
     def _persist(self) -> None:
+        # Merge back anything a newer build wrote that this one does not model.
+        # Tolerating unknown fields on READ but dropping them on WRITE would make
+        # this change destructive: the next heartbeat, alarm or phase transition
+        # rewrites the whole snapshot, and returning to the newer build would
+        # then find defaults where its durable values used to be — version skew
+        # silently erasing state rather than merely failing loudly, which is
+        # worse than the bug being fixed (review round 2).
+        payload = _merge_preserved(
+            self.snapshot.model_dump(mode="json"), self._preserved_unknown
+        )
         with exclusive_lock(
             self.state_path.with_suffix(self.state_path.suffix + ".lock")
         ):
             atomic_write_private_text(
                 self.state_path,
-                json.dumps(
-                    self.snapshot.model_dump(mode="json"),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n",
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
             )
+
+    def _record_version_skew(self, unknown_fields: tuple[str, ...]) -> None:
+        """Write version skew to the effect ledger — the surface that survives.
+
+        Deliberately not routed through `_effect`: that keys on
+        `chain_id:generation:effect`, and this is a property of the STATE FILE,
+        not of a generation's rotation. It is also written before `_load` has
+        returned, so `self.snapshot.generation` is not yet trustworthy here.
+
+        Best-effort: a diagnostic must never be the thing that stops a
+        supervisor from loading its own state.
+        """
+        payload = {
+            "schema_version": 1,
+            "effect_id": f"{self.chain_id}:state-read:version-skew",
+            "effect": "state-read",
+            "status": "version-skew",
+            "chain_id": self.chain_id,
+            "unknown_fields": list(unknown_fields),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        try:
+            with exclusive_lock(
+                self.effect_path.with_suffix(self.effect_path.suffix + ".lock")
+            ):
+                append_private_text(self.effect_path, encoded + "\n")
+        except (OSError, UnsafePathError):
+            # UnsafePathError derives from RuntimeError, NOT OSError, so a
+            # symlinked effects file or lock would otherwise escape this
+            # "best-effort" guard and abort `_load` before it could return a
+            # perfectly valid snapshot — an unwritable diagnostic taking down
+            # the recovery it exists to annotate (review round 2).
+            return
 
     def _effect(self, effect: str, status: str, *, generation: int) -> None:
         payload = {
@@ -1631,7 +1839,15 @@ def write_acknowledgement(
     state = lexical_absolute(state_path)
     acknowledged_pid = os.getpid() if owner_pid is None else owner_pid
     with exclusive_lock(state.with_suffix(state.suffix + ".lock")):
-        snapshot = SupervisorSnapshot.model_validate_json(read_private_text(state))
+        # Forward-compatible (BOU-2407): the successor writing its
+        # acknowledgement is the single most costly place to fail on version
+        # skew — a strict read here blocks the handoff the rotation exists to
+        # perform, on a file the predecessor just wrote successfully.
+        # `_preserved` is unused here on purpose: this function writes only the
+        # `.ack` sidecar, never the state file, so there is nothing to merge back.
+        snapshot, _unknown, _preserved = SupervisorSnapshot.read_forward_compatible(
+            json.loads(read_private_text(state))
+        )
         if snapshot.phase is not SupervisorPhase.AWAITING_ACK:
             raise ValueError("supervisor is not awaiting an acknowledgement")
         if generation != snapshot.generation:

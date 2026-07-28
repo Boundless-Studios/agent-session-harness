@@ -10,6 +10,7 @@ import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pydantic import ValidationError
 
 from agent_session_harness.activity import (
     ActivitySnapshot,
@@ -21,7 +22,7 @@ from agent_session_harness.coordinator import (
     ClaimHandle,
     FenceResult,
 )
-from agent_session_harness.models import Confidence
+from agent_session_harness.models import Confidence, Runtime
 
 NOW = datetime(2026, 7, 19, 6, 0, tzinfo=UTC)
 
@@ -2730,3 +2731,252 @@ def test_a_fast_poll_interval_cannot_alarm_on_a_young_session(tmp_path) -> None:
     assert snapshot.runtime_silence_streak == 4
     assert snapshot.runtime_silence_since is not None
     assert checkpoints.calls == []
+
+
+# ---------------------------------------------------------------------------
+# BOU-2407: persisted state must survive a field this build predates
+# ---------------------------------------------------------------------------
+
+# `run_spec_fingerprint` is a sha256 hex digest (min_length=64).
+_FINGERPRINT = "a" * 64
+
+
+def test_snapshot_read_tolerates_and_reports_a_field_from_a_newer_build() -> None:
+    """A newer build's field must not make an older reader fail outright.
+
+    `_persist` writes every field, so the moment a newer harness writes the
+    state file, an older reader that forbids the new key cannot validate it at
+    all — mixed-version execution and rollback both break precisely when a live
+    session may need recovery. It fired for real when `supervision_alarm` was
+    added (BOU-2389), and `liveness_alarm`/`usage_alarm` had the same property
+    (BOU-2222, with BOU-2245 as the gaia-side fallout).
+    """
+    _process, supervisor = _modules()
+
+    payload = supervisor.SupervisorSnapshot(
+        runtime=Runtime.CLAUDE, chain_id="chain-1", run_spec_fingerprint=_FINGERPRINT
+    ).model_dump(mode="json")
+    payload["a_field_from_the_future"] = {"nested": True}
+    payload["another_one"] = 7
+
+    snapshot, unknown, preserved = (
+        supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+    )
+
+    assert snapshot.chain_id == "chain-1"
+    assert unknown == ("a_field_from_the_future", "another_one"), (
+        "unknown keys must be REPORTED, not silently swallowed — version skew is "
+        "exactly what an operator debugging odd behaviour needs to be told"
+    )
+    assert preserved == {
+        "a_field_from_the_future": {"nested": True},
+        "another_one": 7,
+    }
+
+
+def test_snapshot_read_still_rejects_a_corrupt_known_field() -> None:
+    """Only UNKNOWN keys are forgiven; the strictness that catches torn state stays."""
+    _process, supervisor = _modules()
+
+    payload = supervisor.SupervisorSnapshot(
+        runtime=Runtime.CLAUDE, chain_id="chain-1", run_spec_fingerprint=_FINGERPRINT
+    ).model_dump(mode="json")
+    payload["generation"] = "not-an-int"
+
+    with pytest.raises(ValidationError):
+        supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+
+
+def test_snapshot_construction_still_forbids_unknown_keyword() -> None:
+    """`extra="forbid"` is kept on purpose — a typo'd kwarg in OUR code is a bug."""
+    _process, supervisor = _modules()
+
+    with pytest.raises(ValidationError):
+        supervisor.SupervisorSnapshot(
+            runtime=Runtime.CLAUDE,
+            chain_id="chain-1",
+            run_spec_fingerprint=_FINGERPRINT,
+            nonexistent_field=1,
+        )
+
+
+def test_supervisor_loads_a_state_file_written_by_a_newer_build(tmp_path) -> None:
+    """End-to-end: `_load` must recover a session whose state file is ahead of it.
+
+    This is the case that actually strands an operator — the state file is on
+    disk, the session needs recovery, and the installed supervisor refuses to
+    read its own state.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["field_added_by_a_later_release"] = "surprise"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = managed._load()
+
+    assert reloaded.chain_id == managed.snapshot.chain_id
+    assert reloaded.generation == managed.snapshot.generation
+
+
+@pytest.mark.parametrize(
+    "corrupt", [None, "a string", [1, 2, 3]], ids=["null", "string", "array"]
+)
+def test_a_non_object_state_file_still_raises_validationerror(corrupt) -> None:
+    """Corrupt-but-valid JSON must stay a `ValidationError`, not a traceback.
+
+    `ValidationError` is a `ValueError`, which the CLI's error handling already
+    catches. Iterating a non-mapping payload would instead surface a `TypeError`
+    (for `null`) or an `AttributeError` (for a string), so `status` and
+    `supervise` would print a traceback for a corrupt snapshot they used to
+    report cleanly (review round 1).
+    """
+    _process, supervisor = _modules()
+
+    with pytest.raises(ValidationError):
+        supervisor.SupervisorSnapshot.read_forward_compatible(corrupt)
+
+
+def test_an_additive_field_inside_a_nested_model_is_also_tolerated() -> None:
+    """Nested persisted models declare their own `extra="forbid"`.
+
+    Filtering only the top level leaves `claim` a KNOWN key, so validation
+    delegates into `ClaimHandle`, which rejects the nested addition — an
+    additive field in claim metadata would still block mixed-version recovery
+    even after every caller adopted the helper (review round 1).
+    """
+    _process, supervisor = _modules()
+
+    snapshot = supervisor.SupervisorSnapshot(
+        runtime=Runtime.CLAUDE,
+        chain_id="chain-1",
+        run_spec_fingerprint=_FINGERPRINT,
+        claim=ClaimHandle(
+            claim_id="claim-1",
+            lease_epoch=1,
+            task_type="session",
+            task_id="chain-1",
+            task_fingerprint="fp",
+            owner_session_id="chain-1:0",
+        ),
+    )
+    payload = snapshot.model_dump(mode="json")
+    payload["claim"]["a_nested_future_field"] = "surprise"
+
+    restored, unknown, preserved = (
+        supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+    )
+
+    assert restored.claim is not None
+    assert restored.claim.claim_id == "claim-1"
+    assert unknown == ("claim.a_nested_future_field",), (
+        "the dropped key must be reported with its path, so an operator can see "
+        f"WHERE the skew is. Got: {unknown}"
+    )
+    assert preserved == {"claim": {"a_nested_future_field": "surprise"}}
+
+
+def test_supervisor_preserves_unknown_fields_when_rewriting_state(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["future_top_level"] = {"enabled": True}
+    payload["claim"] = None
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    managed.snapshot = managed._load()
+    managed._persist()
+
+    rewritten = json.loads(state_path.read_text(encoding="utf-8"))
+    assert rewritten["future_top_level"] == {"enabled": True}
+
+
+def test_mismatched_state_is_rejected_before_skew_is_recorded(tmp_path) -> None:
+    """Identity is checked BEFORE anything is journaled (review round 2).
+
+    A `--state` pointing at another runtime or chain's snapshot must be rejected
+    without writing beside it — otherwise the skew record lands in an unrelated
+    file's history stamped with OUR chain_id, from a supervisor that never
+    accepted the state.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    effects_path = tmp_path / "supervisor.json.events"
+    # `start()` legitimately writes effects, so the assertion below is about the
+    # SKEW record specifically, not about the file being absent.
+    before = effects_path.read_text(encoding="utf-8") if effects_path.exists() else ""
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["chain_id"] = "some-other-chain"
+    payload["future_field"] = 1
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runtime/chain"):
+        managed._load()
+
+    after = effects_path.read_text(encoding="utf-8") if effects_path.exists() else ""
+    assert "version-skew" not in after, (
+        "skew was journaled for a snapshot this supervisor rejected on identity"
+    )
+    assert after == before, "nothing at all should have been appended"
+
+
+def test_unsafe_skew_diagnostic_does_not_abort_state_recovery(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["future_field"] = 1
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+    # `start()` already created the real lock, so replace it with a symlink —
+    # the shape `exclusive_lock` refuses with UnsafePathError (a RuntimeError,
+    # NOT an OSError, which is exactly why the best-effort guard missed it).
+    lock = tmp_path / "supervisor.json.events.lock"
+    lock.unlink(missing_ok=True)
+    lock.symlink_to(tmp_path / "redirected.lock")
+
+    restored = managed._load()
+
+    assert restored.chain_id == managed.chain_id, (
+        "an unwritable diagnostic must not abort recovery of a perfectly valid "
+        "snapshot — the annotation cannot take down the thing it annotates"
+    )
+
+
+def test_version_skew_is_announced_once_and_recorded_durably(tmp_path, capsys) -> None:
+    """Report once per distinct field set, and to a surface that survives.
+
+    `_refresh` calls `_load` every tick and AWAITING_ACK polls hard, so a
+    per-read announcement would bury the acknowledgement failure it sits beside.
+    And `_announce_alarm` stays silent whenever stderr belongs to someone else —
+    a terminal or a managed session, i.e. most of the time — so the effect ledger
+    is what actually delivers the reporting guarantee (review round 1).
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["field_from_the_future"] = 1
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    for _ in range(4):
+        managed._load()
+
+    effects = (tmp_path / "supervisor.json.events").read_text(encoding="utf-8")
+    skew_lines = [
+        line
+        for line in effects.splitlines()
+        if '"status":"version-skew"' in line.replace(" ", "")
+    ]
+    assert len(skew_lines) == 1, (
+        f"expected exactly one durable skew record across 4 loads, got "
+        f"{len(skew_lines)}"
+    )
+    assert "field_from_the_future" in skew_lines[0]
