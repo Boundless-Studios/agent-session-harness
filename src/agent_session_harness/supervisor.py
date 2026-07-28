@@ -1037,7 +1037,9 @@ class Supervisor:
 
     def _clear_stop_request_marker(self) -> None:
         """Drop the `.stop-request` marker; best-effort by design."""
-        from .hooks.command import stop_request_path  # noqa: PLC0415
+        # Local import: `hooks.command` imports this module, so a top-level
+        # import here would be circular.
+        from .hooks.command import stop_request_path
 
         marker = stop_request_path(self.state_path)
         try:
