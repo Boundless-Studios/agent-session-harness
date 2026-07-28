@@ -473,6 +473,9 @@ class Supervisor:
         # Last version-skew field set already reported, so `_load` announces once
         # per distinct set rather than on every tick (BOU-2407 review).
         self._announced_version_skew: tuple[str, ...] = ()
+        # Durable journaling has separate retry state: stderr may be announced
+        # once even when the first effect-ledger append temporarily fails.
+        self._recorded_version_skew: tuple[str, ...] = ()
         # Values a newer build wrote that this one does not model, merged back on
         # every `_persist` so an older supervisor cannot erase them (BOU-2407
         # review round 2).
@@ -1324,6 +1327,11 @@ class Supervisor:
                 self._effect("claim", "started", generation=target)
                 claimed_at = self._now()
                 claim = self._claim(owner_session_id, now=claimed_at)
+                # Preserved nested fields belong to the predecessor ClaimHandle.
+                # A replacement is a new durable object; copying unknown metadata
+                # across that identity boundary can attach predecessor state to
+                # the successor claim.
+                self._preserved_unknown.pop("claim", None)
                 self.snapshot = self.snapshot.model_copy(
                     update={
                         "generation": target,
@@ -1677,25 +1685,25 @@ class Supervisor:
         if snapshot.run_spec_fingerprint != self.run_spec_fingerprint:
             raise ValueError("supervisor state run specification does not match")
         self._preserved_unknown = preserved
-        if unknown_fields and unknown_fields != self._announced_version_skew:
-            # Report ONCE per distinct field set, not once per read. `_refresh`
-            # calls `_load` on every tick, and in AWAITING_ACK the CLI polls at
-            # SUCCESSOR_READY_POLL_SECONDS — repeating this would bury the
-            # acknowledgement failure it is meant to sit beside (review round 1).
-            self._announced_version_skew = unknown_fields
+        if unknown_fields:
             detail = (
                 "supervisor state contains field(s) this build does not know "
                 f"({', '.join(unknown_fields)}); it was written by a newer "
                 "agent-session-harness. Their values are preserved on rewrite. "
                 "The installed build is behind the one that wrote this state."
             )
-            # Durable FIRST, announced second. `_announce_alarm` deliberately
-            # stays silent whenever stderr belongs to someone else — a terminal
-            # or a managed session — which is most of the time, so it alone
-            # cannot satisfy the reporting guarantee this change claims. The
-            # effect ledger is the surface that survives that (review round 1).
-            self._record_version_skew(unknown_fields)
-            _announce_alarm(detail)
+            # Durable and stderr delivery have separate state. A failed append
+            # must be retried even though the human-facing alarm is deduplicated.
+            if unknown_fields != self._recorded_version_skew and (
+                self._record_version_skew(unknown_fields)
+            ):
+                self._recorded_version_skew = unknown_fields
+            if unknown_fields != self._announced_version_skew:
+                # Report ONCE per distinct field set, not once per read.
+                # `_refresh` calls `_load` on every tick, and in AWAITING_ACK
+                # the CLI polls hard enough to bury useful diagnostics.
+                self._announced_version_skew = unknown_fields
+                _announce_alarm(detail)
         return snapshot
 
     def _persist(self) -> None:
@@ -1717,7 +1725,7 @@ class Supervisor:
                 json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
             )
 
-    def _record_version_skew(self, unknown_fields: tuple[str, ...]) -> None:
+    def _record_version_skew(self, unknown_fields: tuple[str, ...]) -> bool:
         """Write version skew to the effect ledger — the surface that survives.
 
         Deliberately not routed through `_effect`: that keys on
@@ -1749,7 +1757,8 @@ class Supervisor:
             # "best-effort" guard and abort `_load` before it could return a
             # perfectly valid snapshot — an unwritable diagnostic taking down
             # the recovery it exists to annotate (review round 2).
-            return
+            return False
+        return True
 
     def _effect(self, effect: str, status: str, *, generation: int) -> None:
         payload = {
