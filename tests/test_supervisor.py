@@ -39,6 +39,7 @@ def _activity(
     quiescence: Quiescence,
     *,
     handoff_requested_generations: frozenset[int] = frozenset(),
+    pre_compact_generations: frozenset[int] = frozenset(),
 ) -> ActivitySnapshot:
     active = frozenset({"active"}) if quiescence is Quiescence.BUSY else frozenset()
     return ActivitySnapshot(
@@ -51,6 +52,7 @@ def _activity(
         last_event_at=NOW,
         integrity_warnings=(),
         handoff_requested_generations=handoff_requested_generations,
+        pre_compact_generations=pre_compact_generations,
     )
 
 
@@ -2730,3 +2732,63 @@ def test_a_fast_poll_interval_cannot_alarm_on_a_young_session(tmp_path) -> None:
     assert snapshot.runtime_silence_streak == 4
     assert snapshot.runtime_silence_since is not None
     assert checkpoints.calls == []
+
+
+def test_runtime_self_compaction_releases_the_drain(tmp_path) -> None:
+    """`context.pre_compact` cancels an in-flight drain (BOU-2565).
+
+    Codex auto-compacts itself at ~90%, always ABOVE our 70% rotate threshold,
+    so every sufficiently long Codex session latched DRAINING, self-compacted
+    down to ~15%, and then sat in DRAINING forever — told on every Stop to
+    checkpoint and stop working while holding 17-35% context. Rotation could not
+    complete either, because `_advance_rotation` withholds on a faulted liveness
+    and liveness flaps as sub-invocations come and go.
+
+    Deliberately NOT driven by the percentage falling: that path only runs for a
+    non-UNKNOWN sample, and these chains sit at `context_confidence: unknown`
+    for hundreds of ticks. The compaction event does not go through sampling at
+    all, so it is the one signal that actually arrives.
+    """
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+
+    snapshot = managed.tick(
+        _activity(Quiescence.BUSY, pre_compact_generations=frozenset({0}))
+    )
+
+    assert snapshot.phase.value == "running", (
+        "the runtime compacted its own context, which is the same recovery the "
+        "rotation was going to perform — the drain must be released instead of "
+        "latching the session at 'stop working' for the rest of its life"
+    )
+    assert snapshot.warning_emitted is False, (
+        "clearing warning_emitted lets a genuine later climb warn again"
+    )
+    assert checkpoints.calls == [], "releasing a drain must not checkpoint"
+
+
+def test_self_compaction_does_not_abandon_a_committed_rotation(tmp_path) -> None:
+    """Past DRAINING the rotation is already in flight and must not be cancelled.
+
+    A checkpoint or coordinator fence has side effects a late compaction event
+    cannot undo, so the release is scoped to DRAINING only.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+    # Quiescent + handoff requested drives the rotation past DRAINING.
+    advanced = managed.tick(_handoff_activity())
+    assert advanced.phase.value != "draining", "setup: rotation must have advanced"
+
+    after = managed.tick(
+        _activity(Quiescence.IDLE, pre_compact_generations=frozenset({0}))
+    )
+    assert after.phase.value != "running", (
+        "a compaction event arriving after the rotation committed must not roll "
+        f"it back to RUNNING; got {after.phase.value}"
+    )

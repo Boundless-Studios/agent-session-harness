@@ -440,3 +440,49 @@ def test_integrity_warnings_alone_do_not_claim_the_hooks_are_dead(tmp_path) -> N
 
     assert snapshot.quiescence is activity.Quiescence.UNKNOWN
     assert snapshot.runtime_liveness is activity.RuntimeLiveness.REPORTING
+
+
+def test_pre_compact_events_are_folded_per_generation(tmp_path) -> None:
+    """`context.pre_compact` must reach the supervisor as a generation set.
+
+    The event type and its `PreCompact` hook mapping already existed but nothing
+    consumed them — it was a dead event. BOU-2565 makes it the signal that
+    releases a latched drain, so the fold is the production wiring that makes
+    that work; the supervisor tests inject ActivitySnapshot directly and would
+    not catch its absence.
+    """
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+
+    ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "event-2",
+            "context.pre_compact",
+            generation=3,
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.pre_compact_generations == frozenset({3})
+
+
+def test_pre_compact_is_absent_when_the_runtime_never_compacted(tmp_path) -> None:
+    """Control: the set stays empty, so a drain is never released by accident."""
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.pre_compact_generations == frozenset()

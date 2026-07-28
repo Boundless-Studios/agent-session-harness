@@ -114,6 +114,7 @@ class EventLedger:
         active_critical_sections: Counter[str] = Counter()
         reaped_tools: set[str] = set()
         handoff_requested_generations: set[int] = set()
+        pre_compact_generations: set[int] = set()
         last_event_at: datetime | None = None
         last_hook_event_at: datetime | None = None
         processed = 0
@@ -195,6 +196,8 @@ class EventLedger:
                     active_tools.clear()
             elif event.event_type is EventType.HANDOFF_REQUESTED:
                 handoff_requested_generations.add(event.generation)
+            elif event.event_type is EventType.PRE_COMPACT:
+                pre_compact_generations.add(event.generation)
 
         active_groups = (
             active_turns,
@@ -226,6 +229,7 @@ class EventLedger:
             integrity_warnings=tuple(warning.message for warning in warnings),
             reaped_tool_ids=frozenset(reaped_tools),
             handoff_requested_generations=frozenset(handoff_requested_generations),
+            pre_compact_generations=frozenset(pre_compact_generations),
         )
 
     def _read_events(

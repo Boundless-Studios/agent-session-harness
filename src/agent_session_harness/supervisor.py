@@ -691,6 +691,7 @@ class Supervisor:
             SupervisorPhase.DRAINING,
         }:
             self._observe_usage()
+            self._release_drain_on_self_compaction(activity)
             # BOU-2222: evaluated in RUNNING and WARNING too. A session whose
             # hooks are dead is already broken there; waiting until it reaches
             # DRAINING to notice means the first symptom is a session that has
@@ -950,7 +951,60 @@ class Supervisor:
                 "ticks; rotation decisions now use unverified context"
             )
 
+    def _release_drain_on_self_compaction(self, activity: ActivitySnapshot) -> None:
+        """Let the runtime's OWN compaction cancel a drain (BOU-2565).
+
+        The percentage-based demotion in ``_apply_usage_thresholds`` cannot save
+        the sessions this was filed for: ``_observe_usage`` only calls it when
+        the sample is not UNKNOWN, and the captured chain had
+        ``context_confidence: unknown`` for 121 consecutive ticks. So a
+        confidence-gated recovery never fires on exactly the runtimes that latch.
+
+        ``context.pre_compact`` does not go through usage sampling at all -- it
+        is the runtime telling us it is compacting itself. That makes it the only
+        signal that reliably arrives for a latched session, and it means the same
+        thing a rotation means: the context is about to be reclaimed. Treat it as
+        an implicit ``cancel_rotation``.
+
+        Only from DRAINING. Past that a checkpoint or fence is already in flight
+        and must not be silently abandoned.
+        """
+        if self.snapshot.phase is not SupervisorPhase.DRAINING:
+            return
+        if self.snapshot.generation not in activity.pre_compact_generations:
+            return
+        self.snapshot = self.snapshot.model_copy(
+            update={
+                "phase": SupervisorPhase.RUNNING,
+                "warning_emitted": False,
+            }
+        )
+        self._persist()
+        self._effect(
+            "rotation",
+            "canceled-by-self-compaction",
+            generation=self.snapshot.generation,
+        )
+
     def _apply_usage_thresholds(self, context_percent: float) -> None:
+        # BOU-2565 deliberately does NOT add a "context fell back below
+        # warn_percent -> RUNNING" demotion here, though that is the obvious
+        # reading of the symptom. Two reasons:
+        #
+        #   1. `test_supervisor_warns_drains_waits_then_rotates_without_overlap`
+        #      pins the opposite contract on purpose — a drop to 10% mid-drain
+        #      must keep DRAINING. Once a rotation is committed, a falling
+        #      percentage does not cancel it.
+        #   2. It could not fix the reported sessions anyway. `_observe_usage`
+        #      only calls this when the sample is not UNKNOWN, and the captured
+        #      chain sat at `context_confidence: unknown` for 121 consecutive
+        #      ticks — so a confidence-gated demotion never fires on exactly the
+        #      runtimes that latch.
+        #
+        # The release is driven by `context.pre_compact` instead: a positive
+        # signal that the runtime reclaimed its own context, not an inference
+        # from a percentage that may just be noise. See
+        # `_release_drain_on_self_compaction`.
         if (
             self.snapshot.phase is SupervisorPhase.RUNNING
             and context_percent >= self.warn_percent

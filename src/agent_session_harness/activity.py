@@ -46,6 +46,11 @@ class ActivitySnapshot:
     last_event_at: datetime | None
     integrity_warnings: tuple[str, ...]
     handoff_requested_generations: frozenset[int] = frozenset()
+    # Generations in which the runtime announced its OWN context compaction
+    # (`context.pre_compact`). This is the only context signal that does not
+    # depend on usage sampling, so it is the one that can release a drain when
+    # sampling has gone non-confident (BOU-2565).
+    pre_compact_generations: frozenset[int] = frozenset()
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
     # Tool starts closed by turn-idle reconciliation rather than by their own
     # finish event (BOU-2236). Reported for observability only -- these are NOT
