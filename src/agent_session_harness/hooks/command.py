@@ -395,7 +395,15 @@ def _read_snapshot(path: Path) -> SupervisorSnapshot:
             encoded = read_private_text(path)
         except FileNotFoundError as exc:
             raise RuntimeError("supervisor state is unavailable") from exc
-        return SupervisorSnapshot.model_validate_json(encoded)
+        # Forward-compatible (BOU-2407): SessionStart/Stop hooks read the same
+        # durable state the supervisor writes. If a newer build adds an optional
+        # field, a strict read here would raise `extra_forbidden` and block the
+        # hook — and therefore the handoff — even when the supervisor itself
+        # loaded the file successfully.
+        snapshot, _unknown = SupervisorSnapshot.read_forward_compatible(
+            json.loads(encoded)
+        )
+        return snapshot
 
 
 def _validate_snapshot(

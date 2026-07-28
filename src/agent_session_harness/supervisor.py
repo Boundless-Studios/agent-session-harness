@@ -10,7 +10,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -135,6 +135,51 @@ _DETACHED_ALARM = (
 )
 
 
+def _model_type_of(annotation: object) -> type[BaseModel] | None:
+    """The BaseModel a field annotation resolves to, unwrapping `X | None`."""
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    for arg in get_args(annotation):
+        if isinstance(arg, type) and issubclass(arg, BaseModel):
+            return arg
+    return None
+
+
+def _strip_unknown_fields(
+    model: type[BaseModel],
+    payload: object,
+    *,
+    path: str,
+    found: list[str],
+) -> object:
+    """Recursively drop keys ``model`` does not declare, recording dotted names.
+
+    Non-mapping payloads are returned untouched so Pydantic — not this function
+    — decides they are invalid. That keeps a corrupt state file raising
+    `ValidationError` (a `ValueError` the CLI already handles) rather than a
+    `TypeError` from iterating `null` or an `AttributeError` from a string
+    (BOU-2407 review round 1).
+    """
+    if not isinstance(payload, dict):
+        return payload
+    fields = model.model_fields
+    cleaned: dict[str, object] = {}
+    for key, value in payload.items():
+        name = str(key)
+        dotted = f"{path}{name}"
+        field = fields.get(name)
+        if field is None:
+            found.append(dotted)
+            continue
+        nested = _model_type_of(field.annotation)
+        cleaned[name] = (
+            _strip_unknown_fields(nested, value, path=f"{dotted}.", found=found)
+            if nested is not None
+            else value
+        )
+    return cleaned
+
+
 class SupervisorPhase(str, Enum):
     INITIAL = "initial"
     RUNNING = "running"
@@ -236,12 +281,12 @@ class SupervisorSnapshot(BaseModel):
 
     @classmethod
     def read_forward_compatible(
-        cls, payload: dict[str, object]
+        cls, payload: object
     ) -> tuple[SupervisorSnapshot, tuple[str, ...]]:
         """Validate persisted state, tolerating fields written by a newer build.
 
-        Returns the snapshot plus the sorted names of any dropped keys, so a
-        caller can surface version skew instead of silently discarding it.
+        Returns the snapshot plus the sorted, dotted names of any dropped keys,
+        so a caller can surface version skew instead of silently discarding it.
 
         Only UNKNOWN keys are forgiven. A torn or corrupt file still fails: bad
         JSON raises in `json.loads` before this is reached, and a known field
@@ -249,12 +294,21 @@ class SupervisorSnapshot(BaseModel):
         changes is that "a key I don't recognise" stops being fatal — and that
         case is indistinguishable from "written by a newer build", which is
         precisely why it must not be.
+
+        The strip is RECURSIVE. Nested persisted models (`claim`) declare their
+        own ``extra="forbid"``, so filtering only the top level would still let
+        an additive field inside `ClaimHandle` block mixed-version recovery —
+        the top-level `claim` key is known, and validation then delegates into a
+        model that rejects the addition anyway (review round 1).
+
+        A non-mapping payload is handed straight to Pydantic rather than
+        iterated, so a corrupt state file holding `null`, a string, or an array
+        still raises `ValidationError` — a `ValueError` the CLI already handles —
+        instead of a `TypeError`/`AttributeError` traceback.
         """
-        known = set(cls.model_fields)
-        unknown = tuple(sorted(str(key) for key in payload if key not in known))
-        if unknown:
-            payload = {k: v for k, v in payload.items() if k in known}
-        return cls.model_validate(payload), unknown
+        unknown: list[str] = []
+        cleaned = _strip_unknown_fields(cls, payload, path="", found=unknown)
+        return cls.model_validate(cleaned), tuple(sorted(unknown))
 
     schema_version: Literal[1] = 1
     runtime: Runtime
@@ -381,6 +435,9 @@ class Supervisor:
         self.effect_path = self.state_path.with_suffix(
             self.state_path.suffix + ".events"
         )
+        # Last version-skew field set already reported, so `_load` announces once
+        # per distinct set rather than on every tick (BOU-2407 review).
+        self._announced_version_skew: tuple[str, ...] = ()
         self.transition_lock_path = self.state_path.with_suffix(
             self.state_path.suffix + ".transition.lock"
         )
@@ -1570,17 +1627,25 @@ class Supervisor:
         ):
             payload = json.loads(read_private_text(self.state_path))
         snapshot, unknown_fields = SupervisorSnapshot.read_forward_compatible(payload)
-        if unknown_fields:
-            # Version skew is worth saying out loud: this state file was written
-            # by a newer build than the one now reading it. We proceed (that is
-            # the whole point of BOU-2407) but an operator debugging odd
-            # behaviour should not have to infer it.
-            _announce_alarm(
+        if unknown_fields and unknown_fields != self._announced_version_skew:
+            # Report ONCE per distinct field set, not once per read. `_refresh`
+            # calls `_load` on every tick, and in AWAITING_ACK the CLI polls at
+            # SUCCESSOR_READY_POLL_SECONDS — repeating this would bury the
+            # acknowledgement failure it is meant to sit beside (review round 1).
+            self._announced_version_skew = unknown_fields
+            detail = (
                 "supervisor state contains field(s) this build does not know "
                 f"({', '.join(unknown_fields)}); it was written by a newer "
                 "agent-session-harness. Ignoring them and continuing — but the "
                 "installed build is behind the one that wrote this state."
             )
+            # Durable FIRST, announced second. `_announce_alarm` deliberately
+            # stays silent whenever stderr belongs to someone else — a terminal
+            # or a managed session — which is most of the time, so it alone
+            # cannot satisfy the reporting guarantee this change claims. The
+            # effect ledger is the surface that survives that (review round 1).
+            self._record_version_skew(unknown_fields)
+            _announce_alarm(detail)
         if snapshot.runtime is not self.runtime or snapshot.chain_id != self.chain_id:
             raise ValueError("supervisor state does not match requested runtime/chain")
         if snapshot.run_spec_fingerprint != self.run_spec_fingerprint:
@@ -1600,6 +1665,35 @@ class Supervisor:
                 )
                 + "\n",
             )
+
+    def _record_version_skew(self, unknown_fields: tuple[str, ...]) -> None:
+        """Write version skew to the effect ledger — the surface that survives.
+
+        Deliberately not routed through `_effect`: that keys on
+        `chain_id:generation:effect`, and this is a property of the STATE FILE,
+        not of a generation's rotation. It is also written before `_load` has
+        returned, so `self.snapshot.generation` is not yet trustworthy here.
+
+        Best-effort: a diagnostic must never be the thing that stops a
+        supervisor from loading its own state.
+        """
+        payload = {
+            "schema_version": 1,
+            "effect_id": f"{self.chain_id}:state-read:version-skew",
+            "effect": "state-read",
+            "status": "version-skew",
+            "chain_id": self.chain_id,
+            "unknown_fields": list(unknown_fields),
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        try:
+            with exclusive_lock(
+                self.effect_path.with_suffix(self.effect_path.suffix + ".lock")
+            ):
+                append_private_text(self.effect_path, encoded + "\n")
+        except OSError:
+            return
 
     def _effect(self, effect: str, status: str, *, generation: int) -> None:
         payload = {
@@ -1689,7 +1783,13 @@ def write_acknowledgement(
     state = lexical_absolute(state_path)
     acknowledged_pid = os.getpid() if owner_pid is None else owner_pid
     with exclusive_lock(state.with_suffix(state.suffix + ".lock")):
-        snapshot = SupervisorSnapshot.model_validate_json(read_private_text(state))
+        # Forward-compatible (BOU-2407): the successor writing its
+        # acknowledgement is the single most costly place to fail on version
+        # skew — a strict read here blocks the handoff the rotation exists to
+        # perform, on a file the predecessor just wrote successfully.
+        snapshot, _unknown = SupervisorSnapshot.read_forward_compatible(
+            json.loads(read_private_text(state))
+        )
         if snapshot.phase is not SupervisorPhase.AWAITING_ACK:
             raise ValueError("supervisor is not awaiting an acknowledgement")
         if generation != snapshot.generation:

@@ -2813,3 +2813,90 @@ def test_supervisor_loads_a_state_file_written_by_a_newer_build(tmp_path) -> Non
 
     assert reloaded.chain_id == managed.snapshot.chain_id
     assert reloaded.generation == managed.snapshot.generation
+
+
+@pytest.mark.parametrize(
+    "corrupt", [None, "a string", [1, 2, 3]], ids=["null", "string", "array"]
+)
+def test_a_non_object_state_file_still_raises_validationerror(corrupt) -> None:
+    """Corrupt-but-valid JSON must stay a `ValidationError`, not a traceback.
+
+    `ValidationError` is a `ValueError`, which the CLI's error handling already
+    catches. Iterating a non-mapping payload would instead surface a `TypeError`
+    (for `null`) or an `AttributeError` (for a string), so `status` and
+    `supervise` would print a traceback for a corrupt snapshot they used to
+    report cleanly (review round 1).
+    """
+    _process, supervisor = _modules()
+
+    with pytest.raises(ValidationError):
+        supervisor.SupervisorSnapshot.read_forward_compatible(corrupt)
+
+
+def test_an_additive_field_inside_a_nested_model_is_also_tolerated() -> None:
+    """Nested persisted models declare their own `extra="forbid"`.
+
+    Filtering only the top level leaves `claim` a KNOWN key, so validation
+    delegates into `ClaimHandle`, which rejects the nested addition — an
+    additive field in claim metadata would still block mixed-version recovery
+    even after every caller adopted the helper (review round 1).
+    """
+    _process, supervisor = _modules()
+
+    snapshot = supervisor.SupervisorSnapshot(
+        runtime=Runtime.CLAUDE,
+        chain_id="chain-1",
+        run_spec_fingerprint=_FINGERPRINT,
+        claim=ClaimHandle(
+            claim_id="claim-1",
+            lease_epoch=1,
+            task_type="session",
+            task_id="chain-1",
+            task_fingerprint="fp",
+            owner_session_id="chain-1:0",
+        ),
+    )
+    payload = snapshot.model_dump(mode="json")
+    payload["claim"]["a_nested_future_field"] = "surprise"
+
+    restored, unknown = supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+
+    assert restored.claim is not None
+    assert restored.claim.claim_id == "claim-1"
+    assert unknown == ("claim.a_nested_future_field",), (
+        "the dropped key must be reported with its path, so an operator can see "
+        f"WHERE the skew is. Got: {unknown}"
+    )
+
+
+def test_version_skew_is_announced_once_and_recorded_durably(tmp_path, capsys) -> None:
+    """Report once per distinct field set, and to a surface that survives.
+
+    `_refresh` calls `_load` every tick and AWAITING_ACK polls hard, so a
+    per-read announcement would bury the acknowledgement failure it sits beside.
+    And `_announce_alarm` stays silent whenever stderr belongs to someone else —
+    a terminal or a managed session, i.e. most of the time — so the effect ledger
+    is what actually delivers the reporting guarantee (review round 1).
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["field_from_the_future"] = 1
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    for _ in range(4):
+        managed._load()
+
+    effects = (tmp_path / "supervisor.json.events").read_text(encoding="utf-8")
+    skew_lines = [
+        line
+        for line in effects.splitlines()
+        if '"status":"version-skew"' in line.replace(" ", "")
+    ]
+    assert len(skew_lines) == 1, (
+        f"expected exactly one durable skew record across 4 loads, got "
+        f"{len(skew_lines)}"
+    )
+    assert "field_from_the_future" in skew_lines[0]
