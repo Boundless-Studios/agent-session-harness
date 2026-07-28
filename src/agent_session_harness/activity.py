@@ -51,6 +51,13 @@ class ActivitySnapshot:
     # depend on usage sampling, so it is the one that can release a drain when
     # sampling has gone non-confident (BOU-2565).
     pre_compact_generations: frozenset[int] = frozenset()
+    # How many compaction events the ledger has EVER reported. Membership above
+    # is a fold over retained history, so it stays true forever once a
+    # generation has compacted once — it answers "has this generation ever
+    # compacted", never "is this a new signal". A consumer that must act once
+    # per event needs a watermark it can compare against what it already acted
+    # on; this is that watermark. Monotonic and bounded (BOU-2565 review).
+    pre_compact_seen: int = 0
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
     # Tool starts closed by turn-idle reconciliation rather than by their own
     # finish event (BOU-2236). Reported for observability only -- these are NOT

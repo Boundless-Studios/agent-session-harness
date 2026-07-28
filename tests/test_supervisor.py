@@ -40,6 +40,7 @@ def _activity(
     *,
     handoff_requested_generations: frozenset[int] = frozenset(),
     pre_compact_generations: frozenset[int] = frozenset(),
+    pre_compact_seen: int | None = None,
 ) -> ActivitySnapshot:
     active = frozenset({"active"}) if quiescence is Quiescence.BUSY else frozenset()
     return ActivitySnapshot(
@@ -53,6 +54,9 @@ def _activity(
         integrity_warnings=(),
         handoff_requested_generations=handoff_requested_generations,
         pre_compact_generations=pre_compact_generations,
+        pre_compact_seen=pre_compact_seen
+        if pre_compact_seen is not None
+        else len(pre_compact_generations),
     )
 
 
@@ -2791,4 +2795,73 @@ def test_self_compaction_does_not_abandon_a_committed_rotation(tmp_path) -> None
     assert after.phase.value != "running", (
         "a compaction event arriving after the rotation committed must not roll "
         f"it back to RUNNING; got {after.phase.value}"
+    )
+
+
+def test_a_stale_compaction_cannot_release_a_second_drain(tmp_path) -> None:
+    """One compaction releases at most ONE drain (BOU-2565 review, P1).
+
+    `pre_compact_generations` is a fold over RETAINED history, so once a
+    generation has compacted it stays in that set forever. If membership were
+    the trigger, context regrowing to the rotate threshold in the same
+    generation would enter DRAINING and be released again off the same stale
+    event — on every tick, permanently disabling rotation, because the
+    generation can only advance THROUGH a rotation.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+    released = managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=1
+        )
+    )
+    assert released.phase.value == "running", "setup: the first compaction releases"
+
+    # Context regrows in the SAME generation. The ledger still reports the old
+    # event, but the watermark has not moved.
+    managed.usage_reader.percent = 70.0
+    redrained = managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=1
+        )
+    )
+
+    assert redrained.phase.value == "draining", (
+        "a compaction already consumed must not cancel the NEXT rotation — "
+        "otherwise the session can never rotate again, which is a worse latch "
+        f"than the one this fix removes. Got {redrained.phase.value}"
+    )
+
+
+def test_a_second_real_compaction_still_releases(tmp_path) -> None:
+    """Control: the watermark must not make the fix a one-shot per generation.
+
+    A genuinely NEW compaction is a fresh reason the rotation is moot, even in a
+    generation that already compacted once.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=1
+        )
+    )
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+
+    # The runtime compacts a SECOND time: the watermark advances.
+    after = managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=2
+        )
+    )
+
+    assert after.phase.value == "running", (
+        "a second genuine compaction is a new signal and must release the drain"
     )

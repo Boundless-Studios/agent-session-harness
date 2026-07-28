@@ -236,6 +236,12 @@ class SupervisorSnapshot(BaseModel):
     checkpoint_fingerprint: str | None = None
     checkpoint_path: Path | None = None
     warning_emitted: bool = False
+    # High-water mark of `ActivitySnapshot.pre_compact_seen` this supervisor has
+    # already acted on, so one compaction releases at most one drain (BOU-2565).
+    # Persisted rather than in-memory: a supervisor that restarts mid-generation
+    # would otherwise re-consume every retained compaction event and cancel the
+    # next legitimate rotation.
+    pre_compact_consumed: int = Field(default=0, ge=0)
     usage_sample_failure_streak: int = Field(default=0, ge=0)
     non_confident_sample_streak: int = Field(default=0, ge=0)
     usage_alarm: str | None = Field(default=None, max_length=320)
@@ -968,15 +974,30 @@ class Supervisor:
 
         Only from DRAINING. Past that a checkpoint or fence is already in flight
         and must not be silently abandoned.
+
+        **Consumed once per event.** ``pre_compact_generations`` is a fold over
+        RETAINED history, so once a generation has compacted it stays in that set
+        forever. Treating membership as the trigger would mean: context regrows
+        to the rotate threshold in the same generation, `_observe_usage` enters
+        DRAINING, this immediately returns it to RUNNING off the stale event, and
+        it repeats on every tick — rotation permanently disabled, because the
+        generation can only advance THROUGH a rotation. So the trigger is the
+        monotonic ``pre_compact_seen`` watermark advancing past what this
+        supervisor already acted on, which also means a genuine SECOND
+        compaction in the same generation still releases (review round 1).
         """
         if self.snapshot.phase is not SupervisorPhase.DRAINING:
             return
         if self.snapshot.generation not in activity.pre_compact_generations:
             return
+        if activity.pre_compact_seen <= self.snapshot.pre_compact_consumed:
+            # Already acted on every compaction the ledger has reported.
+            return
         self.snapshot = self.snapshot.model_copy(
             update={
                 "phase": SupervisorPhase.RUNNING,
                 "warning_emitted": False,
+                "pre_compact_consumed": activity.pre_compact_seen,
             }
         )
         self._persist()

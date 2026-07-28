@@ -229,3 +229,36 @@ def test_project_safety_command_failure_becomes_unknown_without_diagnostics(
 
     assert observation.status is ProjectSafetyStatus.UNKNOWN
     assert observation.warnings == ("project safety probe failed",)
+
+
+def test_merge_preserves_every_runtime_derived_field() -> None:
+    """The probe observes the WORKTREE, so runtime fields must pass through.
+
+    Dropping one silently substitutes the field default. For
+    `pre_compact_generations`/`pre_compact_seen` that means self-compaction
+    could never release DRAINING in any deployment configured with
+    `--safety-adapter` — the BOU-2565 fix would be dead in exactly the
+    environments that run the probe (review round 1). `reaped_tool_ids` was
+    being dropped the same way, losing the BOU-2236 permission-gate fingerprint.
+    """
+    base = ActivitySnapshot(
+        quiescence=Quiescence.IDLE,
+        active_turn_ids=frozenset(),
+        active_tool_ids=frozenset(),
+        active_subagent_ids=frozenset(),
+        active_critical_section_ids=frozenset(),
+        processed_event_count=3,
+        last_event_at=NOW,
+        integrity_warnings=(),
+        handoff_requested_generations=frozenset({7}),
+        pre_compact_generations=frozenset({7}),
+        pre_compact_seen=2,
+        reaped_tool_ids=frozenset({"tool-denied"}),
+    )
+
+    merged = merge_project_safety(base, _observation(ProjectSafetyStatus.QUIESCENT))
+
+    assert merged.pre_compact_generations == frozenset({7})
+    assert merged.pre_compact_seen == 2
+    assert merged.reaped_tool_ids == frozenset({"tool-denied"})
+    assert merged.handoff_requested_generations == frozenset({7})

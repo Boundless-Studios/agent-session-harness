@@ -128,7 +128,17 @@ def merge_project_safety(
         last_event_at=activity.last_event_at,
         integrity_warnings=activity.integrity_warnings + observation.warnings,
         handoff_requested_generations=activity.handoff_requested_generations,
-        # The project probe observes the worktree, not the runtime's hooks, so
-        # it can neither confirm nor clear a reporting fault (BOU-2222).
+        # The project probe observes the WORKTREE, not the runtime's hooks, so
+        # every runtime-derived field must pass through untouched — the probe
+        # has no basis to alter any of them. Dropping one silently substitutes
+        # the field default: `pre_compact_generations`/`pre_compact_seen` reset
+        # to empty/0 would mean self-compaction never releases DRAINING in any
+        # deployment configured with --safety-adapter (BOU-2565 review), and
+        # `reaped_tool_ids` reset would lose the BOU-2236 permission-gate
+        # fingerprint the same way.
+        pre_compact_generations=activity.pre_compact_generations,
+        pre_compact_seen=activity.pre_compact_seen,
+        reaped_tool_ids=activity.reaped_tool_ids,
+        # It can neither confirm nor clear a reporting fault (BOU-2222).
         runtime_liveness=activity.runtime_liveness,
     )
