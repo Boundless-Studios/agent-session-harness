@@ -129,6 +129,7 @@ def merge_project_safety(
         integrity_warnings=activity.integrity_warnings + observation.warnings,
         handoff_requested_generations=activity.handoff_requested_generations,
         handoff_requested_seen=activity.handoff_requested_seen,
+        handoff_requested_signals=activity.handoff_requested_signals,
         # The project probe observes the WORKTREE, not the runtime's hooks, so
         # every runtime-derived field must pass through untouched — the probe
         # has no basis to alter any of them. Dropping one silently substitutes
@@ -139,6 +140,7 @@ def merge_project_safety(
         # fingerprint the same way.
         pre_compact_generations=activity.pre_compact_generations,
         pre_compact_seen=activity.pre_compact_seen,
+        pre_compact_signals=activity.pre_compact_signals,
         reaped_tool_ids=activity.reaped_tool_ids,
         # It can neither confirm nor clear a reporting fault (BOU-2222).
         runtime_liveness=activity.runtime_liveness,

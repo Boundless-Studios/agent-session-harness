@@ -472,6 +472,71 @@ def test_pre_compact_events_are_folded_per_generation(tmp_path) -> None:
     )
 
     assert snapshot.pre_compact_generations == frozenset({3})
+    assert [
+        (signal.event_id, signal.generation, signal.conversation_id)
+        for signal in snapshot.pre_compact_signals
+    ] == [("event-2", 3, "conversation-1")]
+
+
+def test_pre_compact_signals_preserve_conversation_and_generation(tmp_path) -> None:
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "nested",
+            "context.pre_compact",
+            conversation_id="nested-conversation",
+        )
+    )
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "delayed",
+            "context.pre_compact",
+            generation=2,
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    )
+
+    assert {
+        (signal.event_id, signal.generation, signal.conversation_id)
+        for signal in snapshot.pre_compact_signals
+    } == {
+        ("nested", 0, "nested-conversation"),
+        ("delayed", 2, "conversation-1"),
+    }
+
+
+def test_replaced_ledger_preserves_event_identity(tmp_path) -> None:
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "compact", "context.pre_compact"))
+    first = ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    ).pre_compact_signals[0]
+
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(
+        _event(events, tmp_path, "compact", "context.pre_compact").model_dump_json()
+        + "\n",
+        encoding="utf-8",
+    )
+    replacement.replace(ledger.path)
+    second = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    ).pre_compact_signals[0]
+
+    assert second.identity == first.identity
 
 
 def test_handoff_requests_expose_a_monotonic_watermark(tmp_path) -> None:

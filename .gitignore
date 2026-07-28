@@ -159,6 +159,7 @@ venv.bak/
 
 # Local agent workflow state
 .gaia/
+.beads/interactions.jsonl
 
 # Spyder project settings
 .spyderproject

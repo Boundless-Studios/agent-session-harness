@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from agent_session_harness.activity import (
     ActivitySnapshot,
+    LifecycleSignal,
     Quiescence,
     RuntimeLiveness,
 )
@@ -254,6 +255,8 @@ def test_merge_preserves_every_runtime_derived_field() -> None:
         handoff_requested_seen=3,
         pre_compact_generations=frozenset({7}),
         pre_compact_seen=2,
+        handoff_requested_signals=(LifecycleSignal("handoff", 7, "conversation"),),
+        pre_compact_signals=(LifecycleSignal("compact", 7, "conversation"),),
         reaped_tool_ids=frozenset({"tool-denied"}),
     )
 
@@ -264,3 +267,5 @@ def test_merge_preserves_every_runtime_derived_field() -> None:
     assert merged.reaped_tool_ids == frozenset({"tool-denied"})
     assert merged.handoff_requested_generations == frozenset({7})
     assert merged.handoff_requested_seen == 3
+    assert merged.handoff_requested_signals == base.handoff_requested_signals
+    assert merged.pre_compact_signals == base.pre_compact_signals

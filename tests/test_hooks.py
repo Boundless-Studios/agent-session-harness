@@ -90,6 +90,35 @@ def test_native_events_normalize_to_sanitized_lifecycle(
     assert "/private/value" not in event.model_dump_json()
 
 
+def test_handoff_request_identity_changes_for_a_later_stop(tmp_path) -> None:
+    native, _command = _modules()
+    payload = {
+        "hook_event_name": "Stop",
+        "session_id": "conversation-1",
+        "cwd": str(tmp_path),
+        "timestamp": NOW.isoformat(),
+        "turn_id": "turn-1",
+    }
+    first_stop = native.normalize_native_event(
+        runtime="codex",
+        payload=payload,
+        chain_id="chain-1",
+        generation=0,
+        owner_pid=1234,
+    )
+    second_stop = first_stop.model_copy(
+        update={
+            "event_id": "later-stop",
+            "timestamp": NOW + timedelta(seconds=1),
+        }
+    )
+
+    assert (
+        native.handoff_requested_event(first_stop).event_id
+        != native.handoff_requested_event(second_stop).event_id
+    )
+
+
 @pytest.mark.parametrize(
     "hook_name",
     [

@@ -14,7 +14,7 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .activity import ActivitySnapshot, Quiescence, RuntimeLiveness
+from .activity import ActivitySnapshot, LifecycleSignal, Quiescence, RuntimeLiveness
 from .adapters.command import sanitize_error
 from .capsule import HandoffCapsule
 from .coordinator import ClaimHandle, CoordinatorAdapter, StaleOwnerError
@@ -242,10 +242,13 @@ class SupervisorSnapshot(BaseModel):
     # would otherwise re-consume every retained compaction event and cancel the
     # next legitimate rotation.
     pre_compact_consumed: int = Field(default=0, ge=0)
+    pre_compact_consumed_identity: str | None = None
     # Handoff requests at or below this count predate a drain cancellation and no
     # longer authorise a rotation. Consent given before a self-compaction is about
     # work the runtime has since replaced (BOU-2565 review).
     handoff_consent_invalidated_at: int = Field(default=0, ge=0)
+    handoff_consent_invalidated_identity: str | None = None
+    self_compaction_pending: bool = False
     usage_sample_failure_streak: int = Field(default=0, ge=0)
     non_confident_sample_streak: int = Field(default=0, ge=0)
     usage_alarm: str | None = Field(default=None, max_length=320)
@@ -711,15 +714,24 @@ class Supervisor:
                 # Safety gates, never relaxed: the runtime asked to hand off and
                 # nothing is outstanding. Rotating past either would be worse
                 # than the latch this change removes.
+                handoff = self._latest_managed_signal(
+                    activity.handoff_requested_signals
+                )
+                if activity.handoff_requested_signals:
+                    handoff_missing_or_stale = (
+                        handoff is None
+                        or handoff.identity
+                        == self.snapshot.handoff_consent_invalidated_identity
+                    )
+                else:
+                    handoff_missing_or_stale = (
+                        self.snapshot.generation
+                        not in activity.handoff_requested_generations
+                        or activity.handoff_requested_seen
+                        <= self.snapshot.handoff_consent_invalidated_at
+                    )
                 if (
-                    self.snapshot.generation
-                    not in activity.handoff_requested_generations
-                    # ...and the request must POSTDATE any drain this generation
-                    # already cancelled. Membership alone is retained forever, so
-                    # pre-compaction consent would otherwise authorise a
-                    # post-compaction rotation (BOU-2565 review).
-                    or activity.handoff_requested_seen
-                    <= self.snapshot.handoff_consent_invalidated_at
+                    handoff_missing_or_stale
                     or activity.quiescence is not Quiescence.IDLE
                 ):
                     return self.snapshot
@@ -996,11 +1008,18 @@ class Supervisor:
         supervisor already acted on, which also means a genuine SECOND
         compaction in the same generation still releases (review round 1).
         """
-        if self.snapshot.generation not in activity.pre_compact_generations:
-            return
-        if activity.pre_compact_seen <= self.snapshot.pre_compact_consumed:
-            # Already acted on every compaction the ledger has reported.
-            return
+        signal = self._latest_managed_signal(activity.pre_compact_signals)
+        if activity.pre_compact_signals:
+            if (
+                signal is None
+                or signal.identity == self.snapshot.pre_compact_consumed_identity
+            ):
+                return
+        else:
+            if self.snapshot.generation not in activity.pre_compact_generations:
+                return
+            if activity.pre_compact_seen <= self.snapshot.pre_compact_consumed:
+                return
 
         # Consume FIRST, and regardless of phase. A compaction observed while
         # RUNNING or WARNING (usage sampling is often UNKNOWN right when the
@@ -1008,11 +1027,17 @@ class Supervisor:
         # unconsumed, a later drain in the same generation is cancelled by that
         # stale event, which is the same defect as the repeat case one path over
         # (review round 2).
-        updates: dict[str, object] = {"pre_compact_consumed": activity.pre_compact_seen}
+        updates: dict[str, object] = {
+            "pre_compact_consumed": activity.pre_compact_seen,
+            "pre_compact_consumed_identity": (
+                signal.identity if signal is not None else None
+            ),
+        }
         releasing = self.snapshot.phase is SupervisorPhase.DRAINING
         if releasing:
             updates["phase"] = SupervisorPhase.RUNNING
             updates["warning_emitted"] = False
+            updates["self_compaction_pending"] = True
             # Consent to rotate does not survive the compaction it preceded.
             # `handoff_requested_generations` is a retained fold, so without this
             # a Stop that requested handoff BEFORE the compaction would still
@@ -1020,6 +1045,10 @@ class Supervisor:
             # the runtime has since replaced. Invalidate anything already
             # requested; a genuine later request advances the count past this.
             updates["handoff_consent_invalidated_at"] = activity.handoff_requested_seen
+            handoff = self._latest_managed_signal(activity.handoff_requested_signals)
+            updates["handoff_consent_invalidated_identity"] = (
+                handoff.identity if handoff is not None else None
+            )
         self.snapshot = self.snapshot.model_copy(update=updates)
         self._persist()
         if not releasing:
@@ -1034,6 +1063,19 @@ class Supervisor:
             "canceled-by-self-compaction",
             generation=self.snapshot.generation,
         )
+
+    def _latest_managed_signal(
+        self, signals: tuple[LifecycleSignal, ...]
+    ) -> LifecycleSignal | None:
+        """Return the newest signal for the exact managed conversation."""
+        for signal in reversed(signals):
+            if (
+                signal.generation == self.snapshot.generation
+                and self.snapshot.conversation_id is not None
+                and signal.conversation_id == self.snapshot.conversation_id
+            ):
+                return signal
+        return None
 
     def _clear_stop_request_marker(self) -> None:
         """Drop the `.stop-request` marker; best-effort by design."""
@@ -1067,6 +1109,12 @@ class Supervisor:
         # signal that the runtime reclaimed its own context, not an inference
         # from a percentage that may just be noise. See
         # `_release_drain_on_self_compaction`.
+        if self.snapshot.self_compaction_pending:
+            if context_percent < self.rotate_percent:
+                self.snapshot = self.snapshot.model_copy(
+                    update={"self_compaction_pending": False}
+                )
+            return
         if (
             self.snapshot.phase is SupervisorPhase.RUNNING
             and context_percent >= self.warn_percent

@@ -36,6 +36,19 @@ class RuntimeLiveness(str, Enum):
 
 
 @dataclass(frozen=True)
+class LifecycleSignal:
+    """Identity-bearing lifecycle signal retained by the event ledger."""
+
+    event_id: str
+    generation: int
+    conversation_id: str
+
+    @property
+    def identity(self) -> str:
+        return self.event_id
+
+
+@dataclass(frozen=True)
 class ActivitySnapshot:
     quiescence: Quiescence
     active_turn_ids: frozenset[str]
@@ -63,6 +76,8 @@ class ActivitySnapshot:
     # otherwise still authorise a rotation AFTER it — in the same generation, off
     # a request the runtime made about different work (BOU-2565 review).
     handoff_requested_seen: int = 0
+    handoff_requested_signals: tuple[LifecycleSignal, ...] = ()
+    pre_compact_signals: tuple[LifecycleSignal, ...] = ()
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
     # Tool starts closed by turn-idle reconciliation rather than by their own
     # finish event (BOU-2236). Reported for observability only -- these are NOT
