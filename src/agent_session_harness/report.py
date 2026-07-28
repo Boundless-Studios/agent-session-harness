@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -89,7 +90,14 @@ def build_report(
     stale_after_seconds: float = 30.0,
     now: datetime | None = None,
 ) -> StatusReport:
-    state = SupervisorSnapshot.model_validate_json(read_private_text(state_path))
+    # Forward-compatible read (BOU-2407): a status projection must never be the
+    # thing that fails because the state file carries a field this build predates.
+    # `gaia supervise status` is exactly what an operator reaches for when a
+    # session is misbehaving, so it has to survive version skew rather than
+    # become another casualty of it (BOU-2245 was this same fallout gaia-side).
+    state, _unknown = SupervisorSnapshot.read_forward_compatible(
+        json.loads(read_private_text(state_path))
+    )
     quiescence = Quiescence.UNKNOWN
     # No ledger to read is itself the "no hook has ever reported" case.
     runtime_liveness = RuntimeLiveness.NEVER_REPORTED

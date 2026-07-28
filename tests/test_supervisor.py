@@ -21,7 +21,8 @@ from agent_session_harness.coordinator import (
     ClaimHandle,
     FenceResult,
 )
-from agent_session_harness.models import Confidence
+from agent_session_harness.models import Confidence, Runtime
+from pydantic import ValidationError
 
 NOW = datetime(2026, 7, 19, 6, 0, tzinfo=UTC)
 
@@ -2730,3 +2731,85 @@ def test_a_fast_poll_interval_cannot_alarm_on_a_young_session(tmp_path) -> None:
     assert snapshot.runtime_silence_streak == 4
     assert snapshot.runtime_silence_since is not None
     assert checkpoints.calls == []
+
+
+# ---------------------------------------------------------------------------
+# BOU-2407: persisted state must survive a field this build predates
+# ---------------------------------------------------------------------------
+
+# `run_spec_fingerprint` is a sha256 hex digest (min_length=64).
+_FINGERPRINT = "a" * 64
+
+
+def test_snapshot_read_tolerates_and_reports_a_field_from_a_newer_build() -> None:
+    """A newer build's field must not make an older reader fail outright.
+
+    `_persist` writes every field, so the moment a newer harness writes the
+    state file, an older reader that forbids the new key cannot validate it at
+    all — mixed-version execution and rollback both break precisely when a live
+    session may need recovery. It fired for real when `supervision_alarm` was
+    added (BOU-2389), and `liveness_alarm`/`usage_alarm` had the same property
+    (BOU-2222, with BOU-2245 as the gaia-side fallout).
+    """
+    _process, supervisor = _modules()
+
+    payload = supervisor.SupervisorSnapshot(
+        runtime=Runtime.CLAUDE, chain_id="chain-1", run_spec_fingerprint=_FINGERPRINT
+    ).model_dump(mode="json")
+    payload["a_field_from_the_future"] = {"nested": True}
+    payload["another_one"] = 7
+
+    snapshot, unknown = supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+
+    assert snapshot.chain_id == "chain-1"
+    assert unknown == ("a_field_from_the_future", "another_one"), (
+        "unknown keys must be REPORTED, not silently swallowed — version skew is "
+        "exactly what an operator debugging odd behaviour needs to be told"
+    )
+
+
+def test_snapshot_read_still_rejects_a_corrupt_known_field() -> None:
+    """Only UNKNOWN keys are forgiven; the strictness that catches torn state stays."""
+    _process, supervisor = _modules()
+
+    payload = supervisor.SupervisorSnapshot(
+        runtime=Runtime.CLAUDE, chain_id="chain-1", run_spec_fingerprint=_FINGERPRINT
+    ).model_dump(mode="json")
+    payload["generation"] = "not-an-int"
+
+    with pytest.raises(ValidationError):
+        supervisor.SupervisorSnapshot.read_forward_compatible(payload)
+
+
+def test_snapshot_construction_still_forbids_unknown_keyword() -> None:
+    """`extra="forbid"` is kept on purpose — a typo'd kwarg in OUR code is a bug."""
+    _process, supervisor = _modules()
+
+    with pytest.raises(ValidationError):
+        supervisor.SupervisorSnapshot(
+            runtime=Runtime.CLAUDE,
+            chain_id="chain-1",
+            run_spec_fingerprint=_FINGERPRINT,
+            nonexistent_field=1,
+        )
+
+
+def test_supervisor_loads_a_state_file_written_by_a_newer_build(tmp_path) -> None:
+    """End-to-end: `_load` must recover a session whose state file is ahead of it.
+
+    This is the case that actually strands an operator — the state file is on
+    disk, the session needs recovery, and the installed supervisor refuses to
+    read its own state.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["field_added_by_a_later_release"] = "surprise"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = managed._load()
+
+    assert reloaded.chain_id == managed.snapshot.chain_id
+    assert reloaded.generation == managed.snapshot.generation

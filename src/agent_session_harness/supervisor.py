@@ -207,7 +207,54 @@ class CheckpointManager(Protocol):
 
 
 class SupervisorSnapshot(BaseModel):
+    """Durable supervisor state.
+
+    **Evolution policy (BOU-2407).** Adding an OPTIONAL field with a default is
+    always allowed and is not a schema change. `schema_version` gates only
+    incompatible reshaping — a renamed or removed field, or a changed meaning —
+    never an additive one.
+
+    `extra="forbid"` is kept deliberately: it catches a typo'd keyword at
+    construction, which is a real bug in our own code. But it must NOT be how
+    persisted state is read. `_persist` writes every field, so the moment a
+    newer build writes the state file, an OLDER reader that forbids the new key
+    cannot validate it at all — `ValidationError: Extra inputs are not
+    permitted` — and mixed-version execution and rollback both break exactly
+    when a live session may need recovery. This is not hypothetical: it fired
+    during BOU-2389 development when `supervision_alarm` was added, and
+    BOU-2222's `liveness_alarm`/`usage_alarm` had the same property.
+
+    So every read of a persisted snapshot goes through
+    :meth:`read_forward_compatible`, which drops keys this build does not know
+    and REPORTS them rather than swallowing them. That cannot rescue readers
+    already installed today — no change to new code can make an old binary
+    tolerant of a field it was compiled to forbid — but it stops the bleeding
+    permanently, so the next field addition is a non-event.
+    """
+
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @classmethod
+    def read_forward_compatible(
+        cls, payload: dict[str, object]
+    ) -> tuple["SupervisorSnapshot", tuple[str, ...]]:
+        """Validate persisted state, tolerating fields written by a newer build.
+
+        Returns the snapshot plus the sorted names of any dropped keys, so a
+        caller can surface version skew instead of silently discarding it.
+
+        Only UNKNOWN keys are forgiven. A torn or corrupt file still fails: bad
+        JSON raises in `json.loads` before this is reached, and a known field
+        carrying a wrong type still raises here. The single behaviour that
+        changes is that "a key I don't recognise" stops being fatal — and that
+        case is indistinguishable from "written by a newer build", which is
+        precisely why it must not be.
+        """
+        known = set(cls.model_fields)
+        unknown = tuple(sorted(str(key) for key in payload if key not in known))
+        if unknown:
+            payload = {k: v for k, v in payload.items() if k in known}
+        return cls.model_validate(payload), unknown
 
     schema_version: Literal[1] = 1
     runtime: Runtime
@@ -1522,7 +1569,18 @@ class Supervisor:
             self.state_path.with_suffix(self.state_path.suffix + ".lock")
         ):
             payload = json.loads(read_private_text(self.state_path))
-        snapshot = SupervisorSnapshot.model_validate(payload)
+        snapshot, unknown_fields = SupervisorSnapshot.read_forward_compatible(payload)
+        if unknown_fields:
+            # Version skew is worth saying out loud: this state file was written
+            # by a newer build than the one now reading it. We proceed (that is
+            # the whole point of BOU-2407) but an operator debugging odd
+            # behaviour should not have to infer it.
+            _announce_alarm(
+                "supervisor state contains field(s) this build does not know "
+                f"({', '.join(unknown_fields)}); it was written by a newer "
+                "agent-session-harness. Ignoring them and continuing — but the "
+                "installed build is behind the one that wrote this state."
+            )
         if snapshot.runtime is not self.runtime or snapshot.chain_id != self.chain_id:
             raise ValueError("supervisor state does not match requested runtime/chain")
         if snapshot.run_spec_fingerprint != self.run_spec_fingerprint:
