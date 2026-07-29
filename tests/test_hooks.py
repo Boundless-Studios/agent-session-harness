@@ -90,6 +90,35 @@ def test_native_events_normalize_to_sanitized_lifecycle(
     assert "/private/value" not in event.model_dump_json()
 
 
+def test_handoff_request_identity_changes_for_a_later_stop(tmp_path) -> None:
+    native, _command = _modules()
+    payload = {
+        "hook_event_name": "Stop",
+        "session_id": "conversation-1",
+        "cwd": str(tmp_path),
+        "timestamp": NOW.isoformat(),
+        "turn_id": "turn-1",
+    }
+    first_stop = native.normalize_native_event(
+        runtime="codex",
+        payload=payload,
+        chain_id="chain-1",
+        generation=0,
+        owner_pid=1234,
+    )
+    second_stop = first_stop.model_copy(
+        update={
+            "event_id": "later-stop",
+            "timestamp": NOW + timedelta(seconds=1),
+        }
+    )
+
+    assert (
+        native.handoff_requested_event(first_stop).event_id
+        != native.handoff_requested_event(second_stop).event_id
+    )
+
+
 @pytest.mark.parametrize(
     "hook_name",
     [
@@ -428,6 +457,38 @@ def test_stop_rejects_an_owner_other_than_the_managed_runtime(tmp_path: Path) ->
         )
 
     assert not (tmp_path / "events.jsonl").exists()
+
+
+def test_stop_request_is_serialized_with_drain_cancellation(tmp_path: Path) -> None:
+    _native, command = _modules()
+    secure_files = importlib.import_module("agent_session_harness.secure_files")
+    state_path = tmp_path / "supervisor.json"
+    _write_supervisor_state(state_path, runtime="codex", phase="draining")
+    environ = _stop_environment(tmp_path, state_path)
+    transition_lock = state_path.with_suffix(state_path.suffix + ".transition.lock")
+    result: list[tuple[int, str, str]] = []
+
+    with secure_files.exclusive_lock(transition_lock):
+        worker = threading.Thread(
+            target=lambda: result.append(
+                _run_stop(
+                    command,
+                    runtime="codex",
+                    tmp_path=tmp_path,
+                    environ=environ,
+                )
+            )
+        )
+        worker.start()
+        time.sleep(0.05)
+        assert worker.is_alive(), "Stop must wait for the supervisor transition"
+        _write_supervisor_state(state_path, runtime="codex", phase="running")
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert result == [(0, "", "")]
+    ledger_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    assert "handoff.requested" not in ledger_text
 
 
 def test_hook_command_requires_managed_mode_and_appends_locally(tmp_path) -> None:

@@ -11,7 +11,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .activity import ActivitySnapshot, Quiescence, RuntimeLiveness
+from .activity import ActivitySnapshot, LifecycleSignal, Quiescence, RuntimeLiveness
 from .events import LifecycleEvent
 from .models import EventType
 from .secure_files import (
@@ -114,6 +114,11 @@ class EventLedger:
         active_critical_sections: Counter[str] = Counter()
         reaped_tools: set[str] = set()
         handoff_requested_generations: set[int] = set()
+        handoff_requested_seen = 0
+        pre_compact_generations: set[int] = set()
+        pre_compact_seen = 0
+        handoff_requested_signals: list[LifecycleSignal] = []
+        pre_compact_signals: list[LifecycleSignal] = []
         last_event_at: datetime | None = None
         last_hook_event_at: datetime | None = None
         processed = 0
@@ -195,6 +200,12 @@ class EventLedger:
                     active_tools.clear()
             elif event.event_type is EventType.HANDOFF_REQUESTED:
                 handoff_requested_generations.add(event.generation)
+                handoff_requested_seen += 1
+                handoff_requested_signals.append(self._signal(event))
+            elif event.event_type is EventType.PRE_COMPACT:
+                pre_compact_generations.add(event.generation)
+                pre_compact_seen += 1
+                pre_compact_signals.append(self._signal(event))
 
         active_groups = (
             active_turns,
@@ -226,6 +237,18 @@ class EventLedger:
             integrity_warnings=tuple(warning.message for warning in warnings),
             reaped_tool_ids=frozenset(reaped_tools),
             handoff_requested_generations=frozenset(handoff_requested_generations),
+            handoff_requested_seen=handoff_requested_seen,
+            pre_compact_generations=frozenset(pre_compact_generations),
+            pre_compact_seen=pre_compact_seen,
+            handoff_requested_signals=tuple(handoff_requested_signals),
+            pre_compact_signals=tuple(pre_compact_signals),
+        )
+
+    def _signal(self, event: LifecycleEvent) -> LifecycleSignal:
+        return LifecycleSignal(
+            event_id=event.event_id,
+            generation=event.generation,
+            conversation_id=event.conversation_id,
         )
 
     def _read_events(

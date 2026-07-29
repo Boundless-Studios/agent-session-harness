@@ -344,28 +344,30 @@ def _handle_stop(
     environment: Mapping[str, str],
 ) -> NativeHookResponse:
     state_path = _state_path(environment, event.cwd)
-    snapshot = _read_snapshot(state_path)
-    _validate_snapshot(snapshot, event=event, runtime=runtime)
-    draining = snapshot.phase in {
-        SupervisorPhase.DRAINING,
-        SupervisorPhase.CHECKPOINTING,
-    }
-    checkpoint_verified = (
-        snapshot.checkpoint_fingerprint is not None
-        and snapshot.phase
-        not in {SupervisorPhase.DRAINING, SupervisorPhase.CHECKPOINTING}
-    )
-    already_requested = False
-    if draining and not checkpoint_verified:
-        already_requested = not _record_stop_request(
-            state_path=state_path,
-            snapshot=snapshot,
-            ledger=ledger,
-            request_event=handoff_requested_event(event),
-            idle_event=repeated_stop_idle_event(event),
+    transition_lock = state_path.with_suffix(state_path.suffix + ".transition.lock")
+    with exclusive_lock(transition_lock):
+        snapshot = _read_snapshot(state_path)
+        _validate_snapshot(snapshot, event=event, runtime=runtime)
+        draining = snapshot.phase in {
+            SupervisorPhase.DRAINING,
+            SupervisorPhase.CHECKPOINTING,
+        }
+        checkpoint_verified = (
+            snapshot.checkpoint_fingerprint is not None
+            and snapshot.phase
+            not in {SupervisorPhase.DRAINING, SupervisorPhase.CHECKPOINTING}
         )
-    else:
-        ledger.append(event)
+        already_requested = False
+        if draining and not checkpoint_verified:
+            already_requested = not _record_stop_request(
+                state_path=state_path,
+                snapshot=snapshot,
+                ledger=ledger,
+                request_event=handoff_requested_event(event),
+                idle_event=repeated_stop_idle_event(event),
+            )
+        else:
+            ledger.append(event)
     return stop_handshake(
         runtime=runtime,
         draining=draining,

@@ -36,6 +36,19 @@ class RuntimeLiveness(str, Enum):
 
 
 @dataclass(frozen=True)
+class LifecycleSignal:
+    """Identity-bearing lifecycle signal retained by the event ledger."""
+
+    event_id: str
+    generation: int
+    conversation_id: str
+
+    @property
+    def identity(self) -> str:
+        return self.event_id
+
+
+@dataclass(frozen=True)
 class ActivitySnapshot:
     quiescence: Quiescence
     active_turn_ids: frozenset[str]
@@ -46,6 +59,25 @@ class ActivitySnapshot:
     last_event_at: datetime | None
     integrity_warnings: tuple[str, ...]
     handoff_requested_generations: frozenset[int] = frozenset()
+    # Generations in which the runtime announced its OWN context compaction
+    # (`context.pre_compact`). This is the only context signal that does not
+    # depend on usage sampling, so it is the one that can release a drain when
+    # sampling has gone non-confident (BOU-2565).
+    pre_compact_generations: frozenset[int] = frozenset()
+    # How many compaction events the ledger has EVER reported. Membership above
+    # is a fold over retained history, so it stays true forever once a
+    # generation has compacted once — it answers "has this generation ever
+    # compacted", never "is this a new signal". A consumer that must act once
+    # per event needs a watermark it can compare against what it already acted
+    # on; this is that watermark. Monotonic and bounded (BOU-2565 review).
+    pre_compact_seen: int = 0
+    # Same watermark treatment for handoff requests. `handoff_requested_generations`
+    # is also a retained fold, so consent given BEFORE a self-compaction would
+    # otherwise still authorise a rotation AFTER it — in the same generation, off
+    # a request the runtime made about different work (BOU-2565 review).
+    handoff_requested_seen: int = 0
+    handoff_requested_signals: tuple[LifecycleSignal, ...] = ()
+    pre_compact_signals: tuple[LifecycleSignal, ...] = ()
     runtime_liveness: RuntimeLiveness = RuntimeLiveness.REPORTING
     # Tool starts closed by turn-idle reconciliation rather than by their own
     # finish event (BOU-2236). Reported for observability only -- these are NOT

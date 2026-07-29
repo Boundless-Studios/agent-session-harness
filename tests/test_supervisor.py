@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -14,6 +15,7 @@ from pydantic import ValidationError
 
 from agent_session_harness.activity import (
     ActivitySnapshot,
+    LifecycleSignal,
     Quiescence,
     RuntimeLiveness,
 )
@@ -40,6 +42,11 @@ def _activity(
     quiescence: Quiescence,
     *,
     handoff_requested_generations: frozenset[int] = frozenset(),
+    handoff_requested_seen: int | None = None,
+    pre_compact_generations: frozenset[int] = frozenset(),
+    pre_compact_seen: int | None = None,
+    handoff_requested_signals: tuple[LifecycleSignal, ...] = (),
+    pre_compact_signals: tuple[LifecycleSignal, ...] = (),
 ) -> ActivitySnapshot:
     active = frozenset({"active"}) if quiescence is Quiescence.BUSY else frozenset()
     return ActivitySnapshot(
@@ -52,6 +59,28 @@ def _activity(
         last_event_at=NOW,
         integrity_warnings=(),
         handoff_requested_generations=handoff_requested_generations,
+        handoff_requested_seen=handoff_requested_seen
+        if handoff_requested_seen is not None
+        else len(handoff_requested_generations),
+        pre_compact_generations=pre_compact_generations,
+        pre_compact_seen=pre_compact_seen
+        if pre_compact_seen is not None
+        else len(pre_compact_generations),
+        handoff_requested_signals=handoff_requested_signals,
+        pre_compact_signals=pre_compact_signals,
+    )
+
+
+def _signal(
+    event_id: str,
+    *,
+    generation: int = 0,
+    conversation_id: str = "native-conversation-0",
+) -> LifecycleSignal:
+    return LifecycleSignal(
+        event_id=event_id,
+        generation=generation,
+        conversation_id=conversation_id,
     )
 
 
@@ -1940,6 +1969,54 @@ def test_competing_supervisors_refresh_under_one_transition_lock(tmp_path) -> No
     assert [call[0] for call in driver.calls] == ["start"]
 
 
+def test_usage_sampling_does_not_hold_the_transition_lock(tmp_path) -> None:
+    secure_files = importlib.import_module("agent_session_harness.secure_files")
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    sampling_started = threading.Event()
+    allow_sampling_to_finish = threading.Event()
+    transition_acquired = threading.Event()
+    original_sample = managed.usage_reader.sample
+    errors: list[BaseException] = []
+
+    def blocking_sample(process):
+        sampling_started.set()
+        if not allow_sampling_to_finish.wait(timeout=2):
+            raise TimeoutError("test did not release usage sampling")
+        return original_sample(process)
+
+    managed.usage_reader.sample = blocking_sample
+
+    def run_tick() -> None:
+        try:
+            managed.tick(_activity(Quiescence.BUSY))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def acquire_transition() -> None:
+        with secure_files.exclusive_lock(managed.transition_lock_path):
+            transition_acquired.set()
+
+    tick_worker = threading.Thread(target=run_tick)
+    lock_worker = threading.Thread(target=acquire_transition)
+    tick_worker.start()
+    assert sampling_started.wait(timeout=1)
+    lock_worker.start()
+    try:
+        assert transition_acquired.wait(timeout=0.5), (
+            "a slow usage adapter must not consume the Stop hook's transition-lock "
+            "budget"
+        )
+    finally:
+        allow_sampling_to_finish.set()
+        tick_worker.join(timeout=2)
+        lock_worker.join(timeout=2)
+
+    assert not tick_worker.is_alive()
+    assert not lock_worker.is_alive()
+    assert errors == []
+
+
 def test_periodic_heartbeat_and_stale_owner_failure_are_fail_closed(tmp_path) -> None:
     managed, _kwargs, _driver, coordinator, _checkpoints = _supervisor(
         tmp_path, heartbeat_interval_seconds=0.0
@@ -2731,6 +2808,466 @@ def test_a_fast_poll_interval_cannot_alarm_on_a_young_session(tmp_path) -> None:
     assert snapshot.runtime_silence_streak == 4
     assert snapshot.runtime_silence_since is not None
     assert checkpoints.calls == []
+
+
+def test_runtime_self_compaction_releases_the_drain(tmp_path) -> None:
+    """`context.pre_compact` cancels an in-flight drain (BOU-2565).
+
+    Codex auto-compacts itself at ~90%, always ABOVE our 70% rotate threshold,
+    so every sufficiently long Codex session latched DRAINING, self-compacted
+    down to ~15%, and then sat in DRAINING forever — told on every Stop to
+    checkpoint and stop working while holding 17-35% context. Rotation could not
+    complete either, because `_advance_rotation` withholds on a faulted liveness
+    and liveness flaps as sub-invocations come and go.
+
+    Deliberately NOT driven by the percentage falling: that path only runs for a
+    non-UNKNOWN sample, and these chains sit at `context_confidence: unknown`
+    for hundreds of ticks. The compaction event does not go through sampling at
+    all, so it is the one signal that actually arrives.
+    """
+    managed, _kwargs, _driver, _coordinator, checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+
+    snapshot = managed.tick(
+        _activity(Quiescence.BUSY, pre_compact_generations=frozenset({0}))
+    )
+
+    assert snapshot.phase.value == "running", (
+        "the runtime compacted its own context, which is the same recovery the "
+        "rotation was going to perform — the drain must be released instead of "
+        "latching the session at 'stop working' for the rest of its life"
+    )
+    assert snapshot.warning_emitted is False, (
+        "clearing warning_emitted lets a genuine later climb warn again"
+    )
+    assert checkpoints.calls == [], "releasing a drain must not checkpoint"
+
+
+def test_self_compaction_does_not_abandon_a_committed_rotation(tmp_path) -> None:
+    """Past DRAINING the rotation is already in flight and must not be cancelled.
+
+    A checkpoint or coordinator fence has side effects a late compaction event
+    cannot undo, so the release is scoped to DRAINING only.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+    # Quiescent + handoff requested drives the rotation past DRAINING.
+    advanced = managed.tick(_handoff_activity())
+    assert advanced.phase.value != "draining", "setup: rotation must have advanced"
+
+    after = managed.tick(
+        _activity(Quiescence.IDLE, pre_compact_generations=frozenset({0}))
+    )
+    assert after.phase.value != "running", (
+        "a compaction event arriving after the rotation committed must not roll "
+        f"it back to RUNNING; got {after.phase.value}"
+    )
+
+
+def test_a_stale_compaction_cannot_release_a_second_drain(tmp_path) -> None:
+    """One compaction releases at most ONE drain (BOU-2565 review, P1).
+
+    `pre_compact_generations` is a fold over RETAINED history, so once a
+    generation has compacted it stays in that set forever. If membership were
+    the trigger, context regrowing to the rotate threshold in the same
+    generation would enter DRAINING and be released again off the same stale
+    event — on every tick, permanently disabling rotation, because the
+    generation can only advance THROUGH a rotation.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+    released = managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=1
+        )
+    )
+    assert released.phase.value == "running", "setup: the first compaction releases"
+
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    # Context regrows in the SAME generation. The ledger still reports the old
+    # event, but the watermark has not moved.
+    managed.usage_reader.percent = 70.0
+    redrained = managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=1
+        )
+    )
+
+    assert redrained.phase.value == "draining", (
+        "a compaction already consumed must not cancel the NEXT rotation — "
+        "otherwise the session can never rotate again, which is a worse latch "
+        f"than the one this fix removes. Got {redrained.phase.value}"
+    )
+
+
+def test_a_second_real_compaction_still_releases(tmp_path) -> None:
+    """Control: the watermark must not make the fix a one-shot per generation.
+
+    A genuinely NEW compaction is a fresh reason the rotation is moot, even in a
+    generation that already compacted once.
+    """
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=1
+        )
+    )
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+
+    # The runtime compacts a SECOND time: the watermark advances.
+    after = managed.tick(
+        _activity(
+            Quiescence.BUSY, pre_compact_generations=frozenset({0}), pre_compact_seen=2
+        )
+    )
+
+    assert after.phase.value == "running", (
+        "a second genuine compaction is a new signal and must release the drain"
+    )
+
+
+def test_compaction_observed_while_running_cannot_release_a_later_drain(
+    tmp_path,
+) -> None:
+    """A non-draining observation still consumes the retained event."""
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 10.0
+    compacted = _activity(
+        Quiescence.BUSY,
+        pre_compact_generations=frozenset({0}),
+        pre_compact_seen=1,
+    )
+
+    observed = managed.tick(compacted)
+    assert observed.phase.value == "running"
+    assert observed.pre_compact_consumed == 1
+
+    managed.usage_reader.percent = 70.0
+    redrained = managed.tick(compacted)
+
+    assert redrained.phase.value == "draining", (
+        "the retained compaction was already observed before this drain and "
+        "must not cancel it"
+    )
+
+
+def test_cancelled_drain_requires_a_fresh_handoff_and_clears_stop_marker(
+    tmp_path,
+) -> None:
+    """Pre-compaction handoff state cannot authorize a later rotation."""
+    _process, supervisor = _modules()
+    command = importlib.import_module("agent_session_harness.hooks.command")
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    marker = command.stop_request_path(managed.state_path)
+    marker.write_text('{"stale": true}\n', encoding="utf-8")
+
+    managed.usage_reader.percent = 70.0
+    assert (
+        managed.tick(
+            _activity(
+                Quiescence.BUSY,
+                handoff_requested_generations=frozenset({0}),
+                handoff_requested_seen=1,
+            )
+        ).phase
+        is supervisor.SupervisorPhase.DRAINING
+    )
+
+    released = managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_generations=frozenset({0}),
+            handoff_requested_seen=1,
+            pre_compact_generations=frozenset({0}),
+            pre_compact_seen=1,
+        )
+    )
+    assert released.phase is supervisor.SupervisorPhase.RUNNING
+    assert not marker.exists()
+
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+    retained = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_generations=frozenset({0}),
+            handoff_requested_seen=1,
+            pre_compact_generations=frozenset({0}),
+            pre_compact_seen=1,
+        )
+    )
+    assert retained.phase is supervisor.SupervisorPhase.DRAINING
+
+    fresh = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_generations=frozenset({0}),
+            handoff_requested_seen=2,
+            pre_compact_generations=frozenset({0}),
+            pre_compact_seen=1,
+        )
+    )
+    assert fresh.phase is not supervisor.SupervisorPhase.DRAINING
+
+
+def test_nested_conversation_compaction_cannot_release_managed_drain(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+
+    nested = managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            pre_compact_signals=(
+                _signal("nested", conversation_id="nested-conversation"),
+            ),
+        )
+    )
+
+    assert nested.phase.value == "draining"
+
+
+def test_delayed_old_generation_compaction_cannot_release_current_drain(
+    tmp_path,
+) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+    assert managed.tick(_activity(Quiescence.BUSY)).phase.value == "draining"
+
+    delayed = managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            pre_compact_signals=(_signal("old", generation=1),),
+        )
+    )
+
+    assert delayed.phase.value == "draining"
+
+
+def test_new_compaction_identity_after_ledger_replacement_releases_again(
+    tmp_path,
+) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            pre_compact_signals=(_signal("compact-before-replacement"),),
+        )
+    )
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+
+    released = managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            pre_compact_signals=(_signal("compact-after-replacement"),),
+        )
+    )
+
+    assert released.phase.value == "running"
+
+
+def test_ledger_rollback_cannot_replay_any_consumed_compaction(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    first = _signal("compact-a")
+    second = _signal("compact-b")
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(first,)))
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(first, second)))
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+
+    replayed = managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(first,)))
+
+    assert replayed.phase.value == "draining"
+
+
+def test_lifecycle_identity_histories_are_bounded(tmp_path) -> None:
+    _process, supervisor = _modules()
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    limit = supervisor.LIFECYCLE_IDENTITY_HISTORY_LIMIT
+    signals = tuple(_signal(f"compact-{index}") for index in range(limit + 5))
+
+    managed.usage_reader.percent = 10.0
+    for lifecycle_signal in signals:
+        managed.tick(
+            _activity(Quiescence.BUSY, pre_compact_signals=(lifecycle_signal,))
+        )
+
+    assert managed.snapshot.pre_compact_consumed_identities == tuple(
+        signal.identity for signal in signals[-limit:]
+    )
+
+    handoffs = tuple(_signal(f"handoff-{index}") for index in range(limit + 5))
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY, handoff_requested_signals=handoffs))
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=handoffs,
+            pre_compact_signals=(_signal("release"),),
+        )
+    )
+
+    assert managed.snapshot.handoff_consent_invalidated_identities == tuple(
+        signal.identity for signal in handoffs[-limit:]
+    )
+
+
+def test_compaction_release_stays_suppressed_until_low_usage_confirms_completion(
+    tmp_path,
+) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    released = managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            pre_compact_signals=(_signal("compact"),),
+        )
+    )
+    assert released.phase.value == "running"
+
+    managed.usage_reader.percent = 70.0
+    still_released = managed.tick(_activity(Quiescence.BUSY))
+    assert still_released.phase.value == "running"
+
+    managed.usage_reader.percent = 10.0
+    completed = managed.tick(_activity(Quiescence.BUSY))
+    assert completed.phase.value == "running"
+    assert completed.self_compaction_pending is False
+
+
+def test_compaction_pending_cannot_suppress_rotation_indefinitely(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(_signal("compact"),)))
+
+    first_high = managed.tick(_activity(Quiescence.BUSY))
+    second_high = managed.tick(_activity(Quiescence.BUSY))
+
+    assert first_high.phase.value == "running"
+    assert second_high.phase.value == "running"
+
+    managed.snapshot = managed.snapshot.model_copy(
+        update={
+            "self_compaction_pending_until": datetime.now(tz=UTC) - timedelta(seconds=1)
+        }
+    )
+    managed._persist()
+    expired = managed.tick(_activity(Quiescence.BUSY))
+
+    assert expired.phase.value == "draining"
+
+
+def test_fresh_post_compaction_handoff_identity_allows_rotation(tmp_path) -> None:
+    _process, supervisor = _modules()
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    old_handoff = _signal("handoff-old")
+    compact = _signal("compact")
+    managed.usage_reader.percent = 70.0
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=(old_handoff,),
+        )
+    )
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=(old_handoff,),
+            pre_compact_signals=(compact,),
+        )
+    )
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+
+    fresh = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_signals=(old_handoff, _signal("handoff-new")),
+            pre_compact_signals=(compact,),
+        )
+    )
+
+    assert fresh.phase is not supervisor.SupervisorPhase.DRAINING
+
+
+def test_ledger_rollback_cannot_restore_any_pre_compaction_handoff(tmp_path) -> None:
+    _process, supervisor = _modules()
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    first = _signal("handoff-a")
+    second = _signal("handoff-b")
+    compact = _signal("compact")
+    managed.usage_reader.percent = 70.0
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=(first, second),
+        )
+    )
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=(first, second),
+            pre_compact_signals=(compact,),
+        )
+    )
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+
+    replayed = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_signals=(first,),
+            pre_compact_signals=(compact,),
+        )
+    )
+
+    assert replayed.phase is supervisor.SupervisorPhase.DRAINING
 
 
 # ---------------------------------------------------------------------------

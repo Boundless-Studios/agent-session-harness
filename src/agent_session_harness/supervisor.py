@@ -14,7 +14,7 @@ from typing import Literal, Protocol, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .activity import ActivitySnapshot, Quiescence, RuntimeLiveness
+from .activity import ActivitySnapshot, LifecycleSignal, Quiescence, RuntimeLiveness
 from .adapters.command import sanitize_error
 from .capsule import HandoffCapsule
 from .coordinator import ClaimHandle, CoordinatorAdapter, StaleOwnerError
@@ -59,6 +59,14 @@ RUNTIME_SILENCE_ALARM_TICKS = 3
 # session that is a few hundred milliseconds old. Silence only means something
 # once it has lasted longer than a plausible gap between hook events.
 RUNTIME_SILENCE_GRACE_SECONDS = 60.0
+# Retained only within one generation (cleared on successor acknowledgement).
+# The bound prevents malformed/replayed lifecycle logs from growing snapshots
+# without limit while covering far more compactions or Stop requests than one
+# generation can reasonably produce.
+LIFECYCLE_IDENTITY_HISTORY_LIMIT = 64
+# PreCompact is emitted before reclamation finishes. Give the runtime a bounded
+# window to produce a low sample, then let a still-high session drain normally.
+SELF_COMPACTION_GRACE_SECONDS = 30.0
 _RUNTIME_SILENCE_ALARMS = {
     RuntimeLiveness.NEVER_REPORTED: (
         "runtime lifecycle hooks have never reported an event while the managed "
@@ -73,6 +81,14 @@ _RUNTIME_SILENCE_ALARMS = {
         "silence cannot be distinguished from a broken hook"
     ),
 }
+
+
+def _remember_lifecycle_identities(
+    existing: tuple[str, ...],
+    new: tuple[str, ...],
+) -> tuple[str, ...]:
+    remembered = tuple(dict.fromkeys(existing + new))
+    return remembered[-LIFECYCLE_IDENTITY_HISTORY_LIMIT:]
 
 
 def _stderr_belongs_to_someone_else() -> bool:
@@ -237,6 +253,9 @@ class UsageObservation(BaseModel):
     cumulative_tokens: int | None = Field(default=None, ge=0)
 
 
+_UsageSampleResult = tuple[int, str, UsageObservation | Exception]
+
+
 class CheckpointRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -372,6 +391,22 @@ class SupervisorSnapshot(BaseModel):
     checkpoint_fingerprint: str | None = None
     checkpoint_path: Path | None = None
     warning_emitted: bool = False
+    # High-water mark of `ActivitySnapshot.pre_compact_seen` this supervisor has
+    # already acted on, so one compaction releases at most one drain (BOU-2565).
+    # Persisted rather than in-memory: a supervisor that restarts mid-generation
+    # would otherwise re-consume every retained compaction event and cancel the
+    # next legitimate rotation.
+    pre_compact_consumed: int = Field(default=0, ge=0)
+    pre_compact_consumed_identity: str | None = None
+    pre_compact_consumed_identities: tuple[str, ...] = ()
+    # Handoff requests at or below this count predate a drain cancellation and no
+    # longer authorise a rotation. Consent given before a self-compaction is about
+    # work the runtime has since replaced (BOU-2565 review).
+    handoff_consent_invalidated_at: int = Field(default=0, ge=0)
+    handoff_consent_invalidated_identity: str | None = None
+    handoff_consent_invalidated_identities: tuple[str, ...] = ()
+    self_compaction_pending: bool = False
+    self_compaction_pending_until: datetime | None = None
     usage_sample_failure_streak: int = Field(default=0, ge=0)
     non_confident_sample_streak: int = Field(default=0, ge=0)
     usage_alarm: str | None = Field(default=None, max_length=320)
@@ -605,9 +640,26 @@ class Supervisor:
         return self.snapshot
 
     def tick(self, activity: ActivitySnapshot) -> SupervisorSnapshot:
+        # The usage adapter is an out-of-process probe with its own timeout.
+        # Capture the process identity under the transition lock, perform the
+        # potentially slow sample without it, then refresh before applying the
+        # result. Stop only waits for the short state transition, not the probe.
         with exclusive_lock(self.transition_lock_path):
             self._refresh()
-            return self._tick_unlocked(activity)
+            usage_process = (
+                self.current_process
+                if self.snapshot.phase
+                in {
+                    SupervisorPhase.RUNNING,
+                    SupervisorPhase.WARNING,
+                    SupervisorPhase.DRAINING,
+                }
+                else None
+            )
+        usage_sample = self._sample_usage(usage_process)
+        with exclusive_lock(self.transition_lock_path):
+            self._refresh()
+            return self._tick_unlocked(activity, usage_sample=usage_sample)
 
     def shutdown(self) -> SupervisorSnapshot:
         """Stop the managed child and durably fail closed for terminal CLI exit."""
@@ -804,7 +856,12 @@ class Supervisor:
             ) from exit_cleanup_error
         return self.snapshot
 
-    def _tick_unlocked(self, activity: ActivitySnapshot) -> SupervisorSnapshot:
+    def _tick_unlocked(
+        self,
+        activity: ActivitySnapshot,
+        *,
+        usage_sample: _UsageSampleResult | None,
+    ) -> SupervisorSnapshot:
         if self.snapshot.phase is SupervisorPhase.INITIAL:
             raise RuntimeError("supervisor must be started before ticking")
         self._ensure_active_process_is_live()
@@ -833,7 +890,8 @@ class Supervisor:
             SupervisorPhase.WARNING,
             SupervisorPhase.DRAINING,
         }:
-            self._observe_usage()
+            self._observe_usage(usage_sample)
+            self._release_drain_on_self_compaction(activity)
             # BOU-2222: evaluated in RUNNING and WARNING too. A session whose
             # hooks are dead is already broken there; waiting until it reaches
             # DRAINING to notice means the first symptom is a session that has
@@ -843,9 +901,26 @@ class Supervisor:
                 # Safety gates, never relaxed: the runtime asked to hand off and
                 # nothing is outstanding. Rotating past either would be worse
                 # than the latch this change removes.
+                handoff = self._latest_managed_signal(
+                    activity.handoff_requested_signals
+                )
+                if activity.handoff_requested_signals:
+                    handoff_missing_or_stale = (
+                        handoff is None
+                        or handoff.identity
+                        == self.snapshot.handoff_consent_invalidated_identity
+                        or handoff.identity
+                        in self.snapshot.handoff_consent_invalidated_identities
+                    )
+                else:
+                    handoff_missing_or_stale = (
+                        self.snapshot.generation
+                        not in activity.handoff_requested_generations
+                        or activity.handoff_requested_seen
+                        <= self.snapshot.handoff_consent_invalidated_at
+                    )
                 if (
-                    self.snapshot.generation
-                    not in activity.handoff_requested_generations
+                    handoff_missing_or_stale
                     or activity.quiescence is not Quiescence.IDLE
                 ):
                     return self.snapshot
@@ -953,6 +1028,14 @@ class Supervisor:
                 "runtime_silence_streak": 0,
                 "runtime_silence_since": None,
                 "liveness_alarm": None,
+                "pre_compact_consumed": 0,
+                "pre_compact_consumed_identity": None,
+                "pre_compact_consumed_identities": (),
+                "handoff_consent_invalidated_at": 0,
+                "handoff_consent_invalidated_identity": None,
+                "handoff_consent_invalidated_identities": (),
+                "self_compaction_pending": False,
+                "self_compaction_pending_until": None,
             }
         )
         self._persist()
@@ -1031,18 +1114,36 @@ class Supervisor:
         )
         return self._advance_rotation()
 
-    def _observe_usage(self) -> None:
+    def _sample_usage(
+        self,
+        process: ManagedProcess | None,
+    ) -> _UsageSampleResult | None:
+        if process is None:
+            return None
+        try:
+            sample: UsageObservation | Exception = self.usage_reader.sample(process)
+        except Exception as exc:
+            sample = exc
+        return process.pid, process.registry_key, sample
+
+    def _observe_usage(self, sampled: _UsageSampleResult | None) -> None:
         if self.current_process is None:
             raise RuntimeError("managed process metadata is unavailable")
-        try:
-            sample = self.usage_reader.sample(self.current_process)
-        except Exception as exc:
+        if sampled is None:
+            return
+        process_pid, registry_key, sample = sampled
+        if (
+            process_pid != self.current_process.pid
+            or registry_key != self.current_process.registry_key
+        ):
+            return
+        if isinstance(sample, Exception):
             # BOU-2208: the usage adapter is an out-of-process helper with a
             # short timeout, so a transient failure is expected. It used to
             # unwind `tick()` into the CLI's terminal `shutdown()`, which
             # persists BLOCKED and kills the runtime -- one flaky five-second
             # invocation destroyed a live session. Degrade instead.
-            self._record_usage_sample_failure(exc)
+            self._record_usage_sample_failure(sample)
             return
 
         confident = sample.confidence is Confidence.CONFIDENT
@@ -1093,7 +1194,177 @@ class Supervisor:
                 "ticks; rotation decisions now use unverified context"
             )
 
+    def _release_drain_on_self_compaction(self, activity: ActivitySnapshot) -> None:
+        """Let the runtime's OWN compaction cancel a drain (BOU-2565).
+
+        The percentage-based demotion in ``_apply_usage_thresholds`` cannot save
+        the sessions this was filed for: ``_observe_usage`` only calls it when
+        the sample is not UNKNOWN, and the captured chain had
+        ``context_confidence: unknown`` for 121 consecutive ticks. So a
+        confidence-gated recovery never fires on exactly the runtimes that latch.
+
+        ``context.pre_compact`` does not go through usage sampling at all -- it
+        is the runtime telling us it is compacting itself. That makes it the only
+        signal that reliably arrives for a latched session, and it means the same
+        thing a rotation means: the context is about to be reclaimed. Treat it as
+        an implicit ``cancel_rotation``.
+
+        Only from DRAINING. Past that a checkpoint or fence is already in flight
+        and must not be silently abandoned.
+
+        **Consumed once per event.** ``pre_compact_generations`` is a fold over
+        RETAINED history, so once a generation has compacted it stays in that set
+        forever. Treating membership as the trigger would mean: context regrows
+        to the rotate threshold in the same generation, `_observe_usage` enters
+        DRAINING, this immediately returns it to RUNNING off the stale event, and
+        it repeats on every tick — rotation permanently disabled, because the
+        generation can only advance THROUGH a rotation. So the trigger is the
+        monotonic ``pre_compact_seen`` watermark advancing past what this
+        supervisor already acted on, which also means a genuine SECOND
+        compaction in the same generation still releases (review round 1).
+        """
+        signal = self._latest_managed_signal(activity.pre_compact_signals)
+        if activity.pre_compact_signals:
+            if (
+                signal is None
+                or signal.identity == self.snapshot.pre_compact_consumed_identity
+                or signal.identity in self.snapshot.pre_compact_consumed_identities
+            ):
+                return
+        else:
+            if self.snapshot.generation not in activity.pre_compact_generations:
+                return
+            if activity.pre_compact_seen <= self.snapshot.pre_compact_consumed:
+                return
+
+        # Consume FIRST, and regardless of phase. A compaction observed while
+        # RUNNING or WARNING (usage sampling is often UNKNOWN right when the
+        # runtime auto-compacts) cannot cancel anything — but if it is left
+        # unconsumed, a later drain in the same generation is cancelled by that
+        # stale event, which is the same defect as the repeat case one path over
+        # (review round 2).
+        updates: dict[str, object] = {
+            "pre_compact_consumed": activity.pre_compact_seen,
+            "pre_compact_consumed_identity": (
+                signal.identity if signal is not None else None
+            ),
+            "pre_compact_consumed_identities": _remember_lifecycle_identities(
+                self.snapshot.pre_compact_consumed_identities,
+                (signal.identity,) if signal is not None else (),
+            ),
+        }
+        releasing = self.snapshot.phase is SupervisorPhase.DRAINING
+        if releasing:
+            updates["phase"] = SupervisorPhase.RUNNING
+            updates["warning_emitted"] = False
+            updates["self_compaction_pending"] = True
+            updates["self_compaction_pending_until"] = self._now() + timedelta(
+                seconds=SELF_COMPACTION_GRACE_SECONDS
+            )
+            # Consent to rotate does not survive the compaction it preceded.
+            # `handoff_requested_generations` is a retained fold, so without this
+            # a Stop that requested handoff BEFORE the compaction would still
+            # authorise a rotation after it — in the same generation, about work
+            # the runtime has since replaced. Invalidate anything already
+            # requested; a genuine later request advances the count past this.
+            updates["handoff_consent_invalidated_at"] = activity.handoff_requested_seen
+            handoff = self._latest_managed_signal(activity.handoff_requested_signals)
+            updates["handoff_consent_invalidated_identity"] = (
+                handoff.identity if handoff is not None else None
+            )
+            invalidated = tuple(
+                item.identity
+                for item in activity.handoff_requested_signals
+                if (
+                    item.generation == self.snapshot.generation
+                    and self.snapshot.conversation_id is not None
+                    and item.conversation_id == self.snapshot.conversation_id
+                )
+            )
+            updates["handoff_consent_invalidated_identities"] = (
+                _remember_lifecycle_identities(
+                    self.snapshot.handoff_consent_invalidated_identities,
+                    invalidated,
+                )
+            )
+        self.snapshot = self.snapshot.model_copy(update=updates)
+        self._persist()
+        if not releasing:
+            return
+        # The Stop-request marker keys on (chain_id, generation), which this
+        # cancellation preserves — so leaving it would make the next Stop report
+        # "already requested" and skip asking the runtime to persist its NEW next
+        # action. Clear it so the next drain asks fresh.
+        self._clear_stop_request_marker()
+        self._effect(
+            "rotation",
+            "canceled-by-self-compaction",
+            generation=self.snapshot.generation,
+        )
+
+    def _latest_managed_signal(
+        self, signals: tuple[LifecycleSignal, ...]
+    ) -> LifecycleSignal | None:
+        """Return the newest signal for the exact managed conversation."""
+        for signal in reversed(signals):
+            if (
+                signal.generation == self.snapshot.generation
+                and self.snapshot.conversation_id is not None
+                and signal.conversation_id == self.snapshot.conversation_id
+            ):
+                return signal
+        return None
+
+    def _clear_stop_request_marker(self) -> None:
+        """Drop the `.stop-request` marker; best-effort by design."""
+        # Local import: `hooks.command` imports this module, so a top-level
+        # import here would be circular.
+        from .hooks.command import stop_request_path
+
+        marker = stop_request_path(self.state_path)
+        try:
+            with exclusive_lock(marker.with_suffix(marker.suffix + ".lock")):
+                private_unlink(marker)
+        except (OSError, ValueError):
+            return
+
     def _apply_usage_thresholds(self, context_percent: float) -> None:
+        # BOU-2565 deliberately does NOT add a "context fell back below
+        # warn_percent -> RUNNING" demotion here, though that is the obvious
+        # reading of the symptom. Two reasons:
+        #
+        #   1. `test_supervisor_warns_drains_waits_then_rotates_without_overlap`
+        #      pins the opposite contract on purpose — a drop to 10% mid-drain
+        #      must keep DRAINING. Once a rotation is committed, a falling
+        #      percentage does not cancel it.
+        #   2. It could not fix the reported sessions anyway. `_observe_usage`
+        #      only calls this when the sample is not UNKNOWN, and the captured
+        #      chain sat at `context_confidence: unknown` for 121 consecutive
+        #      ticks — so a confidence-gated demotion never fires on exactly the
+        #      runtimes that latch.
+        #
+        # The release is driven by `context.pre_compact` instead: a positive
+        # signal that the runtime reclaimed its own context, not an inference
+        # from a percentage that may just be noise. See
+        # `_release_drain_on_self_compaction`.
+        if self.snapshot.self_compaction_pending:
+            if context_percent < self.rotate_percent:
+                self.snapshot = self.snapshot.model_copy(
+                    update={
+                        "self_compaction_pending": False,
+                        "self_compaction_pending_until": None,
+                    }
+                )
+                return
+            pending_until = self.snapshot.self_compaction_pending_until
+            if pending_until is not None and self._now() < pending_until:
+                return
+            self.snapshot = self.snapshot.model_copy(
+                update={
+                    "self_compaction_pending": False,
+                    "self_compaction_pending_until": None,
+                }
+            )
         if (
             self.snapshot.phase is SupervisorPhase.RUNNING
             and context_percent >= self.warn_percent

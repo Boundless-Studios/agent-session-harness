@@ -440,3 +440,138 @@ def test_integrity_warnings_alone_do_not_claim_the_hooks_are_dead(tmp_path) -> N
 
     assert snapshot.quiescence is activity.Quiescence.UNKNOWN
     assert snapshot.runtime_liveness is activity.RuntimeLiveness.REPORTING
+
+
+def test_pre_compact_events_are_folded_per_generation(tmp_path) -> None:
+    """`context.pre_compact` must reach the supervisor as a generation set.
+
+    The event type and its `PreCompact` hook mapping already existed but nothing
+    consumed them — it was a dead event. BOU-2565 makes it the signal that
+    releases a latched drain, so the fold is the production wiring that makes
+    that work; the supervisor tests inject ActivitySnapshot directly and would
+    not catch its absence.
+    """
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+
+    ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "event-2",
+            "context.pre_compact",
+            generation=3,
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.pre_compact_generations == frozenset({3})
+    assert [
+        (signal.event_id, signal.generation, signal.conversation_id)
+        for signal in snapshot.pre_compact_signals
+    ] == [("event-2", 3, "conversation-1")]
+
+
+def test_pre_compact_signals_preserve_conversation_and_generation(tmp_path) -> None:
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "nested",
+            "context.pre_compact",
+            conversation_id="nested-conversation",
+        )
+    )
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "delayed",
+            "context.pre_compact",
+            generation=2,
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    )
+
+    assert {
+        (signal.event_id, signal.generation, signal.conversation_id)
+        for signal in snapshot.pre_compact_signals
+    } == {
+        ("nested", 0, "nested-conversation"),
+        ("delayed", 2, "conversation-1"),
+    }
+
+
+def test_replaced_ledger_preserves_event_identity(tmp_path) -> None:
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "compact", "context.pre_compact"))
+    first = ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    ).pre_compact_signals[0]
+
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(
+        _event(events, tmp_path, "compact", "context.pre_compact").model_dump_json()
+        + "\n",
+        encoding="utf-8",
+    )
+    replacement.replace(ledger.path)
+    second = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    ).pre_compact_signals[0]
+
+    assert second.identity == first.identity
+
+
+def test_handoff_requests_expose_a_monotonic_watermark(tmp_path) -> None:
+    """Retained generation membership cannot distinguish newer consent."""
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "event-1", "handoff.requested"))
+    ledger.append(
+        _event(
+            events,
+            tmp_path,
+            "event-2",
+            "handoff.requested",
+            timestamp=NOW + timedelta(seconds=1),
+        )
+    )
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=2),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.handoff_requested_generations == frozenset({0})
+    assert snapshot.handoff_requested_seen == 2
+
+
+def test_pre_compact_is_absent_when_the_runtime_never_compacted(tmp_path) -> None:
+    """Control: the set stays empty, so a drain is never released by accident."""
+    _models, events, ledger_module, _activity = _modules()
+    ledger = ledger_module.EventLedger(tmp_path / "events.jsonl")
+    ledger.append(_event(events, tmp_path, "event-1", "tool.started"))
+
+    snapshot = ledger.materialize(
+        now=NOW + timedelta(seconds=1),
+        stale_after_seconds=30,
+    )
+
+    assert snapshot.pre_compact_generations == frozenset()

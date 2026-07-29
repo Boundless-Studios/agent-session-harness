@@ -142,7 +142,7 @@ def stop_handshake(
 
 
 def handoff_requested_event(stop_event: LifecycleEvent) -> LifecycleEvent:
-    """Derive one sanitized, generation-stable handoff request event."""
+    """Derive one sanitized handoff request event per distinct Stop."""
 
     if stop_event.event_type is not EventType.TURN_IDLE:
         raise ValueError("handoff request must derive from a Stop event")
@@ -153,6 +153,7 @@ def handoff_requested_event(stop_event: LifecycleEvent) -> LifecycleEvent:
             stop_event.conversation_id,
             str(stop_event.generation),
             EventType.HANDOFF_REQUESTED.value,
+            stop_event.event_id,
         )
     )
     return LifecycleEvent(
