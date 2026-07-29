@@ -459,6 +459,38 @@ def test_stop_rejects_an_owner_other_than_the_managed_runtime(tmp_path: Path) ->
     assert not (tmp_path / "events.jsonl").exists()
 
 
+def test_stop_request_is_serialized_with_drain_cancellation(tmp_path: Path) -> None:
+    _native, command = _modules()
+    secure_files = importlib.import_module("agent_session_harness.secure_files")
+    state_path = tmp_path / "supervisor.json"
+    _write_supervisor_state(state_path, runtime="codex", phase="draining")
+    environ = _stop_environment(tmp_path, state_path)
+    transition_lock = state_path.with_suffix(state_path.suffix + ".transition.lock")
+    result: list[tuple[int, str, str]] = []
+
+    with secure_files.exclusive_lock(transition_lock):
+        worker = threading.Thread(
+            target=lambda: result.append(
+                _run_stop(
+                    command,
+                    runtime="codex",
+                    tmp_path=tmp_path,
+                    environ=environ,
+                )
+            )
+        )
+        worker.start()
+        time.sleep(0.05)
+        assert worker.is_alive(), "Stop must wait for the supervisor transition"
+        _write_supervisor_state(state_path, runtime="codex", phase="running")
+
+    worker.join(timeout=2)
+    assert not worker.is_alive()
+    assert result == [(0, "", "")]
+    ledger_text = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    assert "handoff.requested" not in ledger_text
+
+
 def test_hook_command_requires_managed_mode_and_appends_locally(tmp_path) -> None:
     _native, command = _modules()
     payload = {

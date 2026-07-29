@@ -59,6 +59,14 @@ RUNTIME_SILENCE_ALARM_TICKS = 3
 # session that is a few hundred milliseconds old. Silence only means something
 # once it has lasted longer than a plausible gap between hook events.
 RUNTIME_SILENCE_GRACE_SECONDS = 60.0
+# Retained only within one generation (cleared on successor acknowledgement).
+# The bound prevents malformed/replayed lifecycle logs from growing snapshots
+# without limit while covering far more compactions or Stop requests than one
+# generation can reasonably produce.
+LIFECYCLE_IDENTITY_HISTORY_LIMIT = 64
+# PreCompact is emitted before reclamation finishes. Give the runtime a bounded
+# window to produce a low sample, then let a still-high session drain normally.
+SELF_COMPACTION_GRACE_SECONDS = 30.0
 _RUNTIME_SILENCE_ALARMS = {
     RuntimeLiveness.NEVER_REPORTED: (
         "runtime lifecycle hooks have never reported an event while the managed "
@@ -73,6 +81,14 @@ _RUNTIME_SILENCE_ALARMS = {
         "silence cannot be distinguished from a broken hook"
     ),
 }
+
+
+def _remember_lifecycle_identities(
+    existing: tuple[str, ...],
+    new: tuple[str, ...],
+) -> tuple[str, ...]:
+    remembered = tuple(dict.fromkeys(existing + new))
+    return remembered[-LIFECYCLE_IDENTITY_HISTORY_LIMIT:]
 
 
 def _stderr_belongs_to_someone_else() -> bool:
@@ -379,12 +395,15 @@ class SupervisorSnapshot(BaseModel):
     # next legitimate rotation.
     pre_compact_consumed: int = Field(default=0, ge=0)
     pre_compact_consumed_identity: str | None = None
+    pre_compact_consumed_identities: tuple[str, ...] = ()
     # Handoff requests at or below this count predate a drain cancellation and no
     # longer authorise a rotation. Consent given before a self-compaction is about
     # work the runtime has since replaced (BOU-2565 review).
     handoff_consent_invalidated_at: int = Field(default=0, ge=0)
     handoff_consent_invalidated_identity: str | None = None
+    handoff_consent_invalidated_identities: tuple[str, ...] = ()
     self_compaction_pending: bool = False
+    self_compaction_pending_until: datetime | None = None
     usage_sample_failure_streak: int = Field(default=0, ge=0)
     non_confident_sample_streak: int = Field(default=0, ge=0)
     usage_alarm: str | None = Field(default=None, max_length=320)
@@ -865,6 +884,8 @@ class Supervisor:
                         handoff is None
                         or handoff.identity
                         == self.snapshot.handoff_consent_invalidated_identity
+                        or handoff.identity
+                        in self.snapshot.handoff_consent_invalidated_identities
                     )
                 else:
                     handoff_missing_or_stale = (
@@ -982,6 +1003,14 @@ class Supervisor:
                 "runtime_silence_streak": 0,
                 "runtime_silence_since": None,
                 "liveness_alarm": None,
+                "pre_compact_consumed": 0,
+                "pre_compact_consumed_identity": None,
+                "pre_compact_consumed_identities": (),
+                "handoff_consent_invalidated_at": 0,
+                "handoff_consent_invalidated_identity": None,
+                "handoff_consent_invalidated_identities": (),
+                "self_compaction_pending": False,
+                "self_compaction_pending_until": None,
             }
         )
         self._persist()
@@ -1156,6 +1185,7 @@ class Supervisor:
             if (
                 signal is None
                 or signal.identity == self.snapshot.pre_compact_consumed_identity
+                or signal.identity in self.snapshot.pre_compact_consumed_identities
             ):
                 return
         else:
@@ -1175,12 +1205,19 @@ class Supervisor:
             "pre_compact_consumed_identity": (
                 signal.identity if signal is not None else None
             ),
+            "pre_compact_consumed_identities": _remember_lifecycle_identities(
+                self.snapshot.pre_compact_consumed_identities,
+                (signal.identity,) if signal is not None else (),
+            ),
         }
         releasing = self.snapshot.phase is SupervisorPhase.DRAINING
         if releasing:
             updates["phase"] = SupervisorPhase.RUNNING
             updates["warning_emitted"] = False
             updates["self_compaction_pending"] = True
+            updates["self_compaction_pending_until"] = self._now() + timedelta(
+                seconds=SELF_COMPACTION_GRACE_SECONDS
+            )
             # Consent to rotate does not survive the compaction it preceded.
             # `handoff_requested_generations` is a retained fold, so without this
             # a Stop that requested handoff BEFORE the compaction would still
@@ -1191,6 +1228,21 @@ class Supervisor:
             handoff = self._latest_managed_signal(activity.handoff_requested_signals)
             updates["handoff_consent_invalidated_identity"] = (
                 handoff.identity if handoff is not None else None
+            )
+            invalidated = tuple(
+                item.identity
+                for item in activity.handoff_requested_signals
+                if (
+                    item.generation == self.snapshot.generation
+                    and self.snapshot.conversation_id is not None
+                    and item.conversation_id == self.snapshot.conversation_id
+                )
+            )
+            updates["handoff_consent_invalidated_identities"] = (
+                _remember_lifecycle_identities(
+                    self.snapshot.handoff_consent_invalidated_identities,
+                    invalidated,
+                )
             )
         self.snapshot = self.snapshot.model_copy(update=updates)
         self._persist()
@@ -1255,9 +1307,21 @@ class Supervisor:
         if self.snapshot.self_compaction_pending:
             if context_percent < self.rotate_percent:
                 self.snapshot = self.snapshot.model_copy(
-                    update={"self_compaction_pending": False}
+                    update={
+                        "self_compaction_pending": False,
+                        "self_compaction_pending_until": None,
+                    }
                 )
-            return
+                return
+            pending_until = self.snapshot.self_compaction_pending_until
+            if pending_until is not None and self._now() < pending_until:
+                return
+            self.snapshot = self.snapshot.model_copy(
+                update={
+                    "self_compaction_pending": False,
+                    "self_compaction_pending_until": None,
+                }
+            )
         if (
             self.snapshot.phase is SupervisorPhase.RUNNING
             and context_percent >= self.warn_percent

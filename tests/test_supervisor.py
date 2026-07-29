@@ -3045,6 +3045,61 @@ def test_new_compaction_identity_after_ledger_replacement_releases_again(
     assert released.phase.value == "running"
 
 
+def test_ledger_rollback_cannot_replay_any_consumed_compaction(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    first = _signal("compact-a")
+    second = _signal("compact-b")
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(first,)))
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(first, second)))
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+
+    replayed = managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(first,)))
+
+    assert replayed.phase.value == "draining"
+
+
+def test_lifecycle_identity_histories_are_bounded(tmp_path) -> None:
+    _process, supervisor = _modules()
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    limit = supervisor.LIFECYCLE_IDENTITY_HISTORY_LIMIT
+    signals = tuple(_signal(f"compact-{index}") for index in range(limit + 5))
+
+    managed.usage_reader.percent = 10.0
+    for lifecycle_signal in signals:
+        managed.tick(
+            _activity(Quiescence.BUSY, pre_compact_signals=(lifecycle_signal,))
+        )
+
+    assert managed.snapshot.pre_compact_consumed_identities == tuple(
+        signal.identity for signal in signals[-limit:]
+    )
+
+    handoffs = tuple(_signal(f"handoff-{index}") for index in range(limit + 5))
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY, handoff_requested_signals=handoffs))
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=handoffs,
+            pre_compact_signals=(_signal("release"),),
+        )
+    )
+
+    assert managed.snapshot.handoff_consent_invalidated_identities == tuple(
+        signal.identity for signal in handoffs[-limit:]
+    )
+
+
 def test_compaction_release_stays_suppressed_until_low_usage_confirms_completion(
     tmp_path,
 ) -> None:
@@ -3068,6 +3123,30 @@ def test_compaction_release_stays_suppressed_until_low_usage_confirms_completion
     completed = managed.tick(_activity(Quiescence.BUSY))
     assert completed.phase.value == "running"
     assert completed.self_compaction_pending is False
+
+
+def test_compaction_pending_cannot_suppress_rotation_indefinitely(tmp_path) -> None:
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    managed.usage_reader.percent = 70.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.tick(_activity(Quiescence.BUSY, pre_compact_signals=(_signal("compact"),)))
+
+    first_high = managed.tick(_activity(Quiescence.BUSY))
+    second_high = managed.tick(_activity(Quiescence.BUSY))
+
+    assert first_high.phase.value == "running"
+    assert second_high.phase.value == "running"
+
+    managed.snapshot = managed.snapshot.model_copy(
+        update={
+            "self_compaction_pending_until": datetime.now(tz=UTC) - timedelta(seconds=1)
+        }
+    )
+    managed._persist()
+    expired = managed.tick(_activity(Quiescence.BUSY))
+
+    assert expired.phase.value == "draining"
 
 
 def test_fresh_post_compaction_handoff_identity_allows_rotation(tmp_path) -> None:
@@ -3104,6 +3183,42 @@ def test_fresh_post_compaction_handoff_identity_allows_rotation(tmp_path) -> Non
     )
 
     assert fresh.phase is not supervisor.SupervisorPhase.DRAINING
+
+
+def test_ledger_rollback_cannot_restore_any_pre_compaction_handoff(tmp_path) -> None:
+    _process, supervisor = _modules()
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    first = _signal("handoff-a")
+    second = _signal("handoff-b")
+    compact = _signal("compact")
+    managed.usage_reader.percent = 70.0
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=(first, second),
+        )
+    )
+    managed.tick(
+        _activity(
+            Quiescence.BUSY,
+            handoff_requested_signals=(first, second),
+            pre_compact_signals=(compact,),
+        )
+    )
+    managed.usage_reader.percent = 10.0
+    managed.tick(_activity(Quiescence.BUSY))
+    managed.usage_reader.percent = 70.0
+
+    replayed = managed.tick(
+        _activity(
+            Quiescence.IDLE,
+            handoff_requested_signals=(first,),
+            pre_compact_signals=(compact,),
+        )
+    )
+
+    assert replayed.phase is supervisor.SupervisorPhase.DRAINING
 
 
 # ---------------------------------------------------------------------------
