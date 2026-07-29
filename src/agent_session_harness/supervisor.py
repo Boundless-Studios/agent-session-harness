@@ -253,6 +253,9 @@ class UsageObservation(BaseModel):
     cumulative_tokens: int | None = Field(default=None, ge=0)
 
 
+_UsageSampleResult = tuple[int, str, UsageObservation | Exception]
+
+
 class CheckpointRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -637,9 +640,26 @@ class Supervisor:
         return self.snapshot
 
     def tick(self, activity: ActivitySnapshot) -> SupervisorSnapshot:
+        # The usage adapter is an out-of-process probe with its own timeout.
+        # Capture the process identity under the transition lock, perform the
+        # potentially slow sample without it, then refresh before applying the
+        # result. Stop only waits for the short state transition, not the probe.
         with exclusive_lock(self.transition_lock_path):
             self._refresh()
-            return self._tick_unlocked(activity)
+            usage_process = (
+                self.current_process
+                if self.snapshot.phase
+                in {
+                    SupervisorPhase.RUNNING,
+                    SupervisorPhase.WARNING,
+                    SupervisorPhase.DRAINING,
+                }
+                else None
+            )
+        usage_sample = self._sample_usage(usage_process)
+        with exclusive_lock(self.transition_lock_path):
+            self._refresh()
+            return self._tick_unlocked(activity, usage_sample=usage_sample)
 
     def shutdown(self) -> SupervisorSnapshot:
         """Stop the managed child and durably fail closed for terminal CLI exit."""
@@ -836,7 +856,12 @@ class Supervisor:
             ) from exit_cleanup_error
         return self.snapshot
 
-    def _tick_unlocked(self, activity: ActivitySnapshot) -> SupervisorSnapshot:
+    def _tick_unlocked(
+        self,
+        activity: ActivitySnapshot,
+        *,
+        usage_sample: _UsageSampleResult | None,
+    ) -> SupervisorSnapshot:
         if self.snapshot.phase is SupervisorPhase.INITIAL:
             raise RuntimeError("supervisor must be started before ticking")
         self._ensure_active_process_is_live()
@@ -865,7 +890,7 @@ class Supervisor:
             SupervisorPhase.WARNING,
             SupervisorPhase.DRAINING,
         }:
-            self._observe_usage()
+            self._observe_usage(usage_sample)
             self._release_drain_on_self_compaction(activity)
             # BOU-2222: evaluated in RUNNING and WARNING too. A session whose
             # hooks are dead is already broken there; waiting until it reaches
@@ -1089,18 +1114,36 @@ class Supervisor:
         )
         return self._advance_rotation()
 
-    def _observe_usage(self) -> None:
+    def _sample_usage(
+        self,
+        process: ManagedProcess | None,
+    ) -> _UsageSampleResult | None:
+        if process is None:
+            return None
+        try:
+            sample: UsageObservation | Exception = self.usage_reader.sample(process)
+        except Exception as exc:
+            sample = exc
+        return process.pid, process.registry_key, sample
+
+    def _observe_usage(self, sampled: _UsageSampleResult | None) -> None:
         if self.current_process is None:
             raise RuntimeError("managed process metadata is unavailable")
-        try:
-            sample = self.usage_reader.sample(self.current_process)
-        except Exception as exc:
+        if sampled is None:
+            return
+        process_pid, registry_key, sample = sampled
+        if (
+            process_pid != self.current_process.pid
+            or registry_key != self.current_process.registry_key
+        ):
+            return
+        if isinstance(sample, Exception):
             # BOU-2208: the usage adapter is an out-of-process helper with a
             # short timeout, so a transient failure is expected. It used to
             # unwind `tick()` into the CLI's terminal `shutdown()`, which
             # persists BLOCKED and kills the runtime -- one flaky five-second
             # invocation destroyed a live session. Degrade instead.
-            self._record_usage_sample_failure(exc)
+            self._record_usage_sample_failure(sample)
             return
 
         confident = sample.confidence is Confidence.CONFIDENT

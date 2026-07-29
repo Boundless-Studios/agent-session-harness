@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -1966,6 +1967,54 @@ def test_competing_supervisors_refresh_under_one_transition_lock(tmp_path) -> No
 
     assert [call[0] for call in coordinator.calls] == ["claim"]
     assert [call[0] for call in driver.calls] == ["start"]
+
+
+def test_usage_sampling_does_not_hold_the_transition_lock(tmp_path) -> None:
+    secure_files = importlib.import_module("agent_session_harness.secure_files")
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+    sampling_started = threading.Event()
+    allow_sampling_to_finish = threading.Event()
+    transition_acquired = threading.Event()
+    original_sample = managed.usage_reader.sample
+    errors: list[BaseException] = []
+
+    def blocking_sample(process):
+        sampling_started.set()
+        if not allow_sampling_to_finish.wait(timeout=2):
+            raise TimeoutError("test did not release usage sampling")
+        return original_sample(process)
+
+    managed.usage_reader.sample = blocking_sample
+
+    def run_tick() -> None:
+        try:
+            managed.tick(_activity(Quiescence.BUSY))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def acquire_transition() -> None:
+        with secure_files.exclusive_lock(managed.transition_lock_path):
+            transition_acquired.set()
+
+    tick_worker = threading.Thread(target=run_tick)
+    lock_worker = threading.Thread(target=acquire_transition)
+    tick_worker.start()
+    assert sampling_started.wait(timeout=1)
+    lock_worker.start()
+    try:
+        assert transition_acquired.wait(timeout=0.5), (
+            "a slow usage adapter must not consume the Stop hook's transition-lock "
+            "budget"
+        )
+    finally:
+        allow_sampling_to_finish.set()
+        tick_worker.join(timeout=2)
+        lock_worker.join(timeout=2)
+
+    assert not tick_worker.is_alive()
+    assert not lock_worker.is_alive()
+    assert errors == []
 
 
 def test_periodic_heartbeat_and_stale_owner_failure_are_fail_closed(tmp_path) -> None:
