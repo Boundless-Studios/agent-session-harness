@@ -3432,6 +3432,28 @@ def test_supervisor_preserves_unknown_fields_when_rewriting_state(tmp_path) -> N
     assert rewritten["future_top_level"] == {"enabled": True}
 
 
+def test_replacing_claim_drops_unknown_metadata_from_the_predecessor(tmp_path) -> None:
+    _process, supervisor = _modules()
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["future_top_level"] = {"enabled": True}
+    payload["claim"]["future_claim_metadata"] = "belongs-to-predecessor"
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    managed.snapshot = managed._load().model_copy(
+        update={"phase": supervisor.SupervisorPhase.CLAIMING}
+    )
+    with pytest.raises(RuntimeError, match="verified checkpoint"):
+        managed._advance_rotation()
+
+    rewritten = json.loads(state_path.read_text(encoding="utf-8"))
+    assert rewritten["future_top_level"] == {"enabled": True}
+    assert "future_claim_metadata" not in rewritten["claim"]
+
+
 def test_mismatched_state_is_rejected_before_skew_is_recorded(tmp_path) -> None:
     """Identity is checked BEFORE anything is journaled (review round 2).
 
@@ -3517,3 +3539,41 @@ def test_version_skew_is_announced_once_and_recorded_durably(tmp_path, capsys) -
         f"{len(skew_lines)}"
     )
     assert "field_from_the_future" in skew_lines[0]
+
+
+def test_version_skew_journaling_retries_after_a_temporary_failure(
+    tmp_path, monkeypatch
+) -> None:
+    _process, supervisor = _modules()
+    managed, _kwargs, _driver, _coordinator, _checkpoints = _supervisor(tmp_path)
+    managed.start()
+
+    state_path = tmp_path / "supervisor.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["field_from_the_future"] = 1
+    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    real_append = supervisor.append_private_text
+    attempts = 0
+
+    def fail_first_skew_append(path, text):
+        nonlocal attempts
+        if '"status":"version-skew"' in text and attempts == 0:
+            attempts += 1
+            raise OSError("temporarily unavailable")
+        return real_append(path, text)
+
+    monkeypatch.setattr(supervisor, "append_private_text", fail_first_skew_append)
+
+    managed._load()
+    managed._load()
+    managed._load()
+
+    effects = (tmp_path / "supervisor.json.events").read_text(encoding="utf-8")
+    skew_lines = [
+        line
+        for line in effects.splitlines()
+        if '"status":"version-skew"' in line.replace(" ", "")
+    ]
+    assert attempts == 1
+    assert len(skew_lines) == 1
