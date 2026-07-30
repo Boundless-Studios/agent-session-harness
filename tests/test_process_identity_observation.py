@@ -13,7 +13,6 @@ from agent_session_harness.process_identity import (
     legacy_process_fingerprint,
 )
 
-
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
 RUNNING = NativeProcessRecord(
     pid=42,

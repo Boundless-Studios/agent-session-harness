@@ -13,7 +13,6 @@ from agent_session_harness.process_identity import (
     same_process,
 )
 
-
 CAPTURED_AT = datetime(2026, 7, 30, tzinfo=UTC)
 
 
@@ -73,7 +72,7 @@ def test_contract_rejects_unsupported_major_version(
         ("pid", 0),
         ("opaque_start_token", ""),
         ("executable_identity", ""),
-        ("captured_at", datetime(2026, 7, 30)),
+        ("captured_at", datetime(2026, 7, 30)),  # noqa: DTZ001 - invalid fixture
     ],
 )
 def test_identity_rejects_untrustworthy_fields(
