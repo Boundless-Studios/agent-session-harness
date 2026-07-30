@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -373,3 +375,158 @@ class LinuxProcessReader:
     @staticmethod
     def _read_proc_executable(pid: int) -> str:
         return os.readlink(f"/proc/{pid}/exe")
+
+
+@dataclass(frozen=True)
+class DarwinNativeInfo:
+    pid: int
+    parent_pid: int
+    status: int
+    start_seconds: int
+    start_microseconds: int
+
+
+class DarwinProcessReader:
+    platform = ProcessPlatform.DARWIN
+    _ZOMBIE_STATUS = 5
+
+    def __init__(
+        self,
+        read_info: Callable[[int], DarwinNativeInfo] | None = None,
+        read_path: Callable[[int], str] | None = None,
+    ) -> None:
+        self._read_info = read_info or self._read_libproc_info
+        self._read_path = read_path or self._read_libproc_path
+
+    def read(self, pid: int) -> NativeReadResult:
+        try:
+            info = self._read_info(pid)
+        except (FileNotFoundError, ProcessLookupError):
+            return NativeReadResult.missing()
+        except (OSError, ValueError):
+            return NativeReadResult.unknown("proc_info_unavailable")
+        if (
+            info.pid != pid
+            or info.parent_pid < 0
+            or info.start_seconds <= 0
+            or not 0 <= info.start_microseconds < 1_000_000
+        ):
+            return NativeReadResult.unknown("proc_info_malformed")
+
+        state = (
+            ProcessState.ZOMBIE
+            if info.status == self._ZOMBIE_STATUS
+            else ProcessState.RUNNING
+        )
+        executable = None
+        if state is not ProcessState.ZOMBIE:
+            try:
+                executable = self._read_path(pid)
+            except (FileNotFoundError, ProcessLookupError):
+                return NativeReadResult.missing()
+            except (OSError, ValueError):
+                return NativeReadResult.unknown("executable_unavailable")
+            if not executable:
+                return NativeReadResult.unknown("executable_unavailable")
+        return NativeReadResult.present(
+            NativeProcessRecord(
+                pid=pid,
+                parent_pid=info.parent_pid,
+                state=state,
+                opaque_start_token=(
+                    f"darwin:{info.start_seconds}:{info.start_microseconds}"
+                ),
+                executable_identity=executable,
+            )
+        )
+
+    @staticmethod
+    def _read_libproc_info(pid: int) -> DarwinNativeInfo:
+        return _read_libproc_info(pid)
+
+    @staticmethod
+    def _read_libproc_path(pid: int) -> str:
+        return _read_libproc_path(pid)
+
+
+class _DarwinProcessInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _raise_libproc_error(pid: int) -> None:
+    error = ctypes.get_errno()
+    if error == errno.ESRCH:
+        raise ProcessLookupError(error, "process disappeared", pid)
+    if error in {errno.EACCES, errno.EPERM}:
+        raise PermissionError(error, "process inspection denied", pid)
+    raise OSError(error or errno.EIO, "libproc inspection failed", pid)
+
+
+def _load_libproc() -> ctypes.CDLL:
+    return ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+
+
+def _read_libproc_info(pid: int) -> DarwinNativeInfo:
+    library = _load_libproc()
+    proc_pidinfo = library.proc_pidinfo
+    proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    proc_pidinfo.restype = ctypes.c_int
+    native = _DarwinProcessInfo()
+    size = ctypes.sizeof(native)
+    ctypes.set_errno(0)
+    result = proc_pidinfo(pid, 3, 0, ctypes.byref(native), size)
+    if result != size:
+        _raise_libproc_error(pid)
+    return DarwinNativeInfo(
+        pid=int(native.pbi_pid),
+        parent_pid=int(native.pbi_ppid),
+        status=int(native.pbi_status),
+        start_seconds=int(native.pbi_start_tvsec),
+        start_microseconds=int(native.pbi_start_tvusec),
+    )
+
+
+def _read_libproc_path(pid: int) -> str:
+    library = _load_libproc()
+    proc_pidpath = library.proc_pidpath
+    proc_pidpath.argtypes = [
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    proc_pidpath.restype = ctypes.c_int
+    buffer = ctypes.create_string_buffer(4096)
+    ctypes.set_errno(0)
+    result = proc_pidpath(pid, buffer, len(buffer))
+    if result <= 0:
+        _raise_libproc_error(pid)
+    return buffer.value.decode("utf-8")
