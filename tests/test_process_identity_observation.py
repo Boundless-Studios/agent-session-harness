@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
 
@@ -5,9 +6,11 @@ from agent_session_harness.process_identity import (
     ManagedResourceReference,
     NativeProcessRecord,
     NativeReadResult,
+    ProcessIdentity,
     ProcessInspector,
     ProcessPlatform,
     ProcessState,
+    legacy_process_fingerprint,
 )
 
 
@@ -49,6 +52,21 @@ def inspector(result: NativeReadResult) -> ProcessInspector:
             }
         ),
         clock=lambda: NOW,
+    )
+
+
+def test_legacy_fingerprint_preserves_existing_registry_value() -> None:
+    identity = ProcessIdentity(
+        platform=ProcessPlatform.LINUX,
+        pid=42,
+        opaque_start_token="linux:12345",
+        executable_identity="/usr/bin/python3",
+        captured_at=NOW,
+    )
+
+    assert (
+        legacy_process_fingerprint(identity)
+        == hashlib.sha256(b"42:linux:12345").hexdigest()
     )
 
 

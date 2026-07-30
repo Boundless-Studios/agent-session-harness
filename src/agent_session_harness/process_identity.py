@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import os
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -90,6 +92,13 @@ def same_process(left: ProcessIdentity, right: ProcessIdentity) -> bool:
         and left.pid == right.pid
         and left.opaque_start_token == right.opaque_start_token
     )
+
+
+def legacy_process_fingerprint(identity: ProcessIdentity) -> str:
+    """Return the registry fingerprint used before the typed contract."""
+
+    value = f"{identity.pid}:{identity.opaque_start_token}"
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -530,3 +539,16 @@ def _read_libproc_path(pid: int) -> str:
     if result <= 0:
         _raise_libproc_error(pid)
     return buffer.value.decode("utf-8")
+
+
+def native_process_reader() -> NativeProcessReader | None:
+    if sys.platform.startswith("linux"):
+        return LinuxProcessReader()
+    if sys.platform == "darwin":
+        return DarwinProcessReader()
+    return None
+
+
+def capture_process_identity(pid: int) -> ProcessIdentity | None:
+    reader = native_process_reader()
+    return ProcessInspector(reader).capture(pid) if reader is not None else None
