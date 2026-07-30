@@ -60,9 +60,7 @@ def test_contract_rejects_unsupported_major_version(
     model: dict[str, object],
 ) -> None:
     contract = (
-        ProcessIdentity
-        if "opaque_start_token" in model
-        else ManagedResourceReference
+        ProcessIdentity if "opaque_start_token" in model else ManagedResourceReference
     )
 
     with pytest.raises(ValidationError):
