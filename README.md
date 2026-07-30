@@ -300,6 +300,37 @@ agent-session-harness report \
 
 Consumers should project this record; they should not infer lifecycle ownership from CPU usage or launch their own model-backed summarizer.
 
+## Process identity and observation
+
+The harness publishes a versioned, platform-neutral process identity contract
+for macOS and Linux. A typed managed-resource reference can associate an
+observation with a runtime or another host-owned resource without importing
+guardian, GitHub, Linear, or session-rotation concepts.
+
+```python
+from agent_session_harness import ManagedResourceReference, ProcessInspector
+from agent_session_harness.process_identity import native_process_reader
+
+reader = native_process_reader()
+if reader is None:
+    raise RuntimeError("native process identity is unavailable")
+inspector = ProcessInspector(reader)
+identity = inspector.capture(pid)
+if identity is not None:
+    observation = inspector.observe(
+        identity,
+        managed_resource=ManagedResourceReference(
+            kind="runtime",
+            resource_key="chain-1:0",
+        ),
+    )
+```
+
+Only `running` is affirmative liveness evidence. `zombie` and `missing` are not
+live; `unknown` is neither evidence of liveness nor permission to reap a
+process. Consumers should preserve unknown additive JSON fields and reject
+unsupported schema major versions.
+
 ## Integration boundaries
 
 - [`agent-coordinator`](https://github.com/Boundless-Studios/agent-coordinator) owns atomic claims and lease-epoch fencing.

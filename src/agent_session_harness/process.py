@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import json
 import math
@@ -22,6 +21,7 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .models import Runtime
+from .process_identity import capture_process_identity, legacy_process_fingerprint
 from .secure_files import (
     atomic_write_private_text,
     exclusive_lock,
@@ -150,35 +150,6 @@ def clear_runtime_abort(
             return
         if marker.owner_pid == expected_owner_pid:
             private_unlink(path)
-
-
-class _DarwinProcessInfo(ctypes.Structure):
-    """Subset of macOS ``proc_bsdinfo`` containing microsecond birth time."""
-
-    _fields_ = [
-        ("pbi_flags", ctypes.c_uint32),
-        ("pbi_status", ctypes.c_uint32),
-        ("pbi_xstatus", ctypes.c_uint32),
-        ("pbi_pid", ctypes.c_uint32),
-        ("pbi_ppid", ctypes.c_uint32),
-        ("pbi_uid", ctypes.c_uint32),
-        ("pbi_gid", ctypes.c_uint32),
-        ("pbi_ruid", ctypes.c_uint32),
-        ("pbi_rgid", ctypes.c_uint32),
-        ("pbi_svuid", ctypes.c_uint32),
-        ("pbi_svgid", ctypes.c_uint32),
-        ("rfu_1", ctypes.c_uint32),
-        ("pbi_comm", ctypes.c_char * 16),
-        ("pbi_name", ctypes.c_char * 32),
-        ("pbi_nfiles", ctypes.c_uint32),
-        ("pbi_pgid", ctypes.c_uint32),
-        ("pbi_pjobc", ctypes.c_uint32),
-        ("e_tdev", ctypes.c_uint32),
-        ("e_tpgid", ctypes.c_uint32),
-        ("pbi_nice", ctypes.c_int32),
-        ("pbi_start_tvsec", ctypes.c_uint64),
-        ("pbi_start_tvusec", ctypes.c_uint64),
-    ]
 
 
 class LaunchRequest(BaseModel):
@@ -591,54 +562,8 @@ class PosixProcessDriver:
 
     @staticmethod
     def _process_identity(pid: int) -> str | None:
-        birth = PosixProcessDriver._kernel_process_birth(pid)
-        if birth is None:
-            return None
-        return hashlib.sha256(f"{pid}:{birth}".encode()).hexdigest()
-
-    @staticmethod
-    def _kernel_process_birth(pid: int) -> str | None:
-        if sys.platform.startswith("linux"):
-            try:
-                encoded = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-            except OSError:
-                return None
-            command_end = encoded.rfind(")")
-            if command_end < 0:
-                return None
-            fields = encoded[command_end + 2 :].split()
-            return f"linux:{fields[19]}" if len(fields) > 19 else None
-        if sys.platform == "darwin":
-            return PosixProcessDriver._darwin_process_birth(pid)
-        return None
-
-    @staticmethod
-    def _darwin_process_birth(pid: int) -> str | None:
-        try:
-            library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            proc_pidinfo = library.proc_pidinfo
-            proc_pidinfo.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            ]
-            proc_pidinfo.restype = ctypes.c_int
-            info = _DarwinProcessInfo()
-            size = ctypes.sizeof(info)
-            result = proc_pidinfo(
-                pid,
-                3,
-                0,
-                ctypes.byref(info),
-                size,
-            )
-        except (AttributeError, OSError):
-            return None
-        if result != size or info.pbi_pid != pid or info.pbi_start_tvsec == 0:
-            return None
-        return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
+        identity = capture_process_identity(pid)
+        return legacy_process_fingerprint(identity) if identity is not None else None
 
     def _registry_path(self, key: str) -> Path:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()

@@ -25,6 +25,11 @@ from agent_session_harness.coordinator import (
     FenceResult,
 )
 from agent_session_harness.models import Confidence, Runtime
+from agent_session_harness.process_identity import (
+    ProcessIdentity,
+    ProcessPlatform,
+    legacy_process_fingerprint,
+)
 
 NOW = datetime(2026, 7, 19, 6, 0, tzinfo=UTC)
 
@@ -520,6 +525,27 @@ def test_process_birth_identity_distinguishes_same_second_processes() -> None:
             child.terminate()
         for child in children:
             child.wait(timeout=2)
+
+
+def test_posix_driver_uses_shared_identity_capture(monkeypatch) -> None:
+    process, _supervisor_module = _modules()
+    identity = ProcessIdentity(
+        platform=ProcessPlatform.LINUX,
+        pid=42,
+        opaque_start_token="linux:12345",
+        executable_identity="/usr/bin/python3",
+        captured_at=NOW,
+    )
+    monkeypatch.setattr(
+        process,
+        "capture_process_identity",
+        lambda pid: identity,
+        raising=False,
+    )
+
+    assert process.PosixProcessDriver._process_identity(42) == (
+        legacy_process_fingerprint(identity)
+    )
 
 
 def test_launch_guardian_rejects_a_superseded_intent(tmp_path, monkeypatch) -> None:
