@@ -75,13 +75,42 @@ def test_live_managed_owner_is_retained() -> None:
 def test_deleted_worktree_without_live_owner_is_reaped() -> None:
     decision = decide_guardian_action(
         observation(
+            process_state=ProcessState.MISSING,
+            process_identity_state=ProcessIdentityState.MISSING,
             worktree_state=WorktreeState.DELETED,
             managed_owner_state=ManagedOwnerState.MISSING,
+            lease_state=LeaseState.NOT_APPLICABLE,
         )
     )
 
     assert decision.action is GuardianAction.REAP
     assert decision.reason_code == "deleted_worktree_without_live_owner"
+
+
+def test_deleted_worktree_with_exact_live_process_alerts() -> None:
+    decision = decide_guardian_action(
+        observation(
+            worktree_state=WorktreeState.DELETED,
+            managed_owner_state=ManagedOwnerState.MISSING,
+        )
+    )
+
+    assert decision.action is GuardianAction.ALERT
+    assert decision.reason_code == "live_unowned_resource"
+
+
+def test_deleted_worktree_with_active_lease_alerts() -> None:
+    decision = decide_guardian_action(
+        observation(
+            process_state=ProcessState.MISSING,
+            process_identity_state=ProcessIdentityState.MISSING,
+            worktree_state=WorktreeState.DELETED,
+            managed_owner_state=ManagedOwnerState.MISSING,
+        )
+    )
+
+    assert decision.action is GuardianAction.ALERT
+    assert decision.reason_code == "active_owner_lease"
 
 
 @pytest.mark.parametrize("process_state", [ProcessState.MISSING, ProcessState.ZOMBIE])
@@ -91,6 +120,7 @@ def test_terminal_managed_child_is_reaped(process_state: ProcessState) -> None:
             process_state=process_state,
             process_identity_state=ProcessIdentityState.MISSING,
             managed_owner_state=ManagedOwnerState.MISSING,
+            lease_state=LeaseState.EXPIRED,
         )
     )
 
@@ -176,4 +206,108 @@ def test_every_decision_preserves_observation_evidence() -> None:
     assert decision.evidence[: len(source.evidence)] == source.evidence
     assert decision.evidence[-1].source == "guardian-policy"
     assert decision.evidence[-1].code == decision.reason_code
+    assert decision.resource.kind == source.resource.kind
+    assert decision.resource.resource_key == source.resource.resource_key
     assert decision.observed_at == source.observed_at
+
+
+@pytest.mark.parametrize(
+    ("resource", "changes"),
+    [
+        (
+            ManagedResource(
+                kind="process-only",
+                resource_key="process:1",
+                process_identity=process_identity(),
+                cleanup_adapter="cleanup-v1",
+            ),
+            {"worktree_state": WorktreeState.DELETED},
+        ),
+        (
+            ManagedResource(
+                kind="worktree-only",
+                resource_key="worktree:1",
+                worktree_identity=WorktreeIdentity(canonical_path="/workspace/one"),
+                cleanup_adapter="cleanup-v1",
+            ),
+            {
+                "process_state": ProcessState.MISSING,
+                "process_identity_state": ProcessIdentityState.MISMATCH,
+            },
+        ),
+        (
+            ManagedResource(
+                kind="process-only",
+                resource_key="process:2",
+                process_identity=process_identity(),
+                cleanup_adapter="cleanup-v1",
+            ),
+            {"lease_state": LeaseState.EXPIRED},
+        ),
+    ],
+)
+def test_missing_registered_identity_cannot_manufacture_reap_authority(
+    resource: ManagedResource,
+    changes: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "resource": resource,
+        "process_state": None,
+        "process_identity_state": ProcessIdentityState.NOT_APPLICABLE,
+        "worktree_state": WorktreeState.NOT_APPLICABLE,
+        "managed_owner_state": ManagedOwnerState.MISSING,
+        "lease_state": LeaseState.NOT_APPLICABLE,
+    }
+    values.update(changes)
+    decision = decide_guardian_action(observation(**values))
+
+    assert decision.action is GuardianAction.ALERT
+    assert decision.reason_code == "identity_state_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason_code", "required_evidence"),
+    [
+        (
+            {
+                "process_state": ProcessState.MISSING,
+                "process_identity_state": ProcessIdentityState.MISSING,
+                "worktree_state": WorktreeState.DELETED,
+                "managed_owner_state": ManagedOwnerState.MISSING,
+                "lease_state": LeaseState.EXPIRED,
+            },
+            "deleted_worktree_without_live_owner",
+            {"process_missing", "worktree_deleted", "lease_expired"},
+        ),
+        (
+            {
+                "process_state": ProcessState.MISSING,
+                "process_identity_state": ProcessIdentityState.MISMATCH,
+                "managed_owner_state": ManagedOwnerState.MISSING,
+                "lease_state": LeaseState.EXPIRED,
+            },
+            "expired_fenced_identity",
+            {"process_missing", "process_identity_mismatch", "lease_expired"},
+        ),
+        (
+            {
+                "process_state": ProcessState.ZOMBIE,
+                "process_identity_state": ProcessIdentityState.MISSING,
+                "managed_owner_state": ManagedOwnerState.MISSING,
+                "lease_state": LeaseState.NOT_APPLICABLE,
+            },
+            "terminal_managed_child",
+            {"process_zombie", "process_identity_missing"},
+        ),
+    ],
+)
+def test_reap_decisions_include_normalized_proof(
+    changes: dict[str, object],
+    reason_code: str,
+    required_evidence: set[str],
+) -> None:
+    decision = decide_guardian_action(observation(**changes))
+
+    assert decision.action is GuardianAction.REAP
+    assert decision.reason_code == reason_code
+    assert required_evidence <= {item.code for item in decision.evidence}

@@ -13,6 +13,7 @@ from agent_session_harness.resource_guardian import (
     GuardianDecision,
     GuardianEvidence,
     GuardianObservation,
+    GuardianReasonCode,
     LeaseState,
     ManagedOwnerState,
     ManagedResource,
@@ -92,6 +93,10 @@ def test_observation_and_decision_contracts_record_stable_evidence() -> None:
         observed_at=OBSERVED_AT,
     )
     decision = GuardianDecision(
+        resource={
+            "kind": observation.resource.kind,
+            "resource_key": observation.resource.resource_key,
+        },
         action=GuardianAction.RETAIN,
         reason_code="live_managed_owner",
         evidence=observation.evidence,
@@ -100,6 +105,11 @@ def test_observation_and_decision_contracts_record_stable_evidence() -> None:
 
     assert decision.model_dump(mode="json") == {
         "schema_version": 1,
+        "resource": {
+            "schema_version": 1,
+            "kind": "worktree-tunnel",
+            "resource_key": "tunnel:worktree-7",
+        },
         "action": "retain",
         "reason_code": "live_managed_owner",
         "evidence": [
@@ -112,6 +122,7 @@ def test_observation_and_decision_contracts_record_stable_evidence() -> None:
         ],
         "observed_at": "2026-07-30T00:00:00Z",
     }
+    assert decision.reason_code is GuardianReasonCode.LIVE_MANAGED_OWNER
 
 
 @pytest.mark.parametrize(
@@ -146,6 +157,10 @@ def test_contracts_reject_unsupported_major_versions(model: object) -> None:
             GuardianDecision,
             {
                 "action": GuardianAction.ALERT,
+                "resource": {
+                    "kind": "test-resource",
+                    "resource_key": "test:1",
+                },
                 "reason_code": "inspection_failed",
                 "evidence": [],
                 "observed_at": datetime(2026, 7, 30),

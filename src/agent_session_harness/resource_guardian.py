@@ -8,7 +8,7 @@ from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .process_identity import ProcessIdentity, ProcessState
+from .process_identity import ManagedResourceReference, ProcessIdentity, ProcessState
 
 SchemaVersion = Literal[1]
 BoundedText = Annotated[str, Field(min_length=1, max_length=512)]
@@ -28,6 +28,20 @@ class GuardianAction(StrEnum):
     RETAIN = "retain"
     ALERT = "alert"
     REAP = "reap"
+
+
+class GuardianReasonCode(StrEnum):
+    INSPECTION_FAILED = "inspection_failed"
+    AMBIGUOUS_IDENTITY = "ambiguous_identity"
+    LIVE_MANAGED_OWNER = "live_managed_owner"
+    DELETED_WORKTREE_WITHOUT_LIVE_OWNER = "deleted_worktree_without_live_owner"
+    EXPIRED_FENCED_IDENTITY = "expired_fenced_identity"
+    TERMINAL_MANAGED_CHILD = "terminal_managed_child"
+    PROCESS_IDENTITY_MISMATCH = "process_identity_mismatch"
+    LIVE_UNOWNED_RESOURCE = "live_unowned_resource"
+    ACTIVE_OWNER_LEASE = "active_owner_lease"
+    IDENTITY_STATE_MISMATCH = "identity_state_mismatch"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
 
 
 class WorktreeState(StrEnum):
@@ -111,7 +125,7 @@ class GuardianObservation(_ContractModel):
     worktree_state: WorktreeState = WorktreeState.NOT_APPLICABLE
     managed_owner_state: ManagedOwnerState = ManagedOwnerState.NOT_APPLICABLE
     lease_state: LeaseState = LeaseState.NOT_APPLICABLE
-    evidence: Annotated[list[GuardianEvidence], Field(min_length=1, max_length=31)]
+    evidence: Annotated[list[GuardianEvidence], Field(min_length=1, max_length=26)]
     observed_at: datetime
 
     @field_validator("observed_at")
@@ -122,8 +136,9 @@ class GuardianObservation(_ContractModel):
 
 class GuardianDecision(_ContractModel):
     schema_version: SchemaVersion = 1
+    resource: ManagedResourceReference
     action: GuardianAction
-    reason_code: BoundedText
+    reason_code: GuardianReasonCode
     evidence: Annotated[list[GuardianEvidence], Field(min_length=1, max_length=32)]
     observed_at: datetime
 
@@ -138,7 +153,11 @@ def decide_guardian_action(observation: GuardianObservation) -> GuardianDecision
 
     evidence_codes = {item.code for item in observation.evidence}
     if "inspection_failed" in evidence_codes:
-        return _decision(observation, GuardianAction.ALERT, "inspection_failed")
+        return _decision(
+            observation,
+            GuardianAction.ALERT,
+            GuardianReasonCode.INSPECTION_FAILED,
+        )
 
     if (
         observation.process_state is ProcessState.UNKNOWN
@@ -147,48 +166,24 @@ def decide_guardian_action(observation: GuardianObservation) -> GuardianDecision
         or observation.managed_owner_state is ManagedOwnerState.UNKNOWN
         or observation.lease_state is LeaseState.UNKNOWN
     ):
-        return _decision(observation, GuardianAction.ALERT, "ambiguous_identity")
-
-    if observation.managed_owner_state is ManagedOwnerState.LIVE:
-        return _decision(observation, GuardianAction.RETAIN, "live_managed_owner")
-
-    if (
-        observation.worktree_state is WorktreeState.DELETED
-        and observation.managed_owner_state is ManagedOwnerState.MISSING
-    ):
-        return _decision(
-            observation,
-            GuardianAction.REAP,
-            "deleted_worktree_without_live_owner",
-        )
-
-    if (
-        observation.lease_state is LeaseState.EXPIRED
-        and observation.process_state is not ProcessState.RUNNING
-        and observation.process_identity_state
-        in {ProcessIdentityState.MISSING, ProcessIdentityState.MISMATCH}
-    ):
-        return _decision(
-            observation,
-            GuardianAction.REAP,
-            "expired_fenced_identity",
-        )
-
-    if (
-        observation.resource.process_identity is not None
-        and observation.process_state in {ProcessState.MISSING, ProcessState.ZOMBIE}
-    ):
-        return _decision(
-            observation,
-            GuardianAction.REAP,
-            "terminal_managed_child",
-        )
-
-    if observation.process_identity_state is ProcessIdentityState.MISMATCH:
         return _decision(
             observation,
             GuardianAction.ALERT,
-            "process_identity_mismatch",
+            GuardianReasonCode.AMBIGUOUS_IDENTITY,
+        )
+
+    if _has_identity_state_mismatch(observation):
+        return _decision(
+            observation,
+            GuardianAction.ALERT,
+            GuardianReasonCode.IDENTITY_STATE_MISMATCH,
+        )
+
+    if observation.managed_owner_state is ManagedOwnerState.LIVE:
+        return _decision(
+            observation,
+            GuardianAction.RETAIN,
+            GuardianReasonCode.LIVE_MANAGED_OWNER,
         )
 
     if (
@@ -198,22 +193,77 @@ def decide_guardian_action(observation: GuardianObservation) -> GuardianDecision
         return _decision(
             observation,
             GuardianAction.ALERT,
-            "live_unowned_resource",
+            GuardianReasonCode.LIVE_UNOWNED_RESOURCE,
         )
 
-    return _decision(observation, GuardianAction.ALERT, "insufficient_evidence")
+    if (
+        observation.lease_state is LeaseState.EXPIRED
+        and observation.process_state is not ProcessState.RUNNING
+        and observation.process_identity_state is ProcessIdentityState.MISMATCH
+    ):
+        return _decision(
+            observation,
+            GuardianAction.REAP,
+            GuardianReasonCode.EXPIRED_FENCED_IDENTITY,
+        )
+
+    if observation.process_identity_state is ProcessIdentityState.MISMATCH:
+        return _decision(
+            observation,
+            GuardianAction.ALERT,
+            GuardianReasonCode.PROCESS_IDENTITY_MISMATCH,
+        )
+
+    if observation.lease_state is LeaseState.ACTIVE:
+        return _decision(
+            observation,
+            GuardianAction.ALERT,
+            GuardianReasonCode.ACTIVE_OWNER_LEASE,
+        )
+
+    if (
+        observation.worktree_state is WorktreeState.DELETED
+        and observation.managed_owner_state is ManagedOwnerState.MISSING
+        and observation.process_state in {ProcessState.MISSING, ProcessState.ZOMBIE}
+    ):
+        return _decision(
+            observation,
+            GuardianAction.REAP,
+            GuardianReasonCode.DELETED_WORKTREE_WITHOUT_LIVE_OWNER,
+        )
+
+    if (
+        observation.resource.process_identity is not None
+        and observation.process_state in {ProcessState.MISSING, ProcessState.ZOMBIE}
+    ):
+        return _decision(
+            observation,
+            GuardianAction.REAP,
+            GuardianReasonCode.TERMINAL_MANAGED_CHILD,
+        )
+
+    return _decision(
+        observation,
+        GuardianAction.ALERT,
+        GuardianReasonCode.INSUFFICIENT_EVIDENCE,
+    )
 
 
 def _decision(
     observation: GuardianObservation,
     action: GuardianAction,
-    reason_code: str,
+    reason_code: GuardianReasonCode,
 ) -> GuardianDecision:
     return GuardianDecision(
+        resource=ManagedResourceReference(
+            kind=observation.resource.kind,
+            resource_key=observation.resource.resource_key,
+        ),
         action=action,
         reason_code=reason_code,
         evidence=[
             *observation.evidence,
+            *_state_evidence(observation),
             GuardianEvidence(
                 source="guardian-policy",
                 code=reason_code,
@@ -221,3 +271,54 @@ def _decision(
         ],
         observed_at=observation.observed_at,
     )
+
+
+def _has_identity_state_mismatch(observation: GuardianObservation) -> bool:
+    resource = observation.resource
+    return (
+        (
+            resource.process_identity is None
+            and (
+                observation.process_state is not None
+                or observation.process_identity_state
+                is not ProcessIdentityState.NOT_APPLICABLE
+            )
+        )
+        or (
+            resource.worktree_identity is None
+            and observation.worktree_state is not WorktreeState.NOT_APPLICABLE
+        )
+        or (
+            resource.owner_lease is None
+            and observation.lease_state is not LeaseState.NOT_APPLICABLE
+        )
+    )
+
+
+def _state_evidence(observation: GuardianObservation) -> list[GuardianEvidence]:
+    process_state = (
+        observation.process_state.value
+        if observation.process_state is not None
+        else "not_applicable"
+    )
+    return [
+        GuardianEvidence(
+            source="guardian-observation", code=f"process_{process_state}"
+        ),
+        GuardianEvidence(
+            source="guardian-observation",
+            code=f"process_identity_{observation.process_identity_state.value}",
+        ),
+        GuardianEvidence(
+            source="guardian-observation",
+            code=f"worktree_{observation.worktree_state.value}",
+        ),
+        GuardianEvidence(
+            source="guardian-observation",
+            code=f"managed_owner_{observation.managed_owner_state.value}",
+        ),
+        GuardianEvidence(
+            source="guardian-observation",
+            code=f"lease_{observation.lease_state.value}",
+        ),
+    ]
