@@ -79,7 +79,7 @@ def test_deleted_worktree_without_live_owner_is_reaped() -> None:
             process_identity_state=ProcessIdentityState.MISSING,
             worktree_state=WorktreeState.DELETED,
             managed_owner_state=ManagedOwnerState.MISSING,
-            lease_state=LeaseState.NOT_APPLICABLE,
+            lease_state=LeaseState.EXPIRED,
         )
     )
 
@@ -294,7 +294,7 @@ def test_missing_registered_identity_cannot_manufacture_reap_authority(
                 "process_state": ProcessState.ZOMBIE,
                 "process_identity_state": ProcessIdentityState.MISSING,
                 "managed_owner_state": ManagedOwnerState.MISSING,
-                "lease_state": LeaseState.NOT_APPLICABLE,
+                "lease_state": LeaseState.EXPIRED,
             },
             "terminal_managed_child",
             {"process_zombie", "process_identity_missing"},
@@ -311,3 +311,41 @@ def test_reap_decisions_include_normalized_proof(
     assert decision.action is GuardianAction.REAP
     assert decision.reason_code == reason_code
     assert required_evidence <= {item.code for item in decision.evidence}
+
+
+@pytest.mark.parametrize(
+    ("process_state", "process_identity_state", "lease_state"),
+    [
+        (
+            ProcessState.MISSING,
+            ProcessIdentityState.MISSING,
+            LeaseState.NOT_APPLICABLE,
+        ),
+        (
+            ProcessState.MISSING,
+            ProcessIdentityState.NOT_APPLICABLE,
+            LeaseState.EXPIRED,
+        ),
+        (
+            ProcessState.MISSING,
+            ProcessIdentityState.EXACT,
+            LeaseState.EXPIRED,
+        ),
+    ],
+)
+def test_registered_identity_requires_complete_coherent_state(
+    process_state: ProcessState,
+    process_identity_state: ProcessIdentityState,
+    lease_state: LeaseState,
+) -> None:
+    decision = decide_guardian_action(
+        observation(
+            process_state=process_state,
+            process_identity_state=process_identity_state,
+            managed_owner_state=ManagedOwnerState.MISSING,
+            lease_state=lease_state,
+        )
+    )
+
+    assert decision.action is GuardianAction.ALERT
+    assert decision.reason_code == "identity_state_mismatch"

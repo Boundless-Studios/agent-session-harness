@@ -275,8 +275,18 @@ def _decision(
 
 def _has_identity_state_mismatch(observation: GuardianObservation) -> bool:
     resource = observation.resource
+    process_state_is_incomplete = resource.process_identity is not None and (
+        observation.process_state is None
+        or observation.process_identity_state is ProcessIdentityState.NOT_APPLICABLE
+    )
+    process_state_is_contradictory = (
+        observation.process_state is ProcessState.MISSING
+        and observation.process_identity_state is ProcessIdentityState.EXACT
+    )
     return (
-        (
+        process_state_is_incomplete
+        or process_state_is_contradictory
+        or (
             resource.process_identity is None
             and (
                 observation.process_state is not None
@@ -285,12 +295,12 @@ def _has_identity_state_mismatch(observation: GuardianObservation) -> bool:
             )
         )
         or (
-            resource.worktree_identity is None
-            and observation.worktree_state is not WorktreeState.NOT_APPLICABLE
+            (resource.worktree_identity is None)
+            != (observation.worktree_state is WorktreeState.NOT_APPLICABLE)
         )
         or (
-            resource.owner_lease is None
-            and observation.lease_state is not LeaseState.NOT_APPLICABLE
+            (resource.owner_lease is None)
+            != (observation.lease_state is LeaseState.NOT_APPLICABLE)
         )
     )
 
