@@ -1,4 +1,4 @@
-"""Thin fenced-ownership adapter over agent-coordinator v0.4.0."""
+"""Thin fenced-ownership adapter over agent-coordinator v0.5.0."""
 
 from __future__ import annotations
 
