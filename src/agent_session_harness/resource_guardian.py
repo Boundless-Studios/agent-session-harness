@@ -224,7 +224,10 @@ def decide_guardian_action(observation: GuardianObservation) -> GuardianDecision
     if (
         observation.worktree_state is WorktreeState.DELETED
         and observation.managed_owner_state is ManagedOwnerState.MISSING
-        and observation.process_state in {ProcessState.MISSING, ProcessState.ZOMBIE}
+        and (
+            observation.resource.process_identity is None
+            or observation.process_state in {ProcessState.MISSING, ProcessState.ZOMBIE}
+        )
     ):
         return _decision(
             observation,

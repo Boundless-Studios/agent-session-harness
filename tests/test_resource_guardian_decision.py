@@ -113,6 +113,29 @@ def test_deleted_worktree_with_active_lease_alerts() -> None:
     assert decision.reason_code == "active_owner_lease"
 
 
+def test_deleted_worktree_only_registration_is_reaped() -> None:
+    resource = ManagedResource(
+        kind="worktree",
+        resource_key="worktree:deleted",
+        worktree_identity=WorktreeIdentity(canonical_path="/workspace/deleted"),
+        cleanup_adapter="worktree-cleanup-v1",
+    )
+
+    decision = decide_guardian_action(
+        observation(
+            resource=resource,
+            process_state=None,
+            process_identity_state=ProcessIdentityState.NOT_APPLICABLE,
+            worktree_state=WorktreeState.DELETED,
+            managed_owner_state=ManagedOwnerState.MISSING,
+            lease_state=LeaseState.NOT_APPLICABLE,
+        )
+    )
+
+    assert decision.action is GuardianAction.REAP
+    assert decision.reason_code == "deleted_worktree_without_live_owner"
+
+
 @pytest.mark.parametrize("process_state", [ProcessState.MISSING, ProcessState.ZOMBIE])
 def test_terminal_managed_child_is_reaped(process_state: ProcessState) -> None:
     decision = decide_guardian_action(
