@@ -331,6 +331,27 @@ live; `unknown` is neither evidence of liveness nor permission to reap a
 process. Consumers should preserve unknown additive JSON fields and reject
 unsupported schema major versions.
 
+## Host resource guardian contract
+
+`resource_guardian` is the portable policy boundary for resources registered by
+sessions. `ManagedResource` names a stable resource key, configured cleanup
+adapter, and whichever process, worktree, or fenced owner-lease identities the
+host can prove. It contains no Gaia paths or built-in process-name allowlist.
+
+`decide_guardian_action` is pure: it returns `retain`, `alert`, or `reap` with a
+stable reason code and the complete observation evidence, but executes no
+cleanup. Inspection failure and unknown identity alert. An exact live managed
+owner retains. Reaping requires affirmative proof: a deleted worktree with no
+live owner, a missing/zombie registered child, or an expired fenced identity
+whose registered process is no longer live. An exact live but unowned process
+alerts even when its lease is expired.
+
+Observe-only execution is the service default. A follow-on service PR will own
+the fenced per-user singleton, durable register/unregister storage, and
+independent reap enablement by reason code. Cleanup adapters for runtimes, hook
+children, tunnels, and explicitly registered language-server trees remain
+configuration, not core process policy.
+
 ## Integration boundaries
 
 - [`agent-coordinator`](https://github.com/Boundless-Studios/agent-coordinator) owns atomic claims and lease-epoch fencing.

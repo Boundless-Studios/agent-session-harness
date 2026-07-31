@@ -170,3 +170,11 @@ def test_contracts_preserve_additive_fields() -> None:
     )
 
     assert resource.model_dump()["future_registration_epoch"] == 9
+
+
+def test_package_exports_guardian_contract() -> None:
+    import agent_session_harness
+
+    assert agent_session_harness.ManagedResource is ManagedResource
+    assert agent_session_harness.GuardianDecision is GuardianDecision
+    assert agent_session_harness.decide_guardian_action
