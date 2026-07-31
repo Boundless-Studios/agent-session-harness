@@ -150,7 +150,7 @@ def test_contracts_reject_unsupported_major_versions(model: object) -> None:
             {
                 "owner_id": "session-7",
                 "fencing_token": 1,
-                "expires_at": datetime(2026, 7, 30),
+                "expires_at": datetime(2026, 7, 30),  # noqa: DTZ001
             },
         ),
         (
@@ -163,7 +163,7 @@ def test_contracts_reject_unsupported_major_versions(model: object) -> None:
                 },
                 "reason_code": "inspection_failed",
                 "evidence": [],
-                "observed_at": datetime(2026, 7, 30),
+                "observed_at": datetime(2026, 7, 30),  # noqa: DTZ001
             },
         ),
     ],
