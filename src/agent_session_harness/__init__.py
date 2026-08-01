@@ -1,9 +1,10 @@
 """Public package boundary for agent-session-harness."""
 
-from .guardian_service import GuardianService
+from .guardian_service import GuardianPublication, GuardianService
 from .guardian_singleton import (
     DuplicateGuardianError,
     GuardianLeaseHandle,
+    GuardianLeaseProof,
     GuardianOwnership,
     GuardianSingleton,
     StaleGuardianError,
@@ -48,8 +49,10 @@ __all__ = [
     "GuardianDecision",
     "GuardianEvidence",
     "GuardianLeaseHandle",
+    "GuardianLeaseProof",
     "GuardianObservation",
     "GuardianOwnership",
+    "GuardianPublication",
     "GuardianReasonCode",
     "GuardianService",
     "GuardianSingleton",

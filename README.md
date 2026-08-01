@@ -352,13 +352,17 @@ requires that exact token, so a stale session cannot delete its successor's
 resource. Corrupt, oversized, unsupported, and unsafe registry paths fail
 closed rather than appearing empty.
 
-`GuardianSingleton` uses the coordinator's durable lease epochs to allow one
-guardian per OS user. An expired owner can be replaced only by a higher epoch,
-and the stale predecessor cannot heartbeat, release, or authorize publication.
-`GuardianService` snapshots registrations and emits decisions in observe-only
-mode; it revalidates singleton ownership before publishing a `reap` decision
-and never executes cleanup. Cleanup adapters and independent reap enablement by
-reason code remain a separate execution boundary.
+`GuardianSingleton.for_current_user()` uses one canonical platform state path
+and the coordinator's durable lease epochs to allow one guardian per OS user.
+An expired owner can be replaced only by a higher epoch, and the stale
+predecessor cannot heartbeat, release, or authorize publication.
+`GuardianService` snapshots registrations and emits proof-bearing
+`GuardianPublication` records in observe-only mode. Every record carries the
+registration incarnation and guardian claim/lease epoch; a `reap` record is
+revalidated immediately before publication, but still grants no cleanup
+authority. A future executor must validate both fences again at execution time.
+Cleanup adapters and independent reap enablement by reason code remain that
+separate execution boundary.
 
 ## Integration boundaries
 

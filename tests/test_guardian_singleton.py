@@ -14,8 +14,8 @@ NOW = datetime(2026, 7, 30, tzinfo=UTC)
 
 
 def test_active_guardian_rejects_duplicate_owner(tmp_path) -> None:
-    first = GuardianSingleton.from_path(tmp_path / "guardian-claims.jsonl")
-    duplicate = GuardianSingleton.from_path(tmp_path / "guardian-claims.jsonl")
+    first = GuardianSingleton._for_test(tmp_path)
+    duplicate = GuardianSingleton._for_test(tmp_path)
     first.acquire(
         owner_session_id="guardian-1",
         owner_pid=100,
@@ -33,8 +33,8 @@ def test_active_guardian_rejects_duplicate_owner(tmp_path) -> None:
 
 
 def test_expired_guardian_is_fenced_by_higher_epoch_successor(tmp_path) -> None:
-    first = GuardianSingleton.from_path(tmp_path / "guardian-claims.jsonl")
-    successor = GuardianSingleton.from_path(tmp_path / "guardian-claims.jsonl")
+    first = GuardianSingleton._for_test(tmp_path)
+    successor = GuardianSingleton._for_test(tmp_path)
     first_handle = first.acquire(
         owner_session_id="guardian-1",
         owner_pid=100,
@@ -60,7 +60,7 @@ def test_expired_guardian_is_fenced_by_higher_epoch_successor(tmp_path) -> None:
 
 
 def test_heartbeat_and_clean_release_preserve_fencing_identity(tmp_path) -> None:
-    singleton = GuardianSingleton.from_path(tmp_path / "guardian-claims.jsonl")
+    singleton = GuardianSingleton._for_test(tmp_path)
     handle = singleton.acquire(
         owner_session_id="guardian-1",
         owner_pid=100,
@@ -84,7 +84,7 @@ def test_heartbeat_and_clean_release_preserve_fencing_identity(tmp_path) -> None
 
 
 def test_bound_ownership_exposes_service_lease_contract(tmp_path) -> None:
-    singleton = GuardianSingleton.from_path(tmp_path / "guardian-claims.jsonl")
+    singleton = GuardianSingleton._for_test(tmp_path)
     handle = singleton.acquire(
         owner_session_id="guardian-1",
         owner_pid=100,
@@ -94,5 +94,7 @@ def test_bound_ownership_exposes_service_lease_contract(tmp_path) -> None:
 
     ownership = singleton.bind(handle, clock=lambda: NOW + timedelta(seconds=1))
 
-    ownership.assert_current()
+    proof = ownership.current_proof()
     assert ownership.handle == handle
+    assert proof.claim_id == handle.claim_id
+    assert proof.lease_epoch == handle.lease_epoch

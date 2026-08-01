@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 import pytest
 
 from agent_session_harness.guardian_service import GuardianService
+from agent_session_harness.guardian_singleton import GuardianLeaseProof
 from agent_session_harness.process_identity import ProcessIdentity, ProcessPlatform
 from agent_session_harness.resource_guardian import (
     GuardianAction,
@@ -26,10 +27,11 @@ class Lease:
         self.assertions = 0
         self.fail_after = fail_after
 
-    def assert_current(self) -> None:
+    def current_proof(self) -> GuardianLeaseProof:
         self.assertions += 1
         if self.fail_after is not None and self.assertions > self.fail_after:
             raise RuntimeError("stale guardian lease")
+        return GuardianLeaseProof(claim_id="claim-1", lease_epoch=7)
 
 
 def resource() -> ManagedResource:
@@ -75,7 +77,13 @@ def test_service_is_observe_only_and_publishes_decisions(tmp_path) -> None:
     decisions = service.run_once()
 
     assert decisions == published
-    assert decisions[0].action is GuardianAction.REAP
+    assert decisions[0].decision.action is GuardianAction.REAP
+    assert decisions[0].registration_id
+    assert decisions[0].guardian == GuardianLeaseProof(
+        claim_id="claim-1",
+        lease_epoch=7,
+    )
+    assert decisions[0].observe_only is True
     assert lease.assertions == 2
 
 
@@ -110,8 +118,8 @@ def test_observer_failure_becomes_alert_instead_of_reap(tmp_path) -> None:
         clock=lambda: NOW,
     ).run_once()
 
-    assert decisions[0].action is GuardianAction.ALERT
-    assert decisions[0].reason_code == "inspection_failed"
+    assert decisions[0].decision.action is GuardianAction.ALERT
+    assert decisions[0].decision.reason_code == "inspection_failed"
 
 
 def test_replaced_registration_blocks_stale_reap_publication(tmp_path) -> None:

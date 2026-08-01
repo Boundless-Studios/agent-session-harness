@@ -14,6 +14,7 @@ from agent_coordinator import (
     TaskCoordinator,
     TaskIdentity,
 )
+from platformdirs import user_state_path
 from pydantic import BaseModel, ConfigDict, Field
 
 from .coordinator import _SecureJsonlClaimStore
@@ -33,6 +34,13 @@ class GuardianLeaseHandle(BaseModel):
     claim_id: str = Field(min_length=1)
     lease_epoch: int = Field(ge=1)
     owner_session_id: str = Field(min_length=1)
+
+
+class GuardianLeaseProof(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_id: str = Field(min_length=1)
+    lease_epoch: int = Field(ge=1)
 
 
 class GuardianRelease(BaseModel):
@@ -56,16 +64,29 @@ class GuardianOwnership:
         self.handle = handle
         self.clock = clock
 
-    def assert_current(self) -> None:
+    def current_proof(self) -> GuardianLeaseProof:
         self.singleton.assert_current(self.handle, now=self.clock())
+        return GuardianLeaseProof(
+            claim_id=self.handle.claim_id,
+            lease_epoch=self.handle.lease_epoch,
+        )
 
 
 class GuardianSingleton:
     """Own one durable, lease-epoch-fenced guardian claim per OS user."""
 
-    def __init__(self, coordinator: TaskCoordinator, *, user_id: int | None = None):
+    _CONSTRUCTION_TOKEN = object()
+
+    def __init__(
+        self,
+        coordinator: TaskCoordinator,
+        *,
+        _construction_token: object,
+    ):
+        if _construction_token is not self._CONSTRUCTION_TOKEN:
+            raise TypeError("use GuardianSingleton.for_current_user()")
         self.coordinator = coordinator
-        self.user_id = os.getuid() if user_id is None else user_id
+        self.user_id = os.getuid()
         self.task = TaskIdentity(
             task_type="resource-guardian",
             task_id=str(self.user_id),
@@ -73,12 +94,24 @@ class GuardianSingleton:
         )
 
     @classmethod
-    def from_path(cls, path: str | Path) -> GuardianSingleton:
+    def for_current_user(
+        cls,
+    ) -> GuardianSingleton:
+        root = user_state_path("agent-session-harness") / "guardian"
+        return cls._from_state_root(root)
+
+    @classmethod
+    def _for_test(cls, state_root: str | Path) -> GuardianSingleton:
+        return cls._from_state_root(Path(state_root))
+
+    @classmethod
+    def _from_state_root(cls, root: Path) -> GuardianSingleton:
         return cls(
             TaskCoordinator(
-                _SecureJsonlClaimStore(path),
+                _SecureJsonlClaimStore(root / "singleton-claims.jsonl"),
                 pid_is_live=lambda _pid: True,
-            )
+            ),
+            _construction_token=cls._CONSTRUCTION_TOKEN,
         )
 
     def acquire(

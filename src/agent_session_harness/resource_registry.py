@@ -29,7 +29,7 @@ class RegistrationConflictError(RuntimeError):
 
 
 class ResourceRegistration(BaseModel):
-    model_config = ConfigDict(extra="allow", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: SchemaVersion = 1
     registration_id: RegistrationId
@@ -45,7 +45,7 @@ class ResourceRegistration(BaseModel):
 
 
 class _RegistryDocument(BaseModel):
-    model_config = ConfigDict(extra="allow", frozen=True)
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: SchemaVersion = 1
     registrations: Annotated[
@@ -81,7 +81,12 @@ class ResourceRegistry:
                 if (item.resource.kind, item.resource.resource_key) != logical_key
             ]
             self._write(
-                document.model_copy(update={"registrations": [*retained, registration]})
+                _RegistryDocument.model_validate(
+                    {
+                        **document.model_dump(),
+                        "registrations": [*retained, registration],
+                    }
+                )
             )
         return registration
 

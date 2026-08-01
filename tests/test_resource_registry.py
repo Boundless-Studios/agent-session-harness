@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -80,6 +81,38 @@ def test_registry_rejects_unsupported_major_version(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="unsupported"):
         ResourceRegistry(path).list()
+
+
+def test_registry_rejects_unknown_persisted_fields(tmp_path) -> None:
+    path = tmp_path / "resources.json"
+    path.write_text(
+        '{"schema_version":1,"registrations":[],"unknown_authority":true}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="contract"):
+        ResourceRegistry(path).list()
+
+
+def test_register_refuses_to_persist_more_than_bounded_capacity(tmp_path) -> None:
+    path = tmp_path / "resources.json"
+    template = ResourceRegistry(path).register(resource("child:seed"), now=NOW)
+    registrations = []
+    for index in range(1024):
+        payload = template.model_dump(mode="json")
+        payload["registration_id"] = f"registration-{index:04d}"
+        payload["resource"]["resource_key"] = f"child:{index}"
+        registrations.append(payload)
+    path.write_text(
+        json.dumps({"schema_version": 1, "registrations": registrations}),
+        encoding="utf-8",
+    )
+    registry = ResourceRegistry(path)
+
+    with pytest.raises(ValueError, match="1024"):
+        registry.register(resource("child:overflow"), now=NOW)
+
+    assert len(registry.list()) == 1024
 
 
 def test_package_exports_guardian_service_contracts() -> None:
