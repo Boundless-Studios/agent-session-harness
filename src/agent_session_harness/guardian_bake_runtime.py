@@ -157,7 +157,7 @@ def assess_bake_exit(
     validated_reasons = {
         decision.reason_code
         for decision in decisions
-        if decision.performed and not decision.live_resource
+        if decision.performed and not decision.live_resource and decision.evidence
     }
     for reason in sorted(config.enabled_reasons - validated_reasons):
         failures.append(f"enabled_reason_unvalidated:{reason}")

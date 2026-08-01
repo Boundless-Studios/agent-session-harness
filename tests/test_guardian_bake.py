@@ -12,8 +12,8 @@ from agent_session_harness.guardian_bake import (
     GuardianHighWaterMarks,
     ObservationWindow,
     ResourceHighWaterMarks,
-    UsageSnapshot,
     UsageHighWaterMarks,
+    UsageSnapshot,
     redact_guardian_text,
 )
 
@@ -69,7 +69,9 @@ def test_report_deduplication_ignores_heartbeat_but_tracks_state() -> None:
 def test_redactor_removes_credentials_paths_and_arguments() -> None:
     value = (
         "Authorization: Bearer secret-token LINEAR_API_KEY=abc123 "
-        "/Users/alice/project --password hunter2 command --flag value"
+        'api_key: colon-secret {"token": "json-secret"} password="two words" '
+        "/Users/alice/project --password hunter2 -p short-secret "
+        "command: tool positional-secret"
     )
 
     redacted = redact_guardian_text(value)
@@ -78,7 +80,11 @@ def test_redactor_removes_credentials_paths_and_arguments() -> None:
     assert "abc123" not in redacted
     assert "alice" not in redacted
     assert "hunter2" not in redacted
-    assert "value" not in redacted
+    assert "colon-secret" not in redacted
+    assert "json-secret" not in redacted
+    assert "two words" not in redacted
+    assert "short-secret" not in redacted
+    assert "positional-secret" not in redacted
     assert "[REDACTED]" in redacted
 
 
@@ -98,6 +104,25 @@ def test_report_rejects_window_or_heartbeat_outside_window() -> None:
 
     with pytest.raises(ValidationError, match="heartbeat"):
         report(heartbeat=START + timedelta(days=2))
+
+
+def test_report_rejects_empty_decision_evidence() -> None:
+    with pytest.raises(ValidationError):
+        GuardianBakeDecision(
+            reason_code="terminal_managed_child",
+            performed=True,
+            live_resource=False,
+            evidence=[],
+        )
+
+
+def test_report_rejects_forged_deduplication_key() -> None:
+    baked = report()
+    payload = baked.model_dump()
+    payload["deduplication_key"] = "f" * 64
+
+    with pytest.raises(ValidationError, match="deduplication key"):
+        GuardianBakeReport.model_validate(payload)
 
 
 def test_report_preserves_before_after_usage() -> None:

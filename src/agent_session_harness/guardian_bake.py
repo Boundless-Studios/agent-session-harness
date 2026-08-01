@@ -8,17 +8,34 @@ import re
 from datetime import UTC, datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 SchemaVersion = Literal[1]
 BoundedText = Annotated[str, Field(min_length=1, max_length=512)]
 
 _AUTHORIZATION = re.compile(r"(?i)\bAuthorization\s*:\s*(?:Bearer\s+)?\S+")
 _CREDENTIAL = re.compile(
-    r"(?i)\b[A-Za-z0-9_-]*(?:token|api[_-]?key|password|secret)\s*=\s*\S+"
+    r"""(?ix)
+    ["']?[A-Za-z0-9_-]*(?:token|api[_-]?key|password|secret)["']?
+    \s*(?:=|:)\s*
+    (?:"[^"]*"|'[^']*'|[^\s,}]+)
+    """
 )
 _HOME_PATH = re.compile(r"(?:/Users|/home)/[^/\s]+")
-_ARGUMENT_VALUE = re.compile(r"(?<!\S)--[A-Za-z0-9_-]+(?:[=\s]+\S+)?")
+_ARGUMENT_VALUE = re.compile(
+    r"""(?x)
+    (?<!\S)-{1,2}[A-Za-z0-9_-]+
+    (?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)
+    """
+)
+_COMMAND_VALUE = re.compile(r"(?i)\b(?:argv|command(?:_line)?)\s*(?:=|:)\s*.*$")
 
 
 def redact_guardian_text(value: str) -> str:
@@ -27,7 +44,8 @@ def redact_guardian_text(value: str) -> str:
     redacted = _AUTHORIZATION.sub("Authorization: [REDACTED]", value)
     redacted = _CREDENTIAL.sub("credential=[REDACTED]", redacted)
     redacted = _HOME_PATH.sub("/[HOME]", redacted)
-    return _ARGUMENT_VALUE.sub("--argument [REDACTED]", redacted)
+    redacted = _ARGUMENT_VALUE.sub("--argument [REDACTED]", redacted)
+    return _COMMAND_VALUE.sub("command=[REDACTED]", redacted)
 
 
 def _utc(value: datetime) -> datetime:
@@ -87,7 +105,7 @@ class GuardianBakeDecision(BaseModel):
     reason_code: BoundedText
     performed: bool
     live_resource: bool
-    evidence: Annotated[list[BoundedText], Field(max_length=64)]
+    evidence: Annotated[list[BoundedText], Field(min_length=1, max_length=64)]
 
     @field_validator("reason_code")
     @classmethod
@@ -145,10 +163,16 @@ class GuardianBakeReport(BaseModel):
             raise ValueError("heartbeat must fall within the observation window")
         return self
 
-    @classmethod
-    def build(cls, **values: object) -> GuardianBakeReport:
-        candidate = cls.model_validate({**values, "deduplication_key": "0" * 64})
-        content = candidate.model_dump(
+    @model_validator(mode="after")
+    def require_content_deduplication_key(self, info: ValidationInfo) -> Self:
+        if info.context and info.context.get("skip_deduplication_check"):
+            return self
+        if self.deduplication_key != self._content_deduplication_key():
+            raise ValueError("deduplication key does not match report content")
+        return self
+
+    def _content_deduplication_key(self) -> str:
+        content = self.model_dump(
             mode="json",
             exclude={"heartbeat_at", "deduplication_key"},
         )
@@ -158,6 +182,14 @@ class GuardianBakeReport(BaseModel):
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def build(cls, **values: object) -> GuardianBakeReport:
+        candidate = cls.model_validate(
+            {**values, "deduplication_key": "0" * 64},
+            context={"skip_deduplication_check": True},
+        )
         return candidate.model_copy(
-            update={"deduplication_key": hashlib.sha256(encoded).hexdigest()}
+            update={"deduplication_key": candidate._content_deduplication_key()}
         )

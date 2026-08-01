@@ -11,8 +11,8 @@ from agent_session_harness.guardian_bake import (
     GuardianHighWaterMarks,
     ObservationWindow,
     ResourceHighWaterMarks,
-    UsageSnapshot,
     UsageHighWaterMarks,
+    UsageSnapshot,
 )
 from agent_session_harness.guardian_bake_spool import GuardianBakeSpool
 
@@ -146,3 +146,10 @@ def test_spool_rejects_oversized_state_before_parsing(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="exceeds 64 bytes"):
         GuardianBakeSpool(path, max_bytes=64).list()
+
+
+def test_spool_rejects_model_copy_with_stale_deduplication_key(tmp_path) -> None:
+    stale = report().model_copy(update={"deduplication_key": "f" * 64})
+
+    with pytest.raises(ValueError, match="deduplication key"):
+        GuardianBakeSpool(tmp_path / "bake.json").append(stale, now=NOW)

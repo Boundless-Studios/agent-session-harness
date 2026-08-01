@@ -8,8 +8,8 @@ from agent_session_harness.guardian_bake import (
     GuardianHighWaterMarks,
     ObservationWindow,
     ResourceHighWaterMarks,
-    UsageSnapshot,
     UsageHighWaterMarks,
+    UsageSnapshot,
 )
 from agent_session_harness.guardian_bake_runtime import (
     GuardianBakeConfig,
@@ -170,3 +170,23 @@ def test_exit_requires_safe_reaps_reason_coverage_and_bounded_overhead() -> None
         "enabled_reason_unvalidated:dead_worktree",
         "memory_overhead_exceeded",
     }
+
+
+def test_exit_does_not_validate_cleanup_without_evidence() -> None:
+    missing_evidence = GuardianBakeDecision(
+        reason_code="terminal_managed_child",
+        performed=True,
+        live_resource=False,
+        evidence=["process_missing"],
+    ).model_copy(update={"evidence": []})
+
+    result = assess_bake_exit(
+        [report(decisions=[missing_evidence])],
+        config(
+            mode=GuardianBakeMode.REAP,
+            enabled_reasons={"terminal_managed_child"},
+        ),
+    )
+
+    assert result.passed is False
+    assert result.failures == ["enabled_reason_unvalidated:terminal_managed_child"]

@@ -6,6 +6,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from ..guardian_bake_runtime import GuardianBakeConfig
 from ..guardian_bake_spool import GuardianBakeSpool, GuardianBakeSpoolRecord
 
 TARGET_ISSUE = "BOU-2704"
@@ -20,6 +21,7 @@ _COMMENTS_QUERY = """
 query GuardianBakeComments($issueId: String!, $after: String) {
   issue(id: $issueId) {
     id
+    identifier
     comments(first: 100, after: $after) {
       nodes { id body }
       pageInfo { hasNextPage endCursor }
@@ -41,12 +43,14 @@ class GuardianBakeLinearSink:
     def __init__(
         self,
         fetch_graphql: FetchGraphQL,
+        config: GuardianBakeConfig,
         *,
         min_delivery_interval: timedelta = DEFAULT_MIN_DELIVERY_INTERVAL,
     ):
         if min_delivery_interval.total_seconds() < 0:
             raise ValueError("guardian bake delivery interval cannot be negative")
         self.fetch_graphql = fetch_graphql
+        self.config = config
         self.min_delivery_interval = min_delivery_interval
 
     def drain(
@@ -56,6 +60,8 @@ class GuardianBakeLinearSink:
         now: datetime | None = None,
     ) -> list[str]:
         delivery_time = (now or datetime.now(UTC)).astimezone(UTC)
+        if not self.config.active_at(delivery_time):
+            return []
         delivered_records = [
             record for record in spool.list() if record.delivered_at is not None
         ]
@@ -93,7 +99,10 @@ class GuardianBakeLinearSink:
             data = response.get("data")
             issue = data.get("issue") if isinstance(data, dict) else None
             current_id = issue.get("id") if isinstance(issue, dict) else None
+            identifier = issue.get("identifier") if isinstance(issue, dict) else None
             connection = issue.get("comments") if isinstance(issue, dict) else None
+            if identifier != TARGET_ISSUE:
+                raise RuntimeError("guardian bake received an unexpected Linear issue")
             if not isinstance(current_id, str) or not isinstance(connection, dict):
                 raise RuntimeError("guardian bake Linear response is invalid")
             if issue_id is None:

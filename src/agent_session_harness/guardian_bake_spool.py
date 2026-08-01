@@ -71,6 +71,12 @@ class GuardianBakeSpool:
         now: datetime | None = None,
     ) -> GuardianBakeSpoolRecord:
         observed_at = (now or datetime.now(UTC)).astimezone(UTC)
+        try:
+            report = GuardianBakeReport.model_validate(report.model_dump())
+        except ValidationError as exc:
+            raise ValueError(
+                "guardian bake report has an invalid deduplication key"
+            ) from exc
         with exclusive_lock(self.lock_path):
             document = self._read()
             records = list(document.records)
