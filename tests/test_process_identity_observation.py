@@ -2,6 +2,7 @@ import hashlib
 from dataclasses import replace
 from datetime import UTC, datetime
 
+import agent_session_harness.process_identity as process_identity_module
 from agent_session_harness.process_identity import (
     ManagedResourceReference,
     NativeProcessRecord,
@@ -11,6 +12,7 @@ from agent_session_harness.process_identity import (
     ProcessPlatform,
     ProcessState,
     legacy_process_fingerprint,
+    observe_process_identity,
 )
 
 NOW = datetime(2026, 7, 30, tzinfo=UTC)
@@ -86,6 +88,26 @@ def test_capture_does_not_invent_identity_when_inspection_is_unknown() -> None:
     subject = inspector(NativeReadResult.unknown("permission_denied"))
 
     assert subject.capture(42) is None
+
+
+def test_public_native_observation_uses_typed_managed_resource(monkeypatch) -> None:
+    reader = FakeReader(
+        {
+            42: NativeReadResult.present(RUNNING),
+            7: NativeReadResult.present(PARENT),
+        }
+    )
+    monkeypatch.setattr(
+        process_identity_module, "native_process_reader", lambda: reader
+    )
+    expected = ProcessInspector(reader, clock=lambda: NOW).capture(42)
+    assert expected is not None
+    resource = ManagedResourceReference(kind="repository_daemon", resource_key="dash")
+
+    observation = observe_process_identity(expected, resource)
+
+    assert observation.state is ProcessState.RUNNING
+    assert observation.managed_resource == resource
 
 
 def test_pid_reuse_marks_expected_identity_missing() -> None:

@@ -552,3 +552,32 @@ def native_process_reader() -> NativeProcessReader | None:
 def capture_process_identity(pid: int) -> ProcessIdentity | None:
     reader = native_process_reader()
     return ProcessInspector(reader).capture(pid) if reader is not None else None
+
+
+def observe_process_identity(
+    expected: ProcessIdentity,
+    managed_resource: ManagedResourceReference | None = None,
+) -> ProcessObservation:
+    """Observe an expected lifetime with the platform's native reader.
+
+    This is the public consumer boundary corresponding to
+    :func:`capture_process_identity`. Unsupported platforms report ``unknown``
+    instead of requiring downstream adapters to import reader internals.
+    """
+
+    reader = native_process_reader()
+    if reader is not None:
+        return ProcessInspector(reader).observe(expected, managed_resource)
+    observed_at = datetime.now(UTC)
+    return ProcessObservation(
+        identity=expected,
+        state=ProcessState.UNKNOWN,
+        managed_resource=managed_resource,
+        evidence=[
+            ProcessEvidence(
+                source="native_process_reader",
+                code="unsupported_platform",
+            )
+        ],
+        observed_at=observed_at,
+    )
