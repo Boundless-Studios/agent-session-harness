@@ -7,7 +7,10 @@ from agent_session_harness.guardian_executor import (
     GuardianExecutor,
 )
 from agent_session_harness.guardian_service import GuardianPublication
-from agent_session_harness.guardian_singleton import GuardianLeaseProof
+from agent_session_harness.guardian_singleton import (
+    GuardianLeaseProof,
+    StaleGuardianError,
+)
 from agent_session_harness.process_identity import ProcessIdentity, ProcessPlatform
 from agent_session_harness.resource_guardian import (
     GuardianAction,
@@ -27,6 +30,11 @@ class Ownership:
 
     def current_proof(self) -> GuardianLeaseProof:
         return self.proof
+
+
+class StaleOwnership:
+    def current_proof(self) -> GuardianLeaseProof:
+        raise StaleGuardianError("lease expired")
 
 
 def resource() -> ManagedResource:
@@ -110,6 +118,19 @@ def test_replaced_registration_refuses_stale_cleanup(tmp_path) -> None:
 def test_changed_guardian_epoch_refuses_stale_cleanup(tmp_path) -> None:
     executor, _registry, registration = setup_executor(tmp_path)
     executor.ownership.proof = GuardianLeaseProof(claim_id="claim-2", lease_epoch=8)
+
+    result = executor.authorize(
+        publication(registration.registration_id),
+        observe_only=False,
+        enabled_reasons={GuardianReasonCode.TERMINAL_MANAGED_CHILD},
+    )
+
+    assert result.outcome is CleanupOutcome.REFUSED_STALE_GUARDIAN
+
+
+def test_expired_guardian_lease_refuses_cleanup(tmp_path) -> None:
+    executor, _registry, registration = setup_executor(tmp_path)
+    executor.ownership = StaleOwnership()
 
     result = executor.authorize(
         publication(registration.registration_id),

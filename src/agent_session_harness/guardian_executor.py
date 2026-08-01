@@ -8,7 +8,7 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict
 
 from .guardian_service import GuardianPublication
-from .guardian_singleton import GuardianLeaseProof
+from .guardian_singleton import GuardianLeaseProof, StaleGuardianError
 from .resource_guardian import GuardianAction, GuardianReasonCode
 from .resource_registry import ResourceRegistration, ResourceRegistry
 
@@ -65,7 +65,10 @@ class GuardianExecutor:
         ):
             return CleanupResult(outcome=CleanupOutcome.OBSERVED)
 
-        current_proof = self.ownership.current_proof()
+        try:
+            current_proof = self.ownership.current_proof()
+        except StaleGuardianError:
+            return CleanupResult(outcome=CleanupOutcome.REFUSED_STALE_GUARDIAN)
         if current_proof != publication.guardian:
             return CleanupResult(outcome=CleanupOutcome.REFUSED_STALE_GUARDIAN)
 
