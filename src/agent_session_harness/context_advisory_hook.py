@@ -107,7 +107,7 @@ from .context_advisory import (
 # numbers is how an agent gets told to wrap up by one while the other says it is
 # fine -- this hook nudges, the harness rotates.
 CHECKPOINT_FRACTION = 0.65  # matches the harness warning threshold
-URGENT_FRACTION = 0.85      # harness rotation has not fired; something is stuck
+URGENT_FRACTION = 0.85  # harness rotation has not fired; something is stuck
 
 # Used only when the model cannot be resolved at all. 200K is the common
 # Claude window and is the safe middle ground: it does not cry wolf the way a
@@ -122,14 +122,14 @@ DEFAULT_CONTEXT_TOKENS = 200_000
 # matches the generic "claude" rule and gets a 200K window. That understatement is
 # what _promote_window_to_fit() below repairs from measured occupancy.
 CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
-    ("[1m]", 1_000_000),        # explicit 1M-window variants
+    ("[1m]", 1_000_000),  # explicit 1M-window variants
     ("-1m", 1_000_000),
     ("deepseek-v4", 1_000_000),
     ("qwen3", 128_000),
     ("qwen", 128_000),
     ("gpt-5", 400_000),
     ("gemini", 1_000_000),
-    ("claude", 200_000),        # default Claude window
+    ("claude", 200_000),  # default Claude window
 )
 
 # The suffixes that name a window variant rather than a model. These are the
@@ -472,9 +472,7 @@ def _context_window_tokens(
     session on an unrecognised model can still get sane thresholds without a
     code change.
     """
-    override = os.environ.get(
-        "AGENT_SESSION_HARNESS_CONTEXT_WINDOW_TOKENS", ""
-    ).strip()
+    override = os.environ.get("AGENT_SESSION_HARNESS_CONTEXT_WINDOW_TOKENS", "").strip()
     if override:
         try:
             parsed = int(override)
@@ -600,9 +598,7 @@ def main(
     # skip the check: measured occupancy does not depend on the current response
     # being large, and bailing here left a session at 90% unexamined whenever a
     # tool happened to return `{}`.
-    tokens = _estimate_response_tokens(
-        str(data.get("tool_name", "")), tool_response
-    )
+    tokens = _estimate_response_tokens(str(data.get("tool_name", "")), tool_response)
 
     # Update ledger
     state_path = _state_path()
@@ -680,12 +676,14 @@ def main(
 
     if should_warn:
         message = renderer(decision)
-        output = json.dumps({
-            "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
-                "additionalContext": message,
-            },
-        })
+        output = json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "PostToolUse",
+                    "additionalContext": message,
+                },
+            }
+        )
         print(output)
         sys.stdout.flush()
 

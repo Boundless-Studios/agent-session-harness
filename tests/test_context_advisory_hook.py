@@ -33,7 +33,9 @@ def test_malformed_or_unscoped_payload_is_a_silent_noop(monkeypatch, tmp_path) -
     assert not (tmp_path / "advisory.json").exists()
 
 
-def test_crossing_threshold_emits_native_additional_context(monkeypatch, tmp_path) -> None:
+def test_crossing_threshold_emits_native_additional_context(
+    monkeypatch, tmp_path
+) -> None:
     result, output, ledger = invoke(
         monkeypatch,
         tmp_path,
