@@ -1,5 +1,20 @@
 """Public package boundary for agent-session-harness."""
 
+from .guardian_bake import (
+    GuardianBakeDecision,
+    GuardianBakeError,
+    GuardianBakeReport,
+    GuardianHighWaterMarks,
+    ObservationWindow,
+    ResourceHighWaterMarks,
+    UsageHighWaterMarks,
+)
+from .guardian_bake_runtime import (
+    GuardianBakeConfig,
+    GuardianBakeExitAssessment,
+    GuardianBakeMode,
+    assess_bake_exit,
+)
 from .process_identity import (
     ManagedResourceReference,
     ProcessEvidence,
@@ -31,14 +46,22 @@ __version__ = "0.1.0"
 
 __all__ = [
     "GuardianAction",
+    "GuardianBakeConfig",
+    "GuardianBakeDecision",
+    "GuardianBakeError",
+    "GuardianBakeExitAssessment",
+    "GuardianBakeMode",
+    "GuardianBakeReport",
     "GuardianDecision",
     "GuardianEvidence",
+    "GuardianHighWaterMarks",
     "GuardianObservation",
     "GuardianReasonCode",
     "LeaseState",
     "ManagedOwnerState",
     "ManagedResource",
     "ManagedResourceReference",
+    "ObservationWindow",
     "OwnerLeaseIdentity",
     "ProcessEvidence",
     "ProcessIdentity",
@@ -47,9 +70,12 @@ __all__ = [
     "ProcessObservation",
     "ProcessPlatform",
     "ProcessState",
+    "ResourceHighWaterMarks",
+    "UsageHighWaterMarks",
     "WorktreeIdentity",
     "WorktreeState",
     "__version__",
+    "assess_bake_exit",
     "capture_process_identity",
     "decide_guardian_action",
     "same_process",
