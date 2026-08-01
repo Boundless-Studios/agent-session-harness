@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..guardian_bake_spool import GuardianBakeSpool, GuardianBakeSpoolRecord
@@ -12,6 +12,7 @@ TARGET_ISSUE = "BOU-2704"
 MAX_COMMENT_PAGES = 10
 MAX_COMMENTS = 1000
 MAX_COMMENT_BODY_BYTES = 1_048_576
+DEFAULT_MIN_DELIVERY_INTERVAL = timedelta(minutes=15)
 
 FetchGraphQL = Callable[[dict[str, Any]], dict[str, Any]]
 
@@ -37,8 +38,16 @@ mutation GuardianBakeCommentCreate($input: CommentCreateInput!) {
 class GuardianBakeLinearSink:
     """Drain durable reports to one statically fixed Linear issue."""
 
-    def __init__(self, fetch_graphql: FetchGraphQL):
+    def __init__(
+        self,
+        fetch_graphql: FetchGraphQL,
+        *,
+        min_delivery_interval: timedelta = DEFAULT_MIN_DELIVERY_INTERVAL,
+    ):
+        if min_delivery_interval.total_seconds() < 0:
+            raise ValueError("guardian bake delivery interval cannot be negative")
         self.fetch_graphql = fetch_graphql
+        self.min_delivery_interval = min_delivery_interval
 
     def drain(
         self,
@@ -46,6 +55,15 @@ class GuardianBakeLinearSink:
         *,
         now: datetime | None = None,
     ) -> list[str]:
+        delivery_time = (now or datetime.now(UTC)).astimezone(UTC)
+        delivered_records = [
+            record for record in spool.list() if record.delivered_at is not None
+        ]
+        if delivered_records:
+            latest_delivery = max(record.delivered_at for record in delivered_records)
+            assert latest_delivery is not None
+            if delivery_time - latest_delivery < self.min_delivery_interval:
+                return []
         delivered: list[str] = []
         for record in spool.pending():
             issue_id, comments = self._comments()
@@ -55,8 +73,9 @@ class GuardianBakeLinearSink:
                 _verified_issue, verified_comments = self._comments()
                 if not any(marker in body for body in verified_comments):
                     raise RuntimeError("guardian bake Linear read-back failed")
-            spool.acknowledge(record.record_id, now=now)
+            spool.acknowledge(record.record_id, now=delivery_time)
             delivered.append(record.record_id)
+            break
         return delivered
 
     def _comments(self) -> tuple[str, list[str]]:

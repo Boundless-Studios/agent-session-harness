@@ -13,15 +13,15 @@ from agent_session_harness.guardian_bake import (
     GuardianHighWaterMarks,
     ObservationWindow,
     ResourceHighWaterMarks,
-    UsageSnapshot,
     UsageHighWaterMarks,
+    UsageSnapshot,
 )
 from agent_session_harness.guardian_bake_spool import GuardianBakeSpool
 
 NOW = datetime(2026, 7, 31, tzinfo=UTC)
 
 
-def report() -> GuardianBakeReport:
+def report(memory_bytes: int = 1024) -> GuardianBakeReport:
     return GuardianBakeReport.build(
         guardian_version="0.1.0",
         platform="linux",
@@ -31,10 +31,10 @@ def report() -> GuardianBakeReport:
         ),
         heartbeat_at=NOW,
         usage_before=UsageSnapshot(memory_bytes=2048, cpu_percent=0.5),
-        usage_after=UsageSnapshot(memory_bytes=1024, cpu_percent=0.25),
+        usage_after=UsageSnapshot(memory_bytes=memory_bytes, cpu_percent=0.25),
         high_water_marks=GuardianHighWaterMarks(
             resources=ResourceHighWaterMarks(observed=2, managed=1, ambiguous=1),
-            usage=UsageHighWaterMarks(memory_bytes=1024, cpu_percent=0.25),
+            usage=UsageHighWaterMarks(memory_bytes=memory_bytes, cpu_percent=0.25),
         ),
         reap_decisions=[],
         refused_decisions=[],
@@ -119,3 +119,21 @@ def test_transport_failure_leaves_report_pending(tmp_path) -> None:
 def test_sink_has_no_configurable_issue_target() -> None:
     with pytest.raises(TypeError):
         GuardianBakeLinearSink(LinearFake(), issue="BOU-9999")  # type: ignore[call-arg]
+
+
+def test_rate_limit_survives_sink_restart(tmp_path) -> None:
+    spool = GuardianBakeSpool(tmp_path / "bake.json")
+    fake = LinearFake()
+    GuardianBakeLinearSink(fake).drain(spool, now=NOW)
+    first = spool.append(report(), now=NOW)
+    GuardianBakeLinearSink(fake).drain(spool, now=NOW)
+    assert first.delivered_at is None
+
+    spool.append(report(2048), now=NOW + timedelta(minutes=1))
+    delivered = GuardianBakeLinearSink(fake).drain(
+        GuardianBakeSpool(tmp_path / "bake.json"),
+        now=NOW + timedelta(minutes=1),
+    )
+
+    assert delivered == []
+    assert len(spool.pending()) == 1
