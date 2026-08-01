@@ -25,6 +25,7 @@ from .process_identity import (
     ProcessPlatform,
     ProcessState,
     capture_process_identity,
+    observe_process_identity,
     same_process,
 )
 from .resource_guardian import (
@@ -80,5 +81,6 @@ __all__ = [
     "assess_bake_exit",
     "capture_process_identity",
     "decide_guardian_action",
+    "observe_process_identity",
     "same_process",
 ]
