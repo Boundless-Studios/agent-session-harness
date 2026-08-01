@@ -118,6 +118,13 @@ Managed runtimes inherit a deliberately small base environment. A host can prese
 
 The long-lived integration surface is `agent_session_harness.supervisor.Supervisor`. A host supplies four small protocols: native usage reader, checkpoint manager, fenced coordinator, and process driver. This keeps Linear, beads, PR dashboards, worktree launchers, and project safety policy outside the reusable package. The deterministic E2E test uses a real child process and proves root → checkpoint → stop while still claimed → fence/release → fresh successor → acknowledgement with no overlap.
 
+Context-pressure UI can use the smaller
+`agent_session_harness.context_advisory.evaluate_context_advisory` contract.
+Runtime adapters supply a measured token/window observation, the harness owns
+portable threshold and one-emission-per-tier semantics, and each repository
+retains its own message text and remediation links. A changed authoritative
+window invalidates a tier recorded against an earlier fallback window.
+
 ## Durable handoff capsule
 
 `HandoffCapsule` contains only bounded operational state:
