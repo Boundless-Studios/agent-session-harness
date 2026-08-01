@@ -1,6 +1,6 @@
 [project]
 name = "agent-session-harness"
-version = "0.1.0"
+version = "0.2.0"
 description = "Crash-safe context accounting and fresh-session supervision for Claude Code and Codex."
 readme = "README.md"
 requires-python = ">=3.11"
