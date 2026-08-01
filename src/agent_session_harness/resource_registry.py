@@ -162,6 +162,24 @@ class ResourceRegistry:
                 for item in self._read().registrations
             )
 
+    def resolve_current(
+        self,
+        kind: str,
+        resource_key: str,
+        registration_id: str,
+    ) -> ResourceRegistration | None:
+        with exclusive_lock(self.lock_path):
+            return next(
+                (
+                    item
+                    for item in self._read().registrations
+                    if item.resource.kind == kind
+                    and item.resource.resource_key == resource_key
+                    and item.registration_id == registration_id
+                ),
+                None,
+            )
+
     def _read(self) -> _RegistryDocument:
         if not private_exists(self.path):
             return _RegistryDocument(registrations=[])
