@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import pwd
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,6 @@ from agent_coordinator import (
     TaskCoordinator,
     TaskIdentity,
 )
-from platformdirs import user_state_path
 from pydantic import BaseModel, ConfigDict, Field
 
 from .coordinator import _SecureJsonlClaimStore
@@ -97,8 +97,14 @@ class GuardianSingleton:
     def for_current_user(
         cls,
     ) -> GuardianSingleton:
-        root = user_state_path("agent-session-harness") / "guardian"
-        return cls._from_state_root(root)
+        return cls._from_state_root(cls.canonical_state_root())
+
+    @staticmethod
+    def canonical_state_root() -> Path:
+        """Return one environment-independent state root for the effective UID."""
+
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        return account_home / ".local" / "state" / "agent-session-harness" / "guardian"
 
     @classmethod
     def _for_test(cls, state_root: str | Path) -> GuardianSingleton:

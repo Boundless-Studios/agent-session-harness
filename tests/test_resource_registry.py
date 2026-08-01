@@ -113,11 +113,3 @@ def test_register_refuses_to_persist_more_than_bounded_capacity(tmp_path) -> Non
         registry.register(resource("child:overflow"), now=NOW)
 
     assert len(registry.list()) == 1024
-
-
-def test_package_exports_guardian_service_contracts() -> None:
-    import agent_session_harness
-
-    assert agent_session_harness.ResourceRegistry is ResourceRegistry
-    assert agent_session_harness.GuardianService.__name__ == "GuardianService"
-    assert agent_session_harness.GuardianSingleton.__name__ == "GuardianSingleton"

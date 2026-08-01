@@ -98,3 +98,13 @@ def test_bound_ownership_exposes_service_lease_contract(tmp_path) -> None:
     assert ownership.handle == handle
     assert proof.claim_id == handle.claim_id
     assert proof.lease_epoch == handle.lease_epoch
+
+
+def test_canonical_user_root_ignores_process_state_environment(monkeypatch) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", "/tmp/first-state-root")
+    first = GuardianSingleton.canonical_state_root()
+    monkeypatch.setenv("XDG_STATE_HOME", "/tmp/second-state-root")
+    second = GuardianSingleton.canonical_state_root()
+
+    assert first == second
+    assert "agent-session-harness" in first.parts
