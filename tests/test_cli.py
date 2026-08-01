@@ -35,7 +35,7 @@ def test_doctor_json_is_deterministic_and_never_launches_a_model(capsys) -> None
     payload = _json_stdout(capsys)
     assert payload["schema_version"] == 1
     assert payload["ok"] is True
-    assert payload["checks"]["package"] == "0.1.0"
+    assert payload["checks"]["package"] == "0.2.0"
     assert "summary" not in payload
 
 

@@ -17,11 +17,14 @@ The harness keeps long agent tasks moving without letting a single conversation 
 
 ## Install
 
-Version `v0.1.0` pins [`agent-coordinator` v0.2.0](https://github.com/Boundless-Studios/agent-coordinator/releases/tag/v0.2.0) by immutable Git tag.
+Version `v0.2.0` adds the native process identity, conservative guardian,
+fenced authorization, and opt-in bake contracts. It pins
+[`agent-coordinator` v0.5.0](https://github.com/Boundless-Studios/agent-coordinator/releases/tag/v0.5.0)
+by immutable Git tag.
 
 ```bash
 python -m pip install \
-  'agent-session-harness @ git+https://github.com/Boundless-Studios/agent-session-harness.git@v0.1.0'
+  'agent-session-harness @ git+https://github.com/Boundless-Studios/agent-session-harness.git@v0.2.0'
 
 agent-session-harness doctor --json
 ```
