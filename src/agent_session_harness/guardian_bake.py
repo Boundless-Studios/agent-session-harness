@@ -20,7 +20,13 @@ from pydantic import (
 SchemaVersion = Literal[1]
 BoundedText = Annotated[str, Field(min_length=1, max_length=512)]
 
-_AUTHORIZATION = re.compile(r"(?i)\bAuthorization\s*:\s*(?:Bearer\s+)?\S+")
+_AUTHORIZATION = re.compile(
+    r"""(?ix)
+    \bAuthorization\s*(?::|=)\s*
+    (?:(?:Bearer|Basic)\s+)?
+    (?:"[^"]*"|'[^']*'|\S+)
+    """
+)
 _CREDENTIAL = re.compile(
     r"""(?ix)
     ["']?[A-Za-z0-9_-]*(?:token|api[_-]?key|password|secret)["']?
@@ -35,7 +41,7 @@ _ARGUMENT_VALUE = re.compile(
     (?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)
     """
 )
-_COMMAND_VALUE = re.compile(r"(?i)\b(?:argv|command(?:_line)?)\s*(?:=|:)\s*.*$")
+_COMMAND_VALUE = re.compile(r"(?is)\b(?:argv|command(?:_line)?)\s*(?:=|:)\s*.*$")
 
 
 def redact_guardian_text(value: str) -> str:

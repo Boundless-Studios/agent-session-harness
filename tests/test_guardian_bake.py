@@ -71,7 +71,8 @@ def test_redactor_removes_credentials_paths_and_arguments() -> None:
         "Authorization: Bearer secret-token LINEAR_API_KEY=abc123 "
         'api_key: colon-secret {"token": "json-secret"} password="two words" '
         "/Users/alice/project --password hunter2 -p short-secret "
-        "command: tool positional-secret"
+        "Authorization=Basic basic-secret command: tool positional-secret\n"
+        "multiline-secret"
     )
 
     redacted = redact_guardian_text(value)
@@ -85,6 +86,8 @@ def test_redactor_removes_credentials_paths_and_arguments() -> None:
     assert "two words" not in redacted
     assert "short-secret" not in redacted
     assert "positional-secret" not in redacted
+    assert "basic-secret" not in redacted
+    assert "multiline-secret" not in redacted
     assert "[REDACTED]" in redacted
 
 
