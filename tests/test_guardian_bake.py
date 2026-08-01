@@ -12,6 +12,7 @@ from agent_session_harness.guardian_bake import (
     GuardianHighWaterMarks,
     ObservationWindow,
     ResourceHighWaterMarks,
+    UsageSnapshot,
     UsageHighWaterMarks,
     redact_guardian_text,
 )
@@ -28,6 +29,8 @@ def report(*, heartbeat: datetime = START, detail: str = "safe") -> GuardianBake
             ends_at=START + timedelta(hours=24),
         ),
         heartbeat_at=heartbeat,
+        usage_before=UsageSnapshot(memory_bytes=2048, cpu_percent=0.5),
+        usage_after=UsageSnapshot(memory_bytes=1024, cpu_percent=0.25),
         high_water_marks=GuardianHighWaterMarks(
             resources=ResourceHighWaterMarks(observed=4, managed=3, ambiguous=1),
             usage=UsageHighWaterMarks(memory_bytes=4096, cpu_percent=1.25),
@@ -95,3 +98,10 @@ def test_report_rejects_window_or_heartbeat_outside_window() -> None:
 
     with pytest.raises(ValidationError, match="heartbeat"):
         report(heartbeat=START + timedelta(days=2))
+
+
+def test_report_preserves_before_after_usage() -> None:
+    baked = report()
+
+    assert baked.usage_before.memory_bytes == 2048
+    assert baked.usage_after.memory_bytes == 1024

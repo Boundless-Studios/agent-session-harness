@@ -13,6 +13,7 @@ from agent_session_harness.guardian_bake import (
     GuardianHighWaterMarks,
     ObservationWindow,
     ResourceHighWaterMarks,
+    UsageSnapshot,
     UsageHighWaterMarks,
 )
 from agent_session_harness.guardian_bake_spool import GuardianBakeSpool
@@ -29,6 +30,8 @@ def report() -> GuardianBakeReport:
             ends_at=NOW + timedelta(days=1),
         ),
         heartbeat_at=NOW,
+        usage_before=UsageSnapshot(memory_bytes=2048, cpu_percent=0.5),
+        usage_after=UsageSnapshot(memory_bytes=1024, cpu_percent=0.25),
         high_water_marks=GuardianHighWaterMarks(
             resources=ResourceHighWaterMarks(observed=2, managed=1, ambiguous=1),
             usage=UsageHighWaterMarks(memory_bytes=1024, cpu_percent=0.25),

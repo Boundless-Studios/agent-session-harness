@@ -145,6 +145,12 @@ def _format_report(record: GuardianBakeSpoolRecord) -> str:
                 f"{resources.ambiguous} ambiguous"
             ),
             f"- High-water usage: {usage.memory_bytes} bytes, {usage.cpu_percent:.2f}% CPU",
+            (
+                "- Before/after usage: "
+                f"{report.usage_before.memory_bytes}/{report.usage_after.memory_bytes} "
+                "bytes, "
+                f"{report.usage_before.cpu_percent:.2f}/{report.usage_after.cpu_percent:.2f}% CPU"
+            ),
             f"- Reap decisions: {len(report.reap_decisions)}",
             f"- Refused decisions: {len(report.refused_decisions)}",
             f"- Errors: {len(report.errors)}",

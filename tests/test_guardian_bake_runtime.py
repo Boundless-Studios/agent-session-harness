@@ -8,6 +8,7 @@ from agent_session_harness.guardian_bake import (
     GuardianHighWaterMarks,
     ObservationWindow,
     ResourceHighWaterMarks,
+    UsageSnapshot,
     UsageHighWaterMarks,
 )
 from agent_session_harness.guardian_bake_runtime import (
@@ -50,6 +51,8 @@ def report(
         platform="linux",
         observation_window=WINDOW,
         heartbeat_at=heartbeat,
+        usage_before=UsageSnapshot(memory_bytes=memory_bytes, cpu_percent=cpu_percent),
+        usage_after=UsageSnapshot(memory_bytes=memory_bytes, cpu_percent=cpu_percent),
         high_water_marks=GuardianHighWaterMarks(
             resources=ResourceHighWaterMarks(observed=1, managed=1, ambiguous=0),
             usage=UsageHighWaterMarks(

@@ -8,6 +8,7 @@ from .guardian_bake import (
     ObservationWindow,
     ResourceHighWaterMarks,
     UsageHighWaterMarks,
+    UsageSnapshot,
 )
 from .guardian_bake_runtime import (
     GuardianBakeConfig,
@@ -72,6 +73,7 @@ __all__ = [
     "ProcessState",
     "ResourceHighWaterMarks",
     "UsageHighWaterMarks",
+    "UsageSnapshot",
     "WorktreeIdentity",
     "WorktreeState",
     "__version__",

@@ -67,6 +67,13 @@ class UsageHighWaterMarks(BaseModel):
     cpu_percent: float = Field(ge=0)
 
 
+class UsageSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    memory_bytes: int = Field(ge=0)
+    cpu_percent: float = Field(ge=0)
+
+
 class GuardianHighWaterMarks(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -113,6 +120,8 @@ class GuardianBakeReport(BaseModel):
     platform: Literal["darwin", "linux"]
     observation_window: ObservationWindow
     heartbeat_at: datetime
+    usage_before: UsageSnapshot
+    usage_after: UsageSnapshot
     high_water_marks: GuardianHighWaterMarks
     reap_decisions: Annotated[list[GuardianBakeDecision], Field(max_length=1024)]
     refused_decisions: Annotated[list[GuardianBakeDecision], Field(max_length=1024)]
