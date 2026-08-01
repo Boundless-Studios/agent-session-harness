@@ -346,11 +346,19 @@ live owner, a missing/zombie registered child, or an expired fenced identity
 whose registered process is no longer live. An exact live but unowned process
 alerts even when its lease is expired.
 
-Observe-only execution is the service default. A follow-on service PR will own
-the fenced per-user singleton, durable register/unregister storage, and
-independent reap enablement by reason code. Cleanup adapters for runtimes, hook
-children, tunnels, and explicitly registered language-server trees remain
-configuration, not core process policy.
+`ResourceRegistry` durably stores explicit registrations in a private atomic
+file. Registering a replacement creates a new incarnation token; unregistering
+requires that exact token, so a stale session cannot delete its successor's
+resource. Corrupt, oversized, unsupported, and unsafe registry paths fail
+closed rather than appearing empty.
+
+`GuardianSingleton` uses the coordinator's durable lease epochs to allow one
+guardian per OS user. An expired owner can be replaced only by a higher epoch,
+and the stale predecessor cannot heartbeat, release, or authorize publication.
+`GuardianService` snapshots registrations and emits decisions in observe-only
+mode; it revalidates singleton ownership before publishing a `reap` decision
+and never executes cleanup. Cleanup adapters and independent reap enablement by
+reason code remain a separate execution boundary.
 
 ## Integration boundaries
 

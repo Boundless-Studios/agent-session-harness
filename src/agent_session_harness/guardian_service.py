@@ -52,6 +52,8 @@ class GuardianService:
             decision = decide_guardian_action(observation)
             if decision.action is GuardianAction.REAP:
                 self.lease.assert_current()
+                if not self.registry.is_current(registration):
+                    continue
             self.publish(decision)
             decisions.append(decision)
         return decisions

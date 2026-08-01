@@ -46,6 +46,9 @@ def test_replacement_token_fences_stale_unregister(tmp_path) -> None:
     old = registry.register(resource(), now=NOW)
     replacement = registry.register(resource(), now=NOW)
 
+    assert registry.is_current(old) is False
+    assert registry.is_current(replacement) is True
+
     with pytest.raises(RegistrationConflictError, match="stale"):
         registry.unregister(
             old.resource.kind, old.resource.resource_key, old.registration_id
@@ -77,3 +80,11 @@ def test_registry_rejects_unsupported_major_version(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="unsupported"):
         ResourceRegistry(path).list()
+
+
+def test_package_exports_guardian_service_contracts() -> None:
+    import agent_session_harness
+
+    assert agent_session_harness.ResourceRegistry is ResourceRegistry
+    assert agent_session_harness.GuardianService.__name__ == "GuardianService"
+    assert agent_session_harness.GuardianSingleton.__name__ == "GuardianSingleton"

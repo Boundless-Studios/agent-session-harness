@@ -1,5 +1,13 @@
 """Public package boundary for agent-session-harness."""
 
+from .guardian_service import GuardianService
+from .guardian_singleton import (
+    DuplicateGuardianError,
+    GuardianLeaseHandle,
+    GuardianOwnership,
+    GuardianSingleton,
+    StaleGuardianError,
+)
 from .process_identity import (
     ManagedResourceReference,
     ProcessEvidence,
@@ -26,15 +34,25 @@ from .resource_guardian import (
     WorktreeState,
     decide_guardian_action,
 )
+from .resource_registry import (
+    RegistrationConflictError,
+    ResourceRegistration,
+    ResourceRegistry,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "DuplicateGuardianError",
     "GuardianAction",
     "GuardianDecision",
     "GuardianEvidence",
+    "GuardianLeaseHandle",
     "GuardianObservation",
+    "GuardianOwnership",
     "GuardianReasonCode",
+    "GuardianService",
+    "GuardianSingleton",
     "LeaseState",
     "ManagedOwnerState",
     "ManagedResource",
@@ -47,6 +65,10 @@ __all__ = [
     "ProcessObservation",
     "ProcessPlatform",
     "ProcessState",
+    "RegistrationConflictError",
+    "ResourceRegistration",
+    "ResourceRegistry",
+    "StaleGuardianError",
     "WorktreeIdentity",
     "WorktreeState",
     "__version__",

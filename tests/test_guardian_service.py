@@ -112,3 +112,23 @@ def test_observer_failure_becomes_alert_instead_of_reap(tmp_path) -> None:
 
     assert decisions[0].action is GuardianAction.ALERT
     assert decisions[0].reason_code == "inspection_failed"
+
+
+def test_replaced_registration_blocks_stale_reap_publication(tmp_path) -> None:
+    registry = ResourceRegistry(tmp_path / "resources.json")
+    registry.register(resource(), now=NOW)
+    published = []
+
+    def replace_during_inspection(managed: ManagedResource) -> GuardianObservation:
+        registry.register(managed, now=NOW)
+        return missing_observation(managed)
+
+    decisions = GuardianService(
+        registry=registry,
+        lease=Lease(),
+        observer=replace_during_inspection,
+        publish=published.append,
+    ).run_once()
+
+    assert decisions == []
+    assert published == []

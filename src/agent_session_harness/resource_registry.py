@@ -124,6 +124,22 @@ class ResourceRegistry:
         with exclusive_lock(self.lock_path):
             return list(self._read().registrations)
 
+    def is_current(self, registration: ResourceRegistration) -> bool:
+        logical_key = (
+            registration.resource.kind,
+            registration.resource.resource_key,
+        )
+        with exclusive_lock(self.lock_path):
+            return any(
+                (
+                    item.resource.kind,
+                    item.resource.resource_key,
+                    item.registration_id,
+                )
+                == (*logical_key, registration.registration_id)
+                for item in self._read().registrations
+            )
+
     def _read(self) -> _RegistryDocument:
         if not private_exists(self.path):
             return _RegistryDocument(registrations=[])
