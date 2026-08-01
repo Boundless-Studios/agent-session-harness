@@ -364,6 +364,35 @@ authority. A future executor must validate both fences again at execution time.
 Cleanup adapters and independent reap enablement by reason code remain that
 separate execution boundary.
 
+## Opt-in guardian bake
+
+The guardian bake packages conservative observation for macOS and Linux without
+enabling cleanup by default. A host explicitly installs a frozen
+`GuardianBakeConfig` with a bounded observation window. `observe_only` records
+proposed reaps but enables no reason codes; `reap` requires a non-empty explicit
+reason-code allowlist and still passes through the existing registration and
+guardian lease fences.
+
+Every `GuardianBakeReport` is redacted and written to a private local spool
+before delivery is attempted. Credential-like assignments, authorization
+tokens, user home prefixes, and command arguments do not enter the spool.
+Identical pending states are summarized with a repeat count. Undelivered
+evidence is never evicted to make room; corrupt, oversized, or unsafe spool
+state fails closed.
+
+The optional Linear sink is statically restricted to commenting on the
+existing issue `BOU-2704`. It cannot accept another issue identifier and has no
+issue-creation operation. Deduplication markers plus comment read-back make
+offline retries idempotent. Credentials and the GraphQL transport remain
+injected by the host.
+
+Uninstalling or rolling back to `observe_only` disables collection/reaping but
+does not remove the local spool. Collection and upload stop automatically at
+the configured window end. `assess_bake_exit` reports success only when no live
+resource was reaped, every enabled reason has a validated non-live cleanup, and
+recorded guardian CPU and memory overhead stay within configured bounds; it
+never changes policy automatically.
+
 ## Integration boundaries
 
 - [`agent-coordinator`](https://github.com/Boundless-Studios/agent-coordinator) owns atomic claims and lease-epoch fencing.
