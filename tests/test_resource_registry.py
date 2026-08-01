@@ -113,3 +113,43 @@ def test_register_refuses_to_persist_more_than_bounded_capacity(tmp_path) -> Non
         registry.register(resource("child:overflow"), now=NOW)
 
     assert len(registry.list()) == 1024
+
+
+def test_register_refuses_oversized_document_without_replacing_current(
+    tmp_path,
+) -> None:
+    path = tmp_path / "resources.json"
+    registry = ResourceRegistry(path)
+    current = registry.register(resource(), now=NOW)
+    oversized = ManagedResource.model_validate(
+        {
+            **resource().model_dump(),
+            "future_blob": "x" * (4 * 1_048_576),
+        }
+    )
+
+    with pytest.raises(ValueError, match="4194304"):
+        registry.register(oversized, now=NOW)
+
+    assert registry.list() == [current]
+
+
+def test_registry_rejects_duplicate_logical_keys(tmp_path) -> None:
+    path = tmp_path / "resources.json"
+    first = ResourceRegistry(path).register(resource(), now=NOW)
+    duplicate = first.model_copy(update={"registration_id": "replacement-token-0001"})
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "registrations": [
+                    first.model_dump(mode="json"),
+                    duplicate.model_dump(mode="json"),
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="contract"):
+        ResourceRegistry(path).list()

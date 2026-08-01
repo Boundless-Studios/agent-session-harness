@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -128,11 +129,12 @@ class GuardianSingleton:
         lease_seconds: int,
         now: datetime | None = None,
     ) -> GuardianLeaseHandle:
+        owner_incarnation_id = f"{owner_session_id}:{uuid.uuid4().hex}"
         try:
             claim = self.coordinator.claim_task(
                 self.task,
                 OwnerIdentity(
-                    session_id=owner_session_id,
+                    session_id=owner_incarnation_id,
                     pid=owner_pid,
                     agent="resource-guardian",
                 ),
@@ -144,7 +146,7 @@ class GuardianSingleton:
         return GuardianLeaseHandle(
             claim_id=claim.claim_id,
             lease_epoch=claim.lease_epoch,
-            owner_session_id=owner_session_id,
+            owner_session_id=owner_incarnation_id,
         )
 
     def bind(

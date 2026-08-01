@@ -6,9 +6,16 @@ import json
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .resource_guardian import ManagedResource
 from .secure_files import (
@@ -52,6 +59,16 @@ class _RegistryDocument(BaseModel):
         list[ResourceRegistration],
         Field(max_length=MAX_REGISTRATIONS),
     ]
+
+    @model_validator(mode="after")
+    def require_unique_logical_keys(self) -> Self:
+        keys = [
+            (item.resource.kind, item.resource.resource_key)
+            for item in self.registrations
+        ]
+        if len(keys) != len(set(keys)):
+            raise ValueError("resource registry contains duplicate logical keys")
+        return self
 
 
 class ResourceRegistry:
@@ -164,7 +181,11 @@ class ResourceRegistry:
             raise RuntimeError("resource registry violates its contract") from exc
 
     def _write(self, document: _RegistryDocument) -> None:
+        encoded = document.model_dump_json() + "\n"
+        byte_length = len(encoded.encode("utf-8"))
+        if byte_length > MAX_REGISTRY_BYTES:
+            raise ValueError(f"resource registry exceeds {MAX_REGISTRY_BYTES} bytes")
         atomic_write_private_text(
             self.path,
-            document.model_dump_json() + "\n",
+            encoded,
         )

@@ -32,6 +32,25 @@ def test_active_guardian_rejects_duplicate_owner(tmp_path) -> None:
         )
 
 
+def test_same_session_cannot_idempotently_acquire_twice(tmp_path) -> None:
+    first = GuardianSingleton._for_test(tmp_path)
+    duplicate = GuardianSingleton._for_test(tmp_path)
+    first.acquire(
+        owner_session_id="shared-session",
+        owner_pid=None,
+        lease_seconds=30,
+        now=NOW,
+    )
+
+    with pytest.raises(DuplicateGuardianError, match="active"):
+        duplicate.acquire(
+            owner_session_id="shared-session",
+            owner_pid=None,
+            lease_seconds=30,
+            now=NOW + timedelta(seconds=1),
+        )
+
+
 def test_expired_guardian_is_fenced_by_higher_epoch_successor(tmp_path) -> None:
     first = GuardianSingleton._for_test(tmp_path)
     successor = GuardianSingleton._for_test(tmp_path)

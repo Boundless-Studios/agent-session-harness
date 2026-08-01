@@ -81,7 +81,10 @@ class GuardianService:
 
     def _observe(self, resource: ManagedResource) -> GuardianObservation:
         try:
-            return self.observer(resource)
+            observation = self.observer(resource)
+            if observation.resource != resource:
+                raise ValueError("observation resource does not match registration")
+            return observation
         except Exception as exc:
             return GuardianObservation(
                 resource=resource,

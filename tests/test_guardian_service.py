@@ -140,3 +140,22 @@ def test_replaced_registration_blocks_stale_reap_publication(tmp_path) -> None:
 
     assert decisions == []
     assert published == []
+
+
+def test_mismatched_observation_alerts_for_registered_resource(tmp_path) -> None:
+    registry = ResourceRegistry(tmp_path / "resources.json")
+    registered = resource()
+    registry.register(registered, now=NOW)
+    other = registered.model_copy(update={"resource_key": "child:other"})
+
+    publications = GuardianService(
+        registry=registry,
+        lease=Lease(),
+        observer=lambda _managed: missing_observation(other),
+        clock=lambda: NOW,
+    ).run_once()
+
+    decision = publications[0].decision
+    assert decision.resource.resource_key == registered.resource_key
+    assert decision.action is GuardianAction.ALERT
+    assert decision.reason_code == "inspection_failed"
