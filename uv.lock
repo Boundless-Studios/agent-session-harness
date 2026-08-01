@@ -9,7 +9,7 @@ source = { git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev
 
 [[package]]
 name = "agent-session-harness"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "agent-coordinator" },
