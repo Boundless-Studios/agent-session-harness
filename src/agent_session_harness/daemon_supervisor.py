@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
 import time
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from .daemon_lifecycle import (
@@ -36,6 +38,12 @@ class DaemonStopTimeoutError(TimeoutError):
     """A verified daemon did not stop within its bounded deadline."""
 
 
+class _OwnedChildState(StrEnum):
+    RUNNING = "running"
+    ZOMBIE = "zombie"
+    MISSING = "missing"
+
+
 class DaemonSupervisor:
     def __init__(
         self,
@@ -48,8 +56,18 @@ class DaemonSupervisor:
         stop_timeout: float = 5,
         kill_timeout: float = 2,
     ) -> None:
-        if min(lock_timeout, startup_probe_seconds, stop_timeout, kill_timeout) < 0:
+        timeouts = (
+            lock_timeout,
+            startup_probe_seconds,
+            stop_timeout,
+            kill_timeout,
+        )
+        if not all(math.isfinite(value) for value in timeouts):
+            raise ValueError("daemon lifecycle timeouts must be finite")
+        if min(timeouts) < 0:
             raise ValueError("daemon lifecycle timeouts cannot be negative")
+        if stop_timeout == 0 or kill_timeout == 0:
+            raise ValueError("daemon stop and kill timeouts must be positive")
         self.definition = definition
         self.store = DaemonLifecycleStore(state_path)
         self.lock = OwnerDiagnosticLock(lock_path, purpose=definition.daemon_key)
@@ -100,19 +118,52 @@ class DaemonSupervisor:
         self._child = child
         time.sleep(self.startup_probe_seconds)
         identity = capture_process_identity(child.pid)
-        if child.poll() is not None or identity is None:
+        child_state = self._owned_child_state(child)
+        if identity is None or child_state is not _OwnedChildState.RUNNING:
+            if child_state is not _OwnedChildState.MISSING:
+                self._terminate_owned_child(child)
+            else:
+                self._child = None
             self._publish(
                 DaemonLifecyclePhase.FAILED,
                 generation,
                 detail="child exited or identity capture failed",
             )
-            self._terminate_owned_child(child)
             raise DaemonLaunchError("daemon failed its startup identity probe")
-        return self._publish(
-            DaemonLifecyclePhase.RUNNING,
-            generation,
-            process_identity=identity,
-        )
+        try:
+            return self._publish(
+                DaemonLifecyclePhase.RUNNING,
+                generation,
+                process_identity=identity,
+            )
+        except BaseException as publish_error:
+            try:
+                self._terminate_owned_child(child)
+            except BaseException as cleanup_error:
+                failure_state_written = True
+                try:
+                    self._publish(
+                        DaemonLifecyclePhase.FAILED,
+                        generation,
+                        detail=f"cleanup failed: {type(cleanup_error).__name__}",
+                        process_identity=identity,
+                    )
+                except BaseException:
+                    failure_state_written = False
+                if not failure_state_written:
+                    cleanup_error.add_note(
+                        "captured daemon identity could not be persisted"
+                    )
+                raise cleanup_error from publish_error
+            try:
+                self._publish(
+                    DaemonLifecyclePhase.FAILED,
+                    generation,
+                    detail=f"running publication failed: {type(publish_error).__name__}",
+                )
+            except BaseException:
+                publish_error.add_note("cleaned daemon failure could not be persisted")
+            raise
 
     def _stop_locked(self) -> DaemonLifecycleRecord:
         current = self.store.read()
@@ -127,8 +178,24 @@ class DaemonSupervisor:
             raise DaemonIdentityUnknownError(
                 "daemon process identity is unknown; refusing to signal"
             )
-        if observation.state in {ProcessState.MISSING, ProcessState.ZOMBIE}:
-            self._reap_owned_child(identity.pid)
+        if observation.state is ProcessState.MISSING:
+            if self._owned_child(identity.pid) is not None:
+                raise DaemonIdentityUnknownError(
+                    "owned daemon PID is missing; refusing process-group cleanup"
+                )
+            return self._publish(
+                DaemonLifecyclePhase.STOPPED,
+                current.generation,
+                detail="tracked process lifetime is absent",
+            )
+        if observation.state is ProcessState.ZOMBIE:
+            child = self._owned_child(identity.pid)
+            if child is not None and self._process_group_has_live_members(
+                child.pid, timeout=min(self.stop_timeout, 0.25)
+            ):
+                self._terminate_owned_child(child)
+            else:
+                self._reap_owned_child(identity.pid)
             return self._publish(
                 DaemonLifecyclePhase.STOPPED,
                 current.generation,
@@ -168,21 +235,31 @@ class DaemonSupervisor:
     @staticmethod
     def _wait_group_absent(child: subprocess.Popen[bytes], timeout: float) -> bool:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not DaemonSupervisor._process_group_has_live_members(child.pid):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if not DaemonSupervisor._process_group_has_live_members(
+                child.pid, timeout=min(remaining, 0.25)
+            ):
                 child.wait(timeout=0)
                 return True
             time.sleep(0.01)
-        return False
 
     @staticmethod
-    def _process_group_has_live_members(process_group_id: int) -> bool:
-        result = subprocess.run(
-            ("ps", "-axo", "pgid=,stat="),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    def _process_group_has_live_members(
+        process_group_id: int, *, timeout: float
+    ) -> bool:
+        try:
+            result = subprocess.run(
+                ("/bin/ps", "-axo", "pgid=,stat="),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return True
         for line in result.stdout.splitlines():
             fields = line.split()
             if (
@@ -196,6 +273,18 @@ class DaemonSupervisor:
     def _owned_child(self, pid: int) -> subprocess.Popen[bytes] | None:
         child = self._child
         return child if child is not None and child.pid == pid else None
+
+    @staticmethod
+    def _owned_child_state(child: subprocess.Popen[bytes]) -> _OwnedChildState:
+        try:
+            result = os.waitid(
+                os.P_PID,
+                child.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError:
+            return _OwnedChildState.MISSING
+        return _OwnedChildState.RUNNING if result is None else _OwnedChildState.ZOMBIE
 
     def _reap_owned_child(self, pid: int) -> None:
         child = self._owned_child(pid)

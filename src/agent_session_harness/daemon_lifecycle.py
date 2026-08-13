@@ -54,6 +54,8 @@ class DaemonDefinition(BaseModel):
     def require_bounded_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if any(not item or len(item) > 4096 for item in value):
             raise ValueError("daemon argv entries must be nonempty and bounded")
+        if any("\x00" in item for item in value):
+            raise ValueError("daemon argv entries cannot contain NUL")
         return value
 
     @field_validator("cwd")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 import multiprocessing
 import os
+import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,11 +18,14 @@ from agent_session_harness.daemon_lifecycle import (
 )
 from agent_session_harness.daemon_supervisor import (
     DaemonIdentityUnknownError,
+    DaemonLaunchError,
     DaemonSupervisor,
+    _OwnedChildState,
 )
 from agent_session_harness.process_identity import (
     ProcessIdentity,
     ProcessPlatform,
+    ProcessState,
 )
 
 
@@ -232,3 +237,176 @@ def test_start_persists_recovered_running_phase(tmp_path) -> None:
         assert DaemonLifecycleStore(tmp_path / "state.json").read() == recovered
     finally:
         owner.stop()
+
+
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize(
+    "field", ["lock_timeout", "startup_probe_seconds", "stop_timeout", "kill_timeout"]
+)
+def test_supervisor_rejects_non_finite_timeouts(tmp_path, field, timeout) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        DaemonSupervisor(
+            definition(tmp_path),
+            state_path=tmp_path / "state.json",
+            lock_path=tmp_path / "lock",
+            **{field: timeout},
+        )
+
+
+@pytest.mark.parametrize("field", ["stop_timeout", "kill_timeout"])
+def test_supervisor_rejects_zero_stop_deadlines(tmp_path, field) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        DaemonSupervisor(
+            definition(tmp_path),
+            state_path=tmp_path / "state.json",
+            lock_path=tmp_path / "lock",
+            **{field: 0},
+        )
+
+
+def test_startup_failure_cleans_group_before_reaping_leader(tmp_path) -> None:
+    forking = DaemonDefinition(
+        daemon_key="forking",
+        argv=(
+            sys.executable,
+            "-c",
+            "import os,time; p=os.fork(); time.sleep(60) if p == 0 else None",
+        ),
+        cwd=tmp_path,
+    )
+    service = DaemonSupervisor(
+        forking,
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "lock",
+        startup_probe_seconds=0.1,
+        stop_timeout=0.05,
+        kill_timeout=1,
+    )
+
+    with pytest.raises(DaemonLaunchError, match="startup identity probe"):
+        service.start()
+
+    assert service._child is None
+
+
+def test_running_publish_failure_cleans_owned_group(tmp_path, monkeypatch) -> None:
+    service = supervisor(tmp_path)
+    original_publish = service.store.publish
+
+    def fail_running(state):
+        if state.phase is DaemonLifecyclePhase.RUNNING:
+            raise OSError("disk full")
+        original_publish(state)
+
+    monkeypatch.setattr(service.store, "publish", fail_running)
+
+    with pytest.raises(OSError, match="disk full"):
+        service.start()
+
+    assert service._child is None
+    state = DaemonLifecycleStore(tmp_path / "state.json").read()
+    assert state is not None
+    assert state.phase is DaemonLifecyclePhase.FAILED
+    assert state.process_identity is None
+
+
+def test_publish_and_cleanup_failure_preserves_captured_identity(
+    tmp_path, monkeypatch
+) -> None:
+    service = supervisor(tmp_path)
+    original_publish = service.store.publish
+
+    def fail_running(state):
+        if state.phase is DaemonLifecyclePhase.RUNNING:
+            raise OSError("disk full")
+        original_publish(state)
+
+    monkeypatch.setattr(service.store, "publish", fail_running)
+    monkeypatch.setattr(
+        service,
+        "_terminate_owned_child",
+        lambda _child: (_ for _ in ()).throw(TimeoutError("cleanup timed out")),
+    )
+
+    with pytest.raises(TimeoutError, match="cleanup timed out"):
+        service.start()
+
+    state = DaemonLifecycleStore(tmp_path / "state.json").read()
+    assert state is not None
+    assert state.phase is DaemonLifecyclePhase.FAILED
+    assert state.process_identity is not None
+
+
+def test_process_group_probe_timeout_fails_closed(monkeypatch) -> None:
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(("/bin/ps",), 0.01)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    assert DaemonSupervisor._process_group_has_live_members(42, timeout=0.01)
+
+
+def test_missing_owned_pid_refuses_group_probe_or_signal(tmp_path, monkeypatch) -> None:
+    service = supervisor(tmp_path)
+    running = service.start()
+    assert running.process_identity is not None
+    child_pid = running.process_identity.pid
+    real_killpg = os.killpg
+    group_probes = []
+    signals = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_supervisor.observe_process_identity",
+        lambda _identity: type("Observation", (), {"state": ProcessState.MISSING})(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_process_group_has_live_members",
+        lambda *_args, **_kwargs: group_probes.append(True) or True,
+    )
+    monkeypatch.setattr(os, "killpg", lambda *_args: signals.append(True))
+
+    try:
+        with pytest.raises(DaemonIdentityUnknownError, match="missing"):
+            service.stop()
+
+        assert group_probes == []
+        assert signals == []
+    finally:
+        real_killpg(child_pid, 9)
+
+
+def test_start_rejects_captured_identity_after_child_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    service = supervisor(tmp_path)
+    captured = ProcessIdentity(
+        platform=(
+            ProcessPlatform.DARWIN
+            if sys.platform == "darwin"
+            else ProcessPlatform.LINUX
+        ),
+        pid=4242,
+        opaque_start_token="replacement",
+        executable_identity=sys.executable,
+        captured_at=datetime.now(UTC),
+    )
+    signals = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_supervisor.capture_process_identity",
+        lambda _pid: captured,
+    )
+    monkeypatch.setattr(
+        service,
+        "_owned_child_state",
+        lambda _child: _OwnedChildState.MISSING,
+    )
+    monkeypatch.setattr(os, "killpg", lambda *_args: signals.append(True))
+
+    with pytest.raises(DaemonLaunchError, match="startup identity probe"):
+        service.start()
+
+    assert signals == []
+    state = DaemonLifecycleStore(tmp_path / "state.json").read()
+    assert state is not None
+    assert state.phase is DaemonLifecyclePhase.FAILED
+    assert state.process_identity is None
