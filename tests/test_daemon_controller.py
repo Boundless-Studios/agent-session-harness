@@ -14,6 +14,7 @@ from agent_session_harness.daemon_controller import (
     DaemonControllerServer,
     DaemonOperation,
     DaemonRequest,
+    ensure_controller,
 )
 from agent_session_harness.daemon_lifecycle import (
     DaemonDefinition,
@@ -64,6 +65,11 @@ def test_separate_clients_share_controller_ownership(controller, tmp_path: Path)
         DaemonRequest(operation=DaemonOperation.STOP, definition=definition)
     )
     assert stopped.record.phase is DaemonLifecyclePhase.STOPPED
+    for _ in range(100):
+        if not server.socket_path.exists():
+            break
+        threading.Event().wait(0.01)
+    assert not server.socket_path.exists()
 
 
 def test_controller_rejects_changed_definition(controller, tmp_path: Path):
@@ -96,6 +102,21 @@ def test_second_controller_cannot_replace_live_socket(controller):
         contender.serve()
 
 
+def test_controller_rejects_public_existing_socket_parent(tmp_path: Path):
+    public = tmp_path / "public"
+    public.mkdir(mode=0o755)
+    public.chmod(0o755)
+    server = DaemonControllerServer(
+        socket_path=public / "controller.sock",
+        state_directory=public / "state",
+    )
+
+    with pytest.raises(RuntimeError, match="must be private"):
+        server.serve()
+
+    assert public.stat().st_mode & 0o777 == 0o755
+
+
 def test_disconnected_malformed_client_does_not_stop_controller(
     controller, tmp_path: Path
 ):
@@ -122,3 +143,36 @@ def test_request_payload_is_bounded(tmp_path: Path):
 
     with pytest.raises(ValueError, match="exceeds"):
         client.request(request)
+
+
+def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path):
+    availability = iter((False, False, True))
+    launches = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._controller_available",
+        lambda _path: next(availability),
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.subprocess.Popen",
+        lambda argv, **options: launches.append((argv, options)),
+    )
+
+    ensure_controller(tmp_path / "controller.sock", tmp_path / "state")
+
+    assert len(launches) == 1
+    argv, options = launches[0]
+    assert argv[2:4] == ("agent_session_harness.daemon_controller", "serve")
+    assert options["start_new_session"] is True
+
+
+def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._controller_available",
+        lambda _path: True,
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.subprocess.Popen",
+        lambda *_args, **_options: pytest.fail("controller should not launch"),
+    )
+
+    ensure_controller(tmp_path / "controller.sock", tmp_path / "state")

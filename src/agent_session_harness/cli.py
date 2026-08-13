@@ -25,6 +25,13 @@ from .capsule import HandoffCapsule
 from .checkpoint import CheckpointManager as DurableCheckpointManager
 from .config import load_config
 from .coordinator import CoordinatorAdapter
+from .daemon_controller import (
+    DaemonControllerClient,
+    DaemonOperation,
+    DaemonRequest,
+    ensure_controller,
+)
+from .daemon_lifecycle import DaemonDefinition
 from .guardian import WATCHDOG_SHUTDOWN_MARGIN_SECONDS
 from .hooks.command import (
     SUCCESSOR_ACK_TIMEOUT_SECONDS,
@@ -166,6 +173,18 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument("--stale-after-seconds", type=float, default=30.0)
     _add_json(report)
     report.set_defaults(handler=_run_report)
+
+    daemon = subparsers.add_parser("daemon", help="manage a persistent local daemon")
+    daemon_actions = daemon.add_subparsers(dest="daemon_action", required=True)
+    for operation in DaemonOperation:
+        action = daemon_actions.add_parser(operation.value)
+        action.add_argument("--socket", required=True)
+        action.add_argument("--state-directory", required=True)
+        action.add_argument("--key", required=True)
+        action.add_argument("--cwd", required=True)
+        action.add_argument("command_argv", nargs=argparse.REMAINDER)
+        _add_json(action)
+        action.set_defaults(handler=_run_daemon, daemon_operation=operation)
 
     supervise = subparsers.add_parser(
         "supervise", help="validate or run managed launch"
@@ -338,6 +357,23 @@ def _parser() -> argparse.ArgumentParser:
 
 def _add_json(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", dest="json_output")
+
+
+def _run_daemon(args: argparse.Namespace) -> int:
+    command = tuple(args.command_argv)
+    if command and command[0] == "--":
+        command = command[1:]
+    definition = DaemonDefinition(
+        daemon_key=args.key,
+        argv=command,
+        cwd=Path(args.cwd),
+    )
+    ensure_controller(args.socket, args.state_directory)
+    response = DaemonControllerClient(args.socket).request(
+        DaemonRequest(operation=args.daemon_operation, definition=definition)
+    )
+    _emit(response.record.model_dump(mode="json"), json_output=args.json_output)
+    return 0
 
 
 def _run_doctor(args: argparse.Namespace) -> int:

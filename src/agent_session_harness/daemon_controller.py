@@ -7,6 +7,8 @@ import json
 import os
 import socket
 import stat
+import subprocess
+import sys
 import threading
 import time
 from enum import StrEnum
@@ -23,6 +25,7 @@ from .daemon_lifecycle import (
 from .daemon_supervisor import DaemonSupervisor
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024
+DEFAULT_CONTROLLER_STARTUP_TIMEOUT = 5.0
 
 
 class DaemonOperation(StrEnum):
@@ -84,6 +87,40 @@ class DaemonControllerClient:
             error = _ErrorResponse.model_validate(decoded)
             raise RuntimeError(error.error)
         return DaemonResponse.model_validate(decoded)
+
+
+def ensure_controller(
+    socket_path: str | Path,
+    state_directory: str | Path,
+    *,
+    startup_timeout: float = DEFAULT_CONTROLLER_STARTUP_TIMEOUT,
+) -> None:
+    """Ensure a detached controller is accepting local requests."""
+    resolved_socket = Path(socket_path)
+    if _controller_available(resolved_socket):
+        return
+    subprocess.Popen(
+        (
+            sys.executable,
+            "-m",
+            "agent_session_harness.daemon_controller",
+            "serve",
+            "--socket",
+            str(resolved_socket),
+            "--state-directory",
+            str(state_directory),
+        ),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + startup_timeout
+    while time.monotonic() < deadline:
+        if _controller_available(resolved_socket):
+            return
+        time.sleep(0.01)
+    raise TimeoutError("daemon controller did not become ready before the deadline")
 
 
 class DaemonControllerServer:
@@ -171,7 +208,12 @@ class DaemonControllerServer:
         if request.operation is DaemonOperation.START:
             return supervisor.start()
         if request.operation is DaemonOperation.STOP:
-            return supervisor.stop()
+            record = supervisor.stop()
+            del self._definitions[request.definition.daemon_key]
+            del self._supervisors[request.definition.daemon_key]
+            if not self._supervisors:
+                self._closing.set()
+            return record
         return supervisor.restart()
 
     def _new_supervisor(self, definition: DaemonDefinition) -> DaemonSupervisor:
@@ -184,10 +226,12 @@ class DaemonControllerServer:
         )
 
     def _prepare_directories(self) -> None:
-        self.socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self.state_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.socket_path.parent, 0o700)
-        os.chmod(self.state_directory, 0o700)
+        _require_private_directory(self.socket_path.parent)
+        try:
+            self.state_directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        _require_private_directory(self.state_directory)
 
     def _remove_stale_socket(self) -> None:
         try:
@@ -229,3 +273,48 @@ def _read_message(connection: socket.socket, max_bytes: int) -> bytes:
     if trailing:
         raise ValueError("daemon controller accepts one request per connection")
     return bytes(message)
+
+
+def _controller_available(socket_path: Path) -> bool:
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(0.1)
+            connection.connect(str(socket_path))
+        return True
+    except OSError:
+        return False
+
+
+def _require_private_directory(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"daemon controller directory does not exist: {path}"
+        ) from exc
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise RuntimeError(f"daemon controller path is not a directory: {path}")
+    if metadata.st_uid != os.getuid():
+        raise RuntimeError(f"daemon controller directory has a different owner: {path}")
+    if metadata.st_mode & 0o077:
+        raise RuntimeError(f"daemon controller directory must be private: {path}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="agent-session-harness-daemon-controller")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    serve = subparsers.add_parser("serve")
+    serve.add_argument("--socket", required=True)
+    serve.add_argument("--state-directory", required=True)
+    args = parser.parse_args(argv)
+    DaemonControllerServer(
+        socket_path=args.socket,
+        state_directory=args.state_directory,
+    ).serve()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
