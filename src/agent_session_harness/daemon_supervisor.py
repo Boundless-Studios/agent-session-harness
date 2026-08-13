@@ -142,7 +142,17 @@ class DaemonSupervisor:
             raise DaemonIdentityUnknownError(
                 "daemon process identity is unknown; refusing to signal"
             )
-        if observation.state in {ProcessState.MISSING, ProcessState.ZOMBIE}:
+        if observation.state is ProcessState.MISSING:
+            if self._owned_child(identity.pid) is not None:
+                raise DaemonIdentityUnknownError(
+                    "owned daemon PID is missing; refusing process-group cleanup"
+                )
+            return self._publish(
+                DaemonLifecyclePhase.STOPPED,
+                current.generation,
+                detail="tracked process lifetime is absent",
+            )
+        if observation.state is ProcessState.ZOMBIE:
             child = self._owned_child(identity.pid)
             if child is not None and self._process_group_has_live_members(
                 child.pid, timeout=min(self.stop_timeout, 0.25)

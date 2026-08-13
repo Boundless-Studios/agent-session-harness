@@ -25,6 +25,7 @@ from agent_session_harness.daemon_supervisor import (
 from agent_session_harness.process_identity import (
     ProcessIdentity,
     ProcessPlatform,
+    ProcessState,
 )
 
 
@@ -263,7 +264,7 @@ def test_supervisor_rejects_zero_stop_deadlines(tmp_path, field) -> None:
         )
 
 
-def test_dead_leader_with_live_group_is_cleaned_before_stopped(tmp_path) -> None:
+def test_dead_missing_leader_with_live_group_fails_closed(tmp_path) -> None:
     forking = DaemonDefinition(
         daemon_key="forking",
         argv=(
@@ -281,12 +282,15 @@ def test_dead_leader_with_live_group_is_cleaned_before_stopped(tmp_path) -> None
         stop_timeout=0.05,
         kill_timeout=1,
     )
-    service.start()
+    running = service.start()
+    assert running.process_identity is not None
     time.sleep(0.1)
 
-    stopped = service.stop()
-
-    assert stopped.phase is DaemonLifecyclePhase.STOPPED
+    try:
+        with pytest.raises(DaemonIdentityUnknownError, match="missing"):
+            service.stop()
+    finally:
+        os.killpg(running.process_identity.pid, 9)
 
 
 def test_startup_failure_cleans_group_before_reaping_leader(tmp_path) -> None:
@@ -338,3 +342,32 @@ def test_process_group_probe_timeout_fails_closed(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "run", timeout)
 
     assert DaemonSupervisor._process_group_has_live_members(42, timeout=0.01)
+
+
+def test_missing_owned_pid_refuses_group_probe_or_signal(tmp_path, monkeypatch) -> None:
+    service = supervisor(tmp_path)
+    running = service.start()
+    assert running.process_identity is not None
+    child_pid = running.process_identity.pid
+    real_killpg = os.killpg
+    group_probes = []
+    signals = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_supervisor.observe_process_identity",
+        lambda _identity: type("Observation", (), {"state": ProcessState.MISSING})(),
+    )
+    monkeypatch.setattr(
+        service,
+        "_process_group_has_live_members",
+        lambda *_args, **_kwargs: group_probes.append(True) or True,
+    )
+    monkeypatch.setattr(os, "killpg", lambda *_args: signals.append(True))
+
+    try:
+        with pytest.raises(DaemonIdentityUnknownError, match="missing"):
+            service.stop()
+
+        assert group_probes == []
+        assert signals == []
+    finally:
+        real_killpg(child_pid, 9)
