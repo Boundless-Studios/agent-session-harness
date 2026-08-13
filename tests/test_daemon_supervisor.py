@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import multiprocessing
+import math
 import os
+import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +19,7 @@ from agent_session_harness.daemon_lifecycle import (
 )
 from agent_session_harness.daemon_supervisor import (
     DaemonIdentityUnknownError,
+    DaemonLaunchError,
     DaemonSupervisor,
 )
 from agent_session_harness.process_identity import (
@@ -232,3 +236,105 @@ def test_start_persists_recovered_running_phase(tmp_path) -> None:
         assert DaemonLifecycleStore(tmp_path / "state.json").read() == recovered
     finally:
         owner.stop()
+
+
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize(
+    "field", ["lock_timeout", "startup_probe_seconds", "stop_timeout", "kill_timeout"]
+)
+def test_supervisor_rejects_non_finite_timeouts(tmp_path, field, timeout) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        DaemonSupervisor(
+            definition(tmp_path),
+            state_path=tmp_path / "state.json",
+            lock_path=tmp_path / "lock",
+            **{field: timeout},
+        )
+
+
+@pytest.mark.parametrize("field", ["stop_timeout", "kill_timeout"])
+def test_supervisor_rejects_zero_stop_deadlines(tmp_path, field) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        DaemonSupervisor(
+            definition(tmp_path),
+            state_path=tmp_path / "state.json",
+            lock_path=tmp_path / "lock",
+            **{field: 0},
+        )
+
+
+def test_dead_leader_with_live_group_is_cleaned_before_stopped(tmp_path) -> None:
+    forking = DaemonDefinition(
+        daemon_key="forking",
+        argv=(
+            sys.executable,
+            "-c",
+            "import os,time; p=os.fork(); time.sleep(60) if p == 0 else None",
+        ),
+        cwd=tmp_path,
+    )
+    service = DaemonSupervisor(
+        forking,
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "lock",
+        startup_probe_seconds=0,
+        stop_timeout=0.05,
+        kill_timeout=1,
+    )
+    service.start()
+    time.sleep(0.1)
+
+    stopped = service.stop()
+
+    assert stopped.phase is DaemonLifecyclePhase.STOPPED
+
+
+def test_startup_failure_cleans_group_before_reaping_leader(tmp_path) -> None:
+    forking = DaemonDefinition(
+        daemon_key="forking",
+        argv=(
+            sys.executable,
+            "-c",
+            "import os,time; p=os.fork(); time.sleep(60) if p == 0 else None",
+        ),
+        cwd=tmp_path,
+    )
+    service = DaemonSupervisor(
+        forking,
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "lock",
+        startup_probe_seconds=0.1,
+        stop_timeout=0.05,
+        kill_timeout=1,
+    )
+
+    with pytest.raises(DaemonLaunchError, match="startup identity probe"):
+        service.start()
+
+    assert service._child is None
+
+
+def test_running_publish_failure_cleans_owned_group(tmp_path, monkeypatch) -> None:
+    service = supervisor(tmp_path)
+    original_publish = service.store.publish
+
+    def fail_running(state):
+        if state.phase is DaemonLifecyclePhase.RUNNING:
+            raise OSError("disk full")
+        original_publish(state)
+
+    monkeypatch.setattr(service.store, "publish", fail_running)
+
+    with pytest.raises(OSError, match="disk full"):
+        service.start()
+
+    assert service._child is None
+
+
+def test_process_group_probe_timeout_fails_closed(monkeypatch) -> None:
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(("/bin/ps",), 0.01)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+
+    assert DaemonSupervisor._process_group_has_live_members(42, timeout=0.01)

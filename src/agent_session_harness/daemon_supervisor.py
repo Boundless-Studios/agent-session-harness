@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import signal
 import subprocess
 import time
@@ -48,8 +49,18 @@ class DaemonSupervisor:
         stop_timeout: float = 5,
         kill_timeout: float = 2,
     ) -> None:
-        if min(lock_timeout, startup_probe_seconds, stop_timeout, kill_timeout) < 0:
+        timeouts = (
+            lock_timeout,
+            startup_probe_seconds,
+            stop_timeout,
+            kill_timeout,
+        )
+        if not all(math.isfinite(value) for value in timeouts):
+            raise ValueError("daemon lifecycle timeouts must be finite")
+        if min(timeouts) < 0:
             raise ValueError("daemon lifecycle timeouts cannot be negative")
+        if stop_timeout == 0 or kill_timeout == 0:
+            raise ValueError("daemon stop and kill timeouts must be positive")
         self.definition = definition
         self.store = DaemonLifecycleStore(state_path)
         self.lock = OwnerDiagnosticLock(lock_path, purpose=definition.daemon_key)
@@ -100,19 +111,23 @@ class DaemonSupervisor:
         self._child = child
         time.sleep(self.startup_probe_seconds)
         identity = capture_process_identity(child.pid)
-        if child.poll() is not None or identity is None:
+        if identity is None:
+            self._terminate_owned_child(child)
             self._publish(
                 DaemonLifecyclePhase.FAILED,
                 generation,
                 detail="child exited or identity capture failed",
             )
-            self._terminate_owned_child(child)
             raise DaemonLaunchError("daemon failed its startup identity probe")
-        return self._publish(
-            DaemonLifecyclePhase.RUNNING,
-            generation,
-            process_identity=identity,
-        )
+        try:
+            return self._publish(
+                DaemonLifecyclePhase.RUNNING,
+                generation,
+                process_identity=identity,
+            )
+        except BaseException:
+            self._terminate_owned_child(child)
+            raise
 
     def _stop_locked(self) -> DaemonLifecycleRecord:
         current = self.store.read()
@@ -128,7 +143,13 @@ class DaemonSupervisor:
                 "daemon process identity is unknown; refusing to signal"
             )
         if observation.state in {ProcessState.MISSING, ProcessState.ZOMBIE}:
-            self._reap_owned_child(identity.pid)
+            child = self._owned_child(identity.pid)
+            if child is not None and self._process_group_has_live_members(
+                child.pid, timeout=min(self.stop_timeout, 0.25)
+            ):
+                self._terminate_owned_child(child)
+            else:
+                self._reap_owned_child(identity.pid)
             return self._publish(
                 DaemonLifecyclePhase.STOPPED,
                 current.generation,
@@ -168,21 +189,31 @@ class DaemonSupervisor:
     @staticmethod
     def _wait_group_absent(child: subprocess.Popen[bytes], timeout: float) -> bool:
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if not DaemonSupervisor._process_group_has_live_members(child.pid):
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if not DaemonSupervisor._process_group_has_live_members(
+                child.pid, timeout=min(remaining, 0.25)
+            ):
                 child.wait(timeout=0)
                 return True
             time.sleep(0.01)
-        return False
 
     @staticmethod
-    def _process_group_has_live_members(process_group_id: int) -> bool:
-        result = subprocess.run(
-            ("ps", "-axo", "pgid=,stat="),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+    def _process_group_has_live_members(
+        process_group_id: int, *, timeout: float
+    ) -> bool:
+        try:
+            result = subprocess.run(
+                ("/bin/ps", "-axo", "pgid=,stat="),
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return True
         for line in result.stdout.splitlines():
             fields = line.split()
             if (

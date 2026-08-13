@@ -166,3 +166,9 @@ def test_publish_revalidates_untrusted_model_copy(tmp_path) -> None:
 def test_daemon_definition_requires_absolute_cwd(tmp_path) -> None:
     with pytest.raises(ValueError, match="absolute"):
         DaemonDefinition(daemon_key="bad", argv=("python3",), cwd="relative")
+
+
+@pytest.mark.parametrize("argv", [("bad\x00arg",), ("python3", "bad\x00arg")])
+def test_daemon_definition_rejects_nul_argv(tmp_path, argv) -> None:
+    with pytest.raises(ValueError, match="NUL"):
+        DaemonDefinition(daemon_key="bad", argv=argv, cwd=tmp_path)
