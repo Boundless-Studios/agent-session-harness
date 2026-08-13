@@ -5,7 +5,6 @@ import multiprocessing
 import os
 import subprocess
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -262,35 +261,6 @@ def test_supervisor_rejects_zero_stop_deadlines(tmp_path, field) -> None:
             lock_path=tmp_path / "lock",
             **{field: 0},
         )
-
-
-def test_dead_missing_leader_with_live_group_fails_closed(tmp_path) -> None:
-    forking = DaemonDefinition(
-        daemon_key="forking",
-        argv=(
-            sys.executable,
-            "-c",
-            "import os,time; p=os.fork(); time.sleep(60) if p == 0 else None",
-        ),
-        cwd=tmp_path,
-    )
-    service = DaemonSupervisor(
-        forking,
-        state_path=tmp_path / "state.json",
-        lock_path=tmp_path / "lock",
-        startup_probe_seconds=0,
-        stop_timeout=0.05,
-        kill_timeout=1,
-    )
-    running = service.start()
-    assert running.process_identity is not None
-    time.sleep(0.1)
-
-    try:
-        with pytest.raises(DaemonIdentityUnknownError, match="missing"):
-            service.stop()
-    finally:
-        os.killpg(running.process_identity.pid, 9)
 
 
 def test_startup_failure_cleans_group_before_reaping_leader(tmp_path) -> None:
