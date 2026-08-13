@@ -368,8 +368,8 @@ def _run_daemon(args: argparse.Namespace) -> int:
         argv=command,
         cwd=Path(args.cwd),
     )
-    ensure_controller(args.socket, args.state_directory)
-    response = DaemonControllerClient(args.socket).request(
+    request_timeout = ensure_controller(args.socket, args.state_directory)
+    response = DaemonControllerClient(args.socket, timeout=request_timeout).request(
         DaemonRequest(operation=args.daemon_operation, definition=definition)
     )
     _emit(response.record.model_dump(mode="json"), json_output=args.json_output)

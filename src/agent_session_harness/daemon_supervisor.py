@@ -26,6 +26,29 @@ from .process_identity import (
 )
 
 
+DEFAULT_LOCK_TIMEOUT = 5.0
+DEFAULT_STARTUP_PROBE_SECONDS = 0.1
+DEFAULT_STOP_TIMEOUT = 5.0
+DEFAULT_KILL_TIMEOUT = 2.0
+
+
+def worst_case_operation_seconds(
+    *,
+    lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+    startup_probe_seconds: float = DEFAULT_STARTUP_PROBE_SECONDS,
+    stop_timeout: float = DEFAULT_STOP_TIMEOUT,
+    kill_timeout: float = DEFAULT_KILL_TIMEOUT,
+) -> float:
+    """Bound the wall time the slowest lifecycle operation can consume.
+
+    Restart is the slowest: it waits for the lock, escalates a stop through both
+    termination deadlines, probes the replacement child, and can spend both
+    deadlines again cleaning up a failed launch.
+    """
+    termination = stop_timeout + kill_timeout
+    return lock_timeout + termination + startup_probe_seconds + termination
+
+
 class DaemonLaunchError(RuntimeError):
     """A child could not become a verified running daemon."""
 
@@ -51,10 +74,10 @@ class DaemonSupervisor:
         *,
         state_path: str | Path,
         lock_path: str | Path,
-        lock_timeout: float = 5,
-        startup_probe_seconds: float = 0.1,
-        stop_timeout: float = 5,
-        kill_timeout: float = 2,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
+        startup_probe_seconds: float = DEFAULT_STARTUP_PROBE_SECONDS,
+        stop_timeout: float = DEFAULT_STOP_TIMEOUT,
+        kill_timeout: float = DEFAULT_KILL_TIMEOUT,
     ) -> None:
         timeouts = (
             lock_timeout,

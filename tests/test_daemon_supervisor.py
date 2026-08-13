@@ -21,6 +21,7 @@ from agent_session_harness.daemon_supervisor import (
     DaemonLaunchError,
     DaemonSupervisor,
     _OwnedChildState,
+    worst_case_operation_seconds,
 )
 from agent_session_harness.process_identity import (
     ProcessIdentity,
@@ -421,3 +422,31 @@ def test_start_rejects_captured_identity_after_child_is_missing(
     assert state is not None
     assert state.phase is DaemonLifecyclePhase.FAILED
     assert state.process_identity is None
+
+
+def test_worst_case_covers_stop_escalation_and_restart_relaunch():
+    bound = worst_case_operation_seconds(
+        lock_timeout=1,
+        startup_probe_seconds=0.5,
+        stop_timeout=2,
+        kill_timeout=3,
+    )
+
+    stop_escalation = 1 + 2 + 3
+    assert bound >= stop_escalation
+    assert bound == stop_escalation + 0.5 + 2 + 3
+
+
+def test_worst_case_matches_supervisor_defaults(tmp_path: Path):
+    service = DaemonSupervisor(
+        DaemonDefinition(daemon_key="d", argv=(sys.executable, "-V"), cwd=tmp_path),
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "state.lock",
+    )
+
+    assert worst_case_operation_seconds() == worst_case_operation_seconds(
+        lock_timeout=service.lock_timeout,
+        startup_probe_seconds=service.startup_probe_seconds,
+        stop_timeout=service.stop_timeout,
+        kill_timeout=service.kill_timeout,
+    )

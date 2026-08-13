@@ -49,11 +49,18 @@ def test_daemon_cli_bootstraps_controller_and_sends_direct_argv(
 ) -> None:
     ensured = []
     requests = []
-    monkeypatch.setattr(cli, "ensure_controller", lambda *paths: ensured.append(paths))
+    timeouts = []
+
+    def fake_ensure(*paths):
+        ensured.append(paths)
+        return 31.5
+
+    monkeypatch.setattr(cli, "ensure_controller", fake_ensure)
 
     class FakeClient:
-        def __init__(self, socket_path):
+        def __init__(self, socket_path, *, timeout):
             assert socket_path == str(tmp_path / "controller.sock")
+            timeouts.append(timeout)
 
         def request(self, request):
             requests.append(request)
@@ -90,6 +97,7 @@ def test_daemon_cli_bootstraps_controller_and_sends_direct_argv(
 
     assert result == 0
     assert ensured == [(str(tmp_path / "controller.sock"), str(tmp_path / "state"))]
+    assert timeouts == [31.5]
     assert requests[0].definition.argv[-1] == "print('safe argv')"
     assert _json_stdout(capsys)["phase"] == "stopped"
 

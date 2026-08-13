@@ -22,11 +22,15 @@ from .daemon_lifecycle import (
     DaemonLifecycleRecord,
     OwnerDiagnosticLock,
 )
-from .daemon_supervisor import DaemonSupervisor
+from .daemon_supervisor import DaemonSupervisor, worst_case_operation_seconds
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024
 DEFAULT_CONTROLLER_STARTUP_TIMEOUT = 5.0
-DEFAULT_CONTROLLER_REQUEST_TIMEOUT = 10.0
+DEFAULT_REQUEST_READ_TIMEOUT = 5.0
+CONTROLLER_RESPONSE_MARGIN_SECONDS = 5.0
+DEFAULT_CONTROLLER_REQUEST_TIMEOUT = (
+    worst_case_operation_seconds() + CONTROLLER_RESPONSE_MARGIN_SECONDS
+)
 
 
 class DaemonOperation(StrEnum):
@@ -65,6 +69,7 @@ class _ControllerProbeResponse(BaseModel):
     schema_version: Literal[1] = 1
     kind: Literal["probe"] = "probe"
     state_directory: Path
+    request_timeout_seconds: float = Field(gt=0)
 
 
 class _ErrorResponse(BaseModel):
@@ -96,7 +101,9 @@ class DaemonControllerClient:
             connection.settimeout(self.timeout)
             connection.connect(str(self.socket_path))
             connection.sendall(payload)
-            raw = _read_message(connection, self.max_message_bytes)
+            raw = _read_message(
+                connection, self.max_message_bytes, deadline_seconds=self.timeout
+            )
         try:
             decoded = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -112,12 +119,17 @@ def ensure_controller(
     state_directory: str | Path,
     *,
     startup_timeout: float = DEFAULT_CONTROLLER_STARTUP_TIMEOUT,
-) -> None:
-    """Ensure a detached controller is accepting local requests."""
+) -> float:
+    """Ensure a detached controller is accepting local requests.
+
+    Returns the response timeout the live controller expects clients to honour,
+    which covers the worst case of its own lifecycle deadlines.
+    """
     resolved_socket = Path(socket_path)
     resolved_state = Path(state_directory)
-    if _controller_available(resolved_socket, resolved_state):
-        return
+    probe = _controller_available(resolved_socket, resolved_state)
+    if probe is not None:
+        return probe.request_timeout_seconds
     subprocess.Popen(
         (
             sys.executable,
@@ -136,8 +148,9 @@ def ensure_controller(
     )
     deadline = time.monotonic() + startup_timeout
     while time.monotonic() < deadline:
-        if _controller_available(resolved_socket, resolved_state):
-            return
+        probe = _controller_available(resolved_socket, resolved_state)
+        if probe is not None:
+            return probe.request_timeout_seconds
         time.sleep(0.01)
     raise TimeoutError("daemon controller did not become ready before the deadline")
 
@@ -166,6 +179,14 @@ class DaemonControllerServer:
             purpose="daemon-controller",
         )
 
+    @property
+    def request_timeout_seconds(self) -> float:
+        """The response deadline clients must allow for this controller."""
+        return (
+            worst_case_operation_seconds(**self.supervisor_options)
+            + CONTROLLER_RESPONSE_MARGIN_SECONDS
+        )
+
     def serve(self) -> None:
         self._prepare_directories()
         with self._owner_lock.acquire(timeout=0):
@@ -184,7 +205,7 @@ class DaemonControllerServer:
                     except TimeoutError:
                         continue
                     with connection:
-                        connection.settimeout(5)
+                        connection.settimeout(DEFAULT_REQUEST_READ_TIMEOUT)
                         self._serve_connection(connection)
             except BaseException as exc:
                 self._startup_error = exc
@@ -212,7 +233,10 @@ class DaemonControllerServer:
                 expected = self.state_directory.resolve(strict=False)
                 if probe.state_directory.resolve(strict=False) != expected:
                     raise RuntimeError("daemon controller state directory mismatch")
-                response: BaseModel = _ControllerProbeResponse(state_directory=expected)
+                response: BaseModel = _ControllerProbeResponse(
+                    state_directory=expected,
+                    request_timeout_seconds=self.request_timeout_seconds,
+                )
             else:
                 request = DaemonRequest.model_validate(decoded)
                 response = DaemonResponse(record=self._dispatch(request))
@@ -284,8 +308,13 @@ class DaemonControllerServer:
             pass
 
 
-def _read_message(connection: socket.socket, max_bytes: int) -> bytes:
-    deadline = time.monotonic() + 5
+def _read_message(
+    connection: socket.socket,
+    max_bytes: int,
+    *,
+    deadline_seconds: float = DEFAULT_REQUEST_READ_TIMEOUT,
+) -> bytes:
+    deadline = time.monotonic() + deadline_seconds
     payload = bytearray()
     while b"\n" not in payload:
         if time.monotonic() >= deadline:
@@ -302,7 +331,9 @@ def _read_message(connection: socket.socket, max_bytes: int) -> bytes:
     return bytes(message)
 
 
-def _controller_available(socket_path: Path, state_directory: Path) -> bool:
+def _controller_available(
+    socket_path: Path, state_directory: Path
+) -> _ControllerProbeResponse | None:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(DEFAULT_CONTROLLER_REQUEST_TIMEOUT)
@@ -313,15 +344,18 @@ def _controller_available(socket_path: Path, state_directory: Path) -> bool:
                 .encode()
                 + b"\n"
             )
-            raw = _read_message(connection, DEFAULT_MAX_MESSAGE_BYTES)
+            raw = _read_message(
+                connection,
+                DEFAULT_MAX_MESSAGE_BYTES,
+                deadline_seconds=DEFAULT_CONTROLLER_REQUEST_TIMEOUT,
+            )
     except OSError:
-        return False
+        return None
     decoded = json.loads(raw)
     if isinstance(decoded, dict) and "error" in decoded:
         error = _ErrorResponse.model_validate(decoded)
         raise RuntimeError(error.error)
-    _ControllerProbeResponse.model_validate(decoded)
-    return True
+    return _ControllerProbeResponse.model_validate(decoded)
 
 
 def _require_private_directory(path: Path) -> None:

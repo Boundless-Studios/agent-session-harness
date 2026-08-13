@@ -9,17 +9,21 @@ from shutil import rmtree
 
 import pytest
 
+from agent_session_harness import daemon_controller
 from agent_session_harness.daemon_controller import (
+    DEFAULT_CONTROLLER_REQUEST_TIMEOUT,
     DaemonControllerClient,
     DaemonControllerServer,
     DaemonOperation,
     DaemonRequest,
+    _ControllerProbeResponse,
     ensure_controller,
 )
 from agent_session_harness.daemon_lifecycle import (
     DaemonDefinition,
     DaemonLifecyclePhase,
 )
+from agent_session_harness.daemon_supervisor import worst_case_operation_seconds
 
 
 def _definition(tmp_path: Path) -> DaemonDefinition:
@@ -157,8 +161,15 @@ def test_request_payload_is_bounded(tmp_path: Path):
         client.request(request)
 
 
+def _probe_response(state_directory: Path, timeout: float = 30.0):
+    return _ControllerProbeResponse(
+        state_directory=state_directory,
+        request_timeout_seconds=timeout,
+    )
+
+
 def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path):
-    availability = iter((False, False, True))
+    availability = iter((None, None, _probe_response(tmp_path / "state")))
     launches = []
     monkeypatch.setattr(
         "agent_session_harness.daemon_controller._controller_available",
@@ -180,14 +191,14 @@ def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path)
 def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(
         "agent_session_harness.daemon_controller._controller_available",
-        lambda _path, _state: True,
+        lambda _path, _state: _probe_response(tmp_path / "state", timeout=42.0),
     )
     monkeypatch.setattr(
         "agent_session_harness.daemon_controller.subprocess.Popen",
         lambda *_args, **_options: pytest.fail("controller should not launch"),
     )
 
-    ensure_controller(tmp_path / "controller.sock", tmp_path / "state")
+    assert ensure_controller(tmp_path / "controller.sock", tmp_path / "state") == 42.0
 
 
 def test_ensure_controller_rejects_live_state_directory_mismatch(controller, tmp_path):
@@ -195,3 +206,42 @@ def test_ensure_controller_rejects_live_state_directory_mismatch(controller, tmp
 
     with pytest.raises(RuntimeError, match="state directory mismatch"):
         ensure_controller(server.socket_path, tmp_path / "different-state")
+
+
+def test_default_request_timeout_outlasts_supervisor_deadlines():
+    assert DEFAULT_CONTROLLER_REQUEST_TIMEOUT > worst_case_operation_seconds()
+
+
+def test_ensure_controller_reports_the_controller_response_deadline(controller):
+    server, _ = controller
+
+    timeout = ensure_controller(server.socket_path, server.state_directory)
+
+    assert timeout > worst_case_operation_seconds(**server.supervisor_options)
+    assert timeout == server.request_timeout_seconds
+
+
+def test_client_read_deadline_follows_the_configured_timeout(
+    controller, monkeypatch, tmp_path: Path
+):
+    server, _ = controller
+    observed = []
+    original = daemon_controller._read_message
+
+    def recording(connection, max_bytes, *, deadline_seconds=None):
+        if deadline_seconds is None:
+            deadline_seconds = daemon_controller.DEFAULT_REQUEST_READ_TIMEOUT
+        observed.append(deadline_seconds)
+        return original(connection, max_bytes, deadline_seconds=deadline_seconds)
+
+    monkeypatch.setattr(daemon_controller, "_read_message", recording)
+    client = DaemonControllerClient(server.socket_path, timeout=45.0)
+
+    response = client.request(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS, definition=_definition(tmp_path)
+        )
+    )
+
+    assert response.record.phase is DaemonLifecyclePhase.STOPPED
+    assert 45.0 in observed
