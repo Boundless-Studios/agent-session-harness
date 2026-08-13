@@ -129,6 +129,7 @@ class DaemonSupervisor:
             try:
                 self._terminate_owned_child(child)
             except BaseException as cleanup_error:
+                failure_state_written = True
                 try:
                     self._publish(
                         DaemonLifecyclePhase.FAILED,
@@ -137,7 +138,11 @@ class DaemonSupervisor:
                         process_identity=identity,
                     )
                 except BaseException:
-                    pass
+                    failure_state_written = False
+                if not failure_state_written:
+                    cleanup_error.add_note(
+                        "captured daemon identity could not be persisted"
+                    )
                 raise cleanup_error from publish_error
             raise
 
