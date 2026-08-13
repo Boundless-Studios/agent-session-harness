@@ -8,6 +8,7 @@ import signal
 import subprocess
 import time
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 
 from .daemon_lifecycle import (
@@ -35,6 +36,12 @@ class DaemonIdentityUnknownError(RuntimeError):
 
 class DaemonStopTimeoutError(TimeoutError):
     """A verified daemon did not stop within its bounded deadline."""
+
+
+class _OwnedChildState(StrEnum):
+    RUNNING = "running"
+    ZOMBIE = "zombie"
+    MISSING = "missing"
 
 
 class DaemonSupervisor:
@@ -111,8 +118,12 @@ class DaemonSupervisor:
         self._child = child
         time.sleep(self.startup_probe_seconds)
         identity = capture_process_identity(child.pid)
-        if identity is None:
-            self._terminate_owned_child(child)
+        child_state = self._owned_child_state(child)
+        if identity is None or child_state is not _OwnedChildState.RUNNING:
+            if child_state is not _OwnedChildState.MISSING:
+                self._terminate_owned_child(child)
+            else:
+                self._child = None
             self._publish(
                 DaemonLifecyclePhase.FAILED,
                 generation,
@@ -144,6 +155,14 @@ class DaemonSupervisor:
                         "captured daemon identity could not be persisted"
                     )
                 raise cleanup_error from publish_error
+            try:
+                self._publish(
+                    DaemonLifecyclePhase.FAILED,
+                    generation,
+                    detail=f"running publication failed: {type(publish_error).__name__}",
+                )
+            except BaseException:
+                publish_error.add_note("cleaned daemon failure could not be persisted")
             raise
 
     def _stop_locked(self) -> DaemonLifecycleRecord:
@@ -254,6 +273,18 @@ class DaemonSupervisor:
     def _owned_child(self, pid: int) -> subprocess.Popen[bytes] | None:
         child = self._child
         return child if child is not None and child.pid == pid else None
+
+    @staticmethod
+    def _owned_child_state(child: subprocess.Popen[bytes]) -> _OwnedChildState:
+        try:
+            result = os.waitid(
+                os.P_PID,
+                child.pid,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError:
+            return _OwnedChildState.MISSING
+        return _OwnedChildState.RUNNING if result is None else _OwnedChildState.ZOMBIE
 
     def _reap_owned_child(self, pid: int) -> None:
         child = self._owned_child(pid)

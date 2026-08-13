@@ -20,6 +20,7 @@ from agent_session_harness.daemon_supervisor import (
     DaemonIdentityUnknownError,
     DaemonLaunchError,
     DaemonSupervisor,
+    _OwnedChildState,
 )
 from agent_session_harness.process_identity import (
     ProcessIdentity,
@@ -303,6 +304,10 @@ def test_running_publish_failure_cleans_owned_group(tmp_path, monkeypatch) -> No
         service.start()
 
     assert service._child is None
+    state = DaemonLifecycleStore(tmp_path / "state.json").read()
+    assert state is not None
+    assert state.phase is DaemonLifecyclePhase.FAILED
+    assert state.process_identity is None
 
 
 def test_publish_and_cleanup_failure_preserves_captured_identity(
@@ -368,3 +373,40 @@ def test_missing_owned_pid_refuses_group_probe_or_signal(tmp_path, monkeypatch) 
         assert signals == []
     finally:
         real_killpg(child_pid, 9)
+
+
+def test_start_rejects_captured_identity_after_child_is_missing(
+    tmp_path, monkeypatch
+) -> None:
+    service = supervisor(tmp_path)
+    captured = ProcessIdentity(
+        platform=(
+            ProcessPlatform.DARWIN
+            if sys.platform == "darwin"
+            else ProcessPlatform.LINUX
+        ),
+        pid=4242,
+        opaque_start_token="replacement",
+        executable_identity=sys.executable,
+        captured_at=datetime.now(UTC),
+    )
+    signals = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_supervisor.capture_process_identity",
+        lambda _pid: captured,
+    )
+    monkeypatch.setattr(
+        service,
+        "_owned_child_state",
+        lambda _child: _OwnedChildState.MISSING,
+    )
+    monkeypatch.setattr(os, "killpg", lambda *_args: signals.append(True))
+
+    with pytest.raises(DaemonLaunchError, match="startup identity probe"):
+        service.start()
+
+    assert signals == []
+    state = DaemonLifecycleStore(tmp_path / "state.json").read()
+    assert state is not None
+    assert state.phase is DaemonLifecyclePhase.FAILED
+    assert state.process_identity is None
