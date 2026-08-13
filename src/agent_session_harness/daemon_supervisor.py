@@ -125,8 +125,20 @@ class DaemonSupervisor:
                 generation,
                 process_identity=identity,
             )
-        except BaseException:
-            self._terminate_owned_child(child)
+        except BaseException as publish_error:
+            try:
+                self._terminate_owned_child(child)
+            except BaseException as cleanup_error:
+                try:
+                    self._publish(
+                        DaemonLifecyclePhase.FAILED,
+                        generation,
+                        detail=f"cleanup failed: {type(cleanup_error).__name__}",
+                        process_identity=identity,
+                    )
+                except BaseException:
+                    pass
+                raise cleanup_error from publish_error
             raise
 
     def _stop_locked(self) -> DaemonLifecycleRecord:

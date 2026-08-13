@@ -305,6 +305,33 @@ def test_running_publish_failure_cleans_owned_group(tmp_path, monkeypatch) -> No
     assert service._child is None
 
 
+def test_publish_and_cleanup_failure_preserves_captured_identity(
+    tmp_path, monkeypatch
+) -> None:
+    service = supervisor(tmp_path)
+    original_publish = service.store.publish
+
+    def fail_running(state):
+        if state.phase is DaemonLifecyclePhase.RUNNING:
+            raise OSError("disk full")
+        original_publish(state)
+
+    monkeypatch.setattr(service.store, "publish", fail_running)
+    monkeypatch.setattr(
+        service,
+        "_terminate_owned_child",
+        lambda _child: (_ for _ in ()).throw(TimeoutError("cleanup timed out")),
+    )
+
+    with pytest.raises(TimeoutError, match="cleanup timed out"):
+        service.start()
+
+    state = DaemonLifecycleStore(tmp_path / "state.json").read()
+    assert state is not None
+    assert state.phase is DaemonLifecyclePhase.FAILED
+    assert state.process_identity is not None
+
+
 def test_process_group_probe_timeout_fails_closed(monkeypatch) -> None:
     def timeout(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(("/bin/ps",), 0.01)
