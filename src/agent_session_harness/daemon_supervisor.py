@@ -185,9 +185,12 @@ class DaemonSupervisor:
         )
         for line in result.stdout.splitlines():
             fields = line.split()
-            if len(fields) >= 2 and fields[0] == str(process_group_id):
-                if not fields[1].startswith("Z"):
-                    return True
+            if (
+                len(fields) >= 2
+                and fields[0] == str(process_group_id)
+                and not fields[1].startswith("Z")
+            ):
+                return True
         return False
 
     def _owned_child(self, pid: int) -> subprocess.Popen[bytes] | None:
