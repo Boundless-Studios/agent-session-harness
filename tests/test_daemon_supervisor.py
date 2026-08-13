@@ -6,13 +6,18 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from agent_session_harness.daemon_lifecycle import (
     DaemonDefinition,
     DaemonLifecyclePhase,
     DaemonLifecycleRecord,
     DaemonLifecycleStore,
 )
-from agent_session_harness.daemon_supervisor import DaemonSupervisor
+from agent_session_harness.daemon_supervisor import (
+    DaemonIdentityUnknownError,
+    DaemonSupervisor,
+)
 from agent_session_harness.process_identity import (
     ProcessIdentity,
     ProcessPlatform,
@@ -50,14 +55,7 @@ def test_start_is_idempotent_and_stop_is_durable(tmp_path) -> None:
         assert started.process_identity is not None
         assert service.start().process_identity == started.process_identity
 
-        stopped = DaemonSupervisor(
-            definition(tmp_path),
-            state_path=tmp_path / "state.json",
-            lock_path=tmp_path / "lifecycle.lock",
-            lock_timeout=1,
-            startup_probe_seconds=0.05,
-            stop_timeout=1,
-        ).stop()
+        stopped = service.stop()
 
         assert stopped.phase is DaemonLifecyclePhase.STOPPED
         assert stopped.generation == started.generation
@@ -86,7 +84,10 @@ def test_concurrent_starters_publish_exactly_one_process(tmp_path) -> None:
         assert len(set(pids)) == 1
         assert all(worker.exitcode == 0 for worker in workers)
     finally:
-        supervisor(tmp_path).stop()
+        try:
+            os.killpg(pids[0], 9)
+        except ProcessLookupError:
+            pass
 
 
 def test_restart_advances_generation_and_replaces_process(tmp_path) -> None:
@@ -171,3 +172,63 @@ def test_stop_escalates_after_bounded_grace_period(tmp_path) -> None:
     stopped = service.stop()
 
     assert stopped.phase is DaemonLifecyclePhase.STOPPED
+
+
+def test_state_for_another_daemon_is_rejected_without_signaling(tmp_path) -> None:
+    foreign = DaemonLifecycleRecord(
+        daemon_key="foreign",
+        phase=DaemonLifecyclePhase.FAILED,
+        generation=1,
+        changed_at=datetime.now(UTC),
+    )
+    DaemonLifecycleStore(tmp_path / "state.json").publish(foreign)
+
+    with pytest.raises(RuntimeError, match="different daemon"):
+        supervisor(tmp_path).start()
+
+    assert DaemonLifecycleStore(tmp_path / "state.json").read() == foreign
+
+
+def test_process_creation_failure_persists_failed_state(tmp_path) -> None:
+    missing = DaemonDefinition(
+        daemon_key="missing",
+        argv=(str(tmp_path / "does-not-exist"),),
+        cwd=tmp_path,
+    )
+    service = DaemonSupervisor(
+        missing,
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "lock",
+    )
+
+    with pytest.raises(Exception, match="process creation failed"):
+        service.start()
+
+    state = DaemonLifecycleStore(tmp_path / "state.json").read()
+    assert state is not None
+    assert state.phase is DaemonLifecyclePhase.FAILED
+
+
+def test_detached_controller_refuses_pid_only_stop(tmp_path) -> None:
+    owner = supervisor(tmp_path)
+    owner.start()
+    detached = supervisor(tmp_path)
+    try:
+        with pytest.raises(DaemonIdentityUnknownError, match="another controller"):
+            detached.stop()
+    finally:
+        owner.stop()
+
+
+def test_start_persists_recovered_running_phase(tmp_path) -> None:
+    owner = supervisor(tmp_path)
+    running = owner.start()
+    stopping = running.model_copy(update={"phase": DaemonLifecyclePhase.STOPPING})
+    DaemonLifecycleStore(tmp_path / "state.json").publish(stopping)
+    try:
+        recovered = supervisor(tmp_path).start()
+
+        assert recovered.phase is DaemonLifecyclePhase.RUNNING
+        assert DaemonLifecycleStore(tmp_path / "state.json").read() == recovered
+    finally:
+        owner.stop()

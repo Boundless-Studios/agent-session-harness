@@ -118,6 +118,13 @@ Managed runtimes inherit a deliberately small base environment. A host can prese
 
 The long-lived integration surface is `agent_session_harness.supervisor.Supervisor`. A host supplies four small protocols: native usage reader, checkpoint manager, fenced coordinator, and process driver. This keeps Linear, beads, PR dashboards, worktree launchers, and project safety policy outside the reusable package. The deterministic E2E test uses a real child process and proves root → checkpoint → stop while still claimed → fence/release → fresh successor → acknowledgement with no overlap.
 
+`agent_session_harness.daemon_supervisor.DaemonSupervisor` provides the smaller
+single-process daemon lifecycle kernel. The controller that starts a daemon retains
+the child handle and is the only controller authorized to signal it; another process
+may observe the durable state but a detached stop fails closed instead of signaling a
+PID after a non-atomic identity check. Hosts that need stop/restart across controller
+processes must keep an owning broker alive and route those operations to it.
+
 Context-pressure UI can use the smaller
 `agent_session_harness.context_advisory.evaluate_context_advisory` contract.
 Runtime adapters supply a measured token/window observation, the harness owns

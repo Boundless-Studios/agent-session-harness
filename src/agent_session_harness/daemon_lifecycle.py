@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from collections.abc import Iterator
@@ -53,6 +54,13 @@ class DaemonDefinition(BaseModel):
     def require_bounded_argv(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         if any(not item or len(item) > 4096 for item in value):
             raise ValueError("daemon argv entries must be nonempty and bounded")
+        return value
+
+    @field_validator("cwd")
+    @classmethod
+    def require_absolute_cwd(cls, value: Path) -> Path:
+        if not value.is_absolute():
+            raise ValueError("daemon cwd must be absolute")
         return value
 
 
@@ -108,7 +116,8 @@ class DaemonLifecycleStore:
         self.path = Path(path)
 
     def publish(self, record: DaemonLifecycleRecord) -> None:
-        encoded = record.model_dump_json() + "\n"
+        validated = DaemonLifecycleRecord.model_validate(record.model_dump())
+        encoded = validated.model_dump_json() + "\n"
         if len(encoded.encode("utf-8")) > MAX_STATE_BYTES:
             raise ValueError(f"daemon lifecycle state exceeds {MAX_STATE_BYTES} bytes")
         atomic_write_private_text(self.path, encoded)
@@ -138,6 +147,8 @@ class OwnerDiagnosticLock:
         self.purpose = purpose
 
     def acquire(self, *, timeout: float) -> AbstractContextManager[LockOwner]:
+        if not math.isfinite(timeout):
+            raise ValueError("lock timeout must be finite")
         if timeout < 0:
             raise ValueError("lock timeout cannot be negative")
         return self._acquire(timeout)
