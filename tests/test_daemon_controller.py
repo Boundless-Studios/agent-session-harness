@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import socket
 import sys
 import tempfile
 import threading
-import socket
-from shutil import rmtree
 from pathlib import Path
+from shutil import rmtree
 
 import pytest
 
