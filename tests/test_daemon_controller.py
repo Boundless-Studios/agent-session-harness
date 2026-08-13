@@ -65,11 +65,7 @@ def test_separate_clients_share_controller_ownership(controller, tmp_path: Path)
         DaemonRequest(operation=DaemonOperation.STOP, definition=definition)
     )
     assert stopped.record.phase is DaemonLifecyclePhase.STOPPED
-    for _ in range(100):
-        if not server.socket_path.exists():
-            break
-        threading.Event().wait(0.01)
-    assert not server.socket_path.exists()
+    assert server.socket_path.exists()
 
 
 def test_controller_rejects_changed_definition(controller, tmp_path: Path):
@@ -166,7 +162,7 @@ def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path)
     launches = []
     monkeypatch.setattr(
         "agent_session_harness.daemon_controller._controller_available",
-        lambda _path: next(availability),
+        lambda _path, _state: next(availability),
     )
     monkeypatch.setattr(
         "agent_session_harness.daemon_controller.subprocess.Popen",
@@ -184,7 +180,7 @@ def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path)
 def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(
         "agent_session_harness.daemon_controller._controller_available",
-        lambda _path: True,
+        lambda _path, _state: True,
     )
     monkeypatch.setattr(
         "agent_session_harness.daemon_controller.subprocess.Popen",
@@ -192,3 +188,10 @@ def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path:
     )
 
     ensure_controller(tmp_path / "controller.sock", tmp_path / "state")
+
+
+def test_ensure_controller_rejects_live_state_directory_mismatch(controller, tmp_path):
+    server, _ = controller
+
+    with pytest.raises(RuntimeError, match="state directory mismatch"):
+        ensure_controller(server.socket_path, tmp_path / "different-state")

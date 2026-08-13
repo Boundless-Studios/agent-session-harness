@@ -26,6 +26,7 @@ from .daemon_supervisor import DaemonSupervisor
 
 DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024
 DEFAULT_CONTROLLER_STARTUP_TIMEOUT = 5.0
+DEFAULT_CONTROLLER_REQUEST_TIMEOUT = 10.0
 
 
 class DaemonOperation(StrEnum):
@@ -50,6 +51,22 @@ class DaemonResponse(BaseModel):
     record: DaemonLifecycleRecord
 
 
+class _ControllerProbe(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    kind: Literal["probe"] = "probe"
+    state_directory: Path
+
+
+class _ControllerProbeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal[1] = 1
+    kind: Literal["probe"] = "probe"
+    state_directory: Path
+
+
 class _ErrorResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -62,7 +79,7 @@ class DaemonControllerClient:
         self,
         socket_path: str | Path,
         *,
-        timeout: float = 5,
+        timeout: float = DEFAULT_CONTROLLER_REQUEST_TIMEOUT,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     ) -> None:
         self.socket_path = Path(socket_path)
@@ -98,7 +115,8 @@ def ensure_controller(
 ) -> None:
     """Ensure a detached controller is accepting local requests."""
     resolved_socket = Path(socket_path)
-    if _controller_available(resolved_socket):
+    resolved_state = Path(state_directory)
+    if _controller_available(resolved_socket, resolved_state):
         return
     subprocess.Popen(
         (
@@ -109,7 +127,7 @@ def ensure_controller(
             "--socket",
             str(resolved_socket),
             "--state-directory",
-            str(state_directory),
+            str(resolved_state),
         ),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -118,7 +136,7 @@ def ensure_controller(
     )
     deadline = time.monotonic() + startup_timeout
     while time.monotonic() < deadline:
-        if _controller_available(resolved_socket):
+        if _controller_available(resolved_socket, resolved_state):
             return
         time.sleep(0.01)
     raise TimeoutError("daemon controller did not become ready before the deadline")
@@ -188,8 +206,16 @@ class DaemonControllerServer:
     def _serve_connection(self, connection: socket.socket) -> None:
         try:
             raw = _read_message(connection, self.max_message_bytes)
-            request = DaemonRequest.model_validate_json(raw)
-            response: BaseModel = DaemonResponse(record=self._dispatch(request))
+            decoded = json.loads(raw)
+            if isinstance(decoded, dict) and decoded.get("kind") == "probe":
+                probe = _ControllerProbe.model_validate(decoded)
+                expected = self.state_directory.resolve(strict=False)
+                if probe.state_directory.resolve(strict=False) != expected:
+                    raise RuntimeError("daemon controller state directory mismatch")
+                response: BaseModel = _ControllerProbeResponse(state_directory=expected)
+            else:
+                request = DaemonRequest.model_validate(decoded)
+                response = DaemonResponse(record=self._dispatch(request))
         except (ValidationError, ValueError, RuntimeError, OSError) as exc:
             response = _ErrorResponse(error=str(exc) or type(exc).__name__)
         try:
@@ -212,8 +238,6 @@ class DaemonControllerServer:
             record = supervisor.stop()
             del self._definitions[request.definition.daemon_key]
             del self._supervisors[request.definition.daemon_key]
-            if not self._supervisors:
-                self._closing.set()
             return record
         if request.operation is DaemonOperation.STATUS:
             return supervisor.status()
@@ -278,14 +302,26 @@ def _read_message(connection: socket.socket, max_bytes: int) -> bytes:
     return bytes(message)
 
 
-def _controller_available(socket_path: Path) -> bool:
+def _controller_available(socket_path: Path, state_directory: Path) -> bool:
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-            connection.settimeout(0.1)
+            connection.settimeout(DEFAULT_CONTROLLER_REQUEST_TIMEOUT)
             connection.connect(str(socket_path))
-        return True
+            connection.sendall(
+                _ControllerProbe(state_directory=state_directory)
+                .model_dump_json()
+                .encode()
+                + b"\n"
+            )
+            raw = _read_message(connection, DEFAULT_MAX_MESSAGE_BYTES)
     except OSError:
         return False
+    decoded = json.loads(raw)
+    if isinstance(decoded, dict) and "error" in decoded:
+        error = _ErrorResponse.model_validate(decoded)
+        raise RuntimeError(error.error)
+    _ControllerProbeResponse.model_validate(decoded)
+    return True
 
 
 def _require_private_directory(path: Path) -> None:
