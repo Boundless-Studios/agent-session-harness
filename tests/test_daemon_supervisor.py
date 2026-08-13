@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import multiprocessing
 import math
+import multiprocessing
 import os
 import subprocess
 import sys

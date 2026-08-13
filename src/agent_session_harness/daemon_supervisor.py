@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import os
 import math
+import os
 import signal
 import subprocess
 import time
