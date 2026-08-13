@@ -14,6 +14,7 @@ from agent_session_harness.daemon_controller import (
     DaemonControllerServer,
     DaemonOperation,
     DaemonRequest,
+    ensure_controller,
 )
 from agent_session_harness.daemon_lifecycle import (
     DaemonDefinition,
@@ -64,6 +65,7 @@ def test_separate_clients_share_controller_ownership(controller, tmp_path: Path)
         DaemonRequest(operation=DaemonOperation.STOP, definition=definition)
     )
     assert stopped.record.phase is DaemonLifecyclePhase.STOPPED
+    assert server.socket_path.exists()
 
 
 def test_controller_rejects_changed_definition(controller, tmp_path: Path):
@@ -80,6 +82,22 @@ def test_controller_rejects_changed_definition(controller, tmp_path: Path):
         )
 
 
+def test_status_from_separate_client_preserves_controller_ownership(
+    controller, tmp_path: Path
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+
+    status = DaemonControllerClient(server.socket_path).request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=definition)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+
+
 def test_socket_is_private(controller):
     server, _ = controller
     assert server.socket_path.stat().st_mode & 0o777 == 0o600
@@ -94,6 +112,21 @@ def test_second_controller_cannot_replace_live_socket(controller):
 
     with pytest.raises(TimeoutError, match="lock is busy"):
         contender.serve()
+
+
+def test_controller_rejects_public_existing_socket_parent(tmp_path: Path):
+    public = tmp_path / "public"
+    public.mkdir(mode=0o755)
+    public.chmod(0o755)
+    server = DaemonControllerServer(
+        socket_path=public / "controller.sock",
+        state_directory=public / "state",
+    )
+
+    with pytest.raises(RuntimeError, match="must be private"):
+        server.serve()
+
+    assert public.stat().st_mode & 0o777 == 0o755
 
 
 def test_disconnected_malformed_client_does_not_stop_controller(
@@ -122,3 +155,43 @@ def test_request_payload_is_bounded(tmp_path: Path):
 
     with pytest.raises(ValueError, match="exceeds"):
         client.request(request)
+
+
+def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path):
+    availability = iter((False, False, True))
+    launches = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._controller_available",
+        lambda _path, _state: next(availability),
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.subprocess.Popen",
+        lambda argv, **options: launches.append((argv, options)),
+    )
+
+    ensure_controller(tmp_path / "controller.sock", tmp_path / "state")
+
+    assert len(launches) == 1
+    argv, options = launches[0]
+    assert argv[2:4] == ("agent_session_harness.daemon_controller", "serve")
+    assert options["start_new_session"] is True
+
+
+def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._controller_available",
+        lambda _path, _state: True,
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.subprocess.Popen",
+        lambda *_args, **_options: pytest.fail("controller should not launch"),
+    )
+
+    ensure_controller(tmp_path / "controller.sock", tmp_path / "state")
+
+
+def test_ensure_controller_rejects_live_state_directory_mismatch(controller, tmp_path):
+    server, _ = controller
+
+    with pytest.raises(RuntimeError, match="state directory mismatch"):
+        ensure_controller(server.socket_path, tmp_path / "different-state")

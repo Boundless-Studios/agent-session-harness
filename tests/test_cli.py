@@ -13,6 +13,11 @@ import pytest
 from agent_session_harness import cli
 from agent_session_harness.activity import Quiescence
 from agent_session_harness.capsule import HandoffCapsule
+from agent_session_harness.daemon_controller import DaemonResponse
+from agent_session_harness.daemon_lifecycle import (
+    DaemonLifecyclePhase,
+    DaemonLifecycleRecord,
+)
 from agent_session_harness.events import LifecycleEvent
 from agent_session_harness.hooks.install import HookInstaller
 from agent_session_harness.ledger import EventLedger
@@ -37,6 +42,56 @@ def test_doctor_json_is_deterministic_and_never_launches_a_model(capsys) -> None
     assert payload["ok"] is True
     assert payload["checks"]["package"] == "0.3.0"
     assert "summary" not in payload
+
+
+def test_daemon_cli_bootstraps_controller_and_sends_direct_argv(
+    monkeypatch, tmp_path: Path, capsys
+) -> None:
+    ensured = []
+    requests = []
+    monkeypatch.setattr(cli, "ensure_controller", lambda *paths: ensured.append(paths))
+
+    class FakeClient:
+        def __init__(self, socket_path):
+            assert socket_path == str(tmp_path / "controller.sock")
+
+        def request(self, request):
+            requests.append(request)
+            return DaemonResponse(
+                record=DaemonLifecycleRecord(
+                    daemon_key="worker",
+                    phase=DaemonLifecyclePhase.STOPPED,
+                    generation=0,
+                    changed_at=datetime.now(UTC),
+                )
+            )
+
+    monkeypatch.setattr(cli, "DaemonControllerClient", FakeClient)
+
+    result = cli.main(
+        [
+            "daemon",
+            "stop",
+            "--socket",
+            str(tmp_path / "controller.sock"),
+            "--state-directory",
+            str(tmp_path / "state"),
+            "--key",
+            "worker",
+            "--cwd",
+            str(tmp_path),
+            "--json",
+            "--",
+            sys.executable,
+            "-c",
+            "print('safe argv')",
+        ]
+    )
+
+    assert result == 0
+    assert ensured == [(str(tmp_path / "controller.sock"), str(tmp_path / "state"))]
+    assert requests[0].definition.argv[-1] == "print('safe argv')"
+    assert _json_stdout(capsys)["phase"] == "stopped"
 
 
 def test_doctor_reports_managed_policy_only_when_capabilities_are_known(
