@@ -32,6 +32,7 @@ class DaemonOperation(StrEnum):
     START = "start"
     STOP = "stop"
     RESTART = "restart"
+    STATUS = "status"
 
 
 class DaemonRequest(BaseModel):
@@ -214,6 +215,8 @@ class DaemonControllerServer:
             if not self._supervisors:
                 self._closing.set()
             return record
+        if request.operation is DaemonOperation.STATUS:
+            return supervisor.status()
         return supervisor.restart()
 
     def _new_supervisor(self, definition: DaemonDefinition) -> DaemonSupervisor:

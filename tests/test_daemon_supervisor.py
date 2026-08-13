@@ -59,6 +59,7 @@ def test_start_is_idempotent_and_stop_is_durable(tmp_path) -> None:
         assert started.phase is DaemonLifecyclePhase.RUNNING
         assert started.process_identity is not None
         assert service.start().process_identity == started.process_identity
+        assert service.status().phase is DaemonLifecyclePhase.RUNNING
 
         stopped = service.stop()
 
@@ -71,6 +72,16 @@ def test_start_is_idempotent_and_stop_is_durable(tmp_path) -> None:
                 os.kill(started.process_identity.pid, 9)
             except ProcessLookupError:
                 pass
+
+
+def test_status_without_state_is_durably_stopped(tmp_path) -> None:
+    service = supervisor(tmp_path)
+
+    status = service.status()
+
+    assert status.phase is DaemonLifecyclePhase.STOPPED
+    assert status.generation == 0
+    assert service.store.read() == status
 
 
 def test_concurrent_starters_publish_exactly_one_process(tmp_path) -> None:

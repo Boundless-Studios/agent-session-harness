@@ -97,6 +97,47 @@ class DaemonSupervisor:
             self._stop_locked()
             return self._start_locked(prior_generation + 1)
 
+    def status(self) -> DaemonLifecycleRecord:
+        with self.lock.acquire(timeout=self.lock_timeout):
+            current = self.store.read()
+            self._require_matching_daemon(current)
+            if current is None:
+                return self._publish(DaemonLifecyclePhase.STOPPED, 0)
+            identity = current.process_identity
+            if identity is None:
+                return current
+            observation = observe_process_identity(identity)
+            if observation.state is ProcessState.UNKNOWN:
+                raise DaemonIdentityUnknownError(
+                    "daemon process identity is unknown; status is indeterminate"
+                )
+            if observation.state is ProcessState.RUNNING:
+                return self._publish(
+                    DaemonLifecyclePhase.RUNNING,
+                    current.generation,
+                    process_identity=identity,
+                )
+            child = self._owned_child(identity.pid)
+            if (
+                observation.state is ProcessState.ZOMBIE
+                and child is not None
+                and self._process_group_has_live_members(
+                    child.pid, timeout=min(self.stop_timeout, 0.25)
+                )
+            ):
+                return self._publish(
+                    DaemonLifecyclePhase.FAILED,
+                    current.generation,
+                    detail="daemon leader exited while its process group remains",
+                    process_identity=identity,
+                )
+            self._reap_owned_child(identity.pid)
+            return self._publish(
+                DaemonLifecyclePhase.STOPPED,
+                current.generation,
+                detail="tracked process lifetime is absent",
+            )
+
     def _start_locked(self, generation: int) -> DaemonLifecycleRecord:
         self._publish(DaemonLifecyclePhase.STARTING, generation)
         try:

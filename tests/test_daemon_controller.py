@@ -86,6 +86,22 @@ def test_controller_rejects_changed_definition(controller, tmp_path: Path):
         )
 
 
+def test_status_from_separate_client_preserves_controller_ownership(
+    controller, tmp_path: Path
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+
+    status = DaemonControllerClient(server.socket_path).request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=definition)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+
+
 def test_socket_is_private(controller):
     server, _ = controller
     assert server.socket_path.stat().st_mode & 0o777 == 0o600
