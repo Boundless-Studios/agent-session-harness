@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import multiprocessing
 import time
 from datetime import UTC, datetime
@@ -145,3 +146,23 @@ def test_released_lock_can_be_reacquired_with_new_owner(tmp_path) -> None:
     with OwnerDiagnosticLock(path, purpose="second").acquire(timeout=0.1) as owner:
         assert owner.pid > 0
         assert owner.purpose == "second"
+
+
+@pytest.mark.parametrize("timeout", [math.nan, math.inf, -math.inf])
+def test_lock_rejects_non_finite_timeout(tmp_path, timeout) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        OwnerDiagnosticLock(tmp_path / "lock", purpose="test").acquire(timeout=timeout)
+
+
+def test_publish_revalidates_untrusted_model_copy(tmp_path) -> None:
+    invalid = record().model_copy(update={"phase": DaemonLifecyclePhase.RUNNING})
+
+    with pytest.raises(ValueError, match="running state requires process identity"):
+        DaemonLifecycleStore(tmp_path / "state.json").publish(invalid)
+
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_daemon_definition_requires_absolute_cwd(tmp_path) -> None:
+    with pytest.raises(ValueError, match="absolute"):
+        DaemonDefinition(daemon_key="bad", argv=("python3",), cwd="relative")
