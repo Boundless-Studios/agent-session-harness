@@ -121,15 +121,23 @@ DEFAULT_CONTEXT_TOKENS = 200_000
 # ("claude-opus-5") to the transcript and drops the "[1m]" suffix, so a 1M session
 # matches the generic "claude" rule and gets a 200K window. That understatement is
 # what _promote_window_to_fit() below repairs from measured occupancy.
+#
+# The Claude 5 family (opus-5, sonnet-5, fable-5) is a further exception: for
+# these, 1M is the DEFAULT window, not a tagged variant -- there is no bare
+# "claude-opus-5" running at 200K to fall back to, unlike pre-5 Claude models
+# which need "[1m]"/"-1m" to opt into the larger window.
 CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     ("[1m]", 1_000_000),  # explicit 1M-window variants
     ("-1m", 1_000_000),
+    ("opus-5", 1_000_000),  # native-1M Claude 5 family
+    ("sonnet-5", 1_000_000),
+    ("fable-5", 1_000_000),
     ("deepseek-v4", 1_000_000),
     ("qwen3", 128_000),
     ("qwen", 128_000),
     ("gpt-5", 400_000),
     ("gemini", 1_000_000),
-    ("claude", 200_000),  # default Claude window
+    ("claude", 200_000),  # default Claude window (pre-native-1M models)
 )
 
 # The suffixes that name a window variant rather than a model. These are the
@@ -399,6 +407,8 @@ def _candidate_windows(model: str) -> tuple[int, ...]:
     """
     lowered = (model or "").lower()
     if "[1m]" in lowered or "-1m" in lowered:
+        return (1_000_000,)
+    if any(name in lowered for name in ("opus-5", "sonnet-5", "fable-5")):
         return (1_000_000,)
     if "claude" in lowered:
         return (200_000, 1_000_000)
