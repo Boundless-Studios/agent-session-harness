@@ -104,3 +104,20 @@ def test_reset_removes_only_the_calling_session(monkeypatch, tmp_path) -> None:
 
     assert hook._reset() == 0
     assert json.loads(state.read_text()) == {"two": {"tokens": 20}}
+
+
+def test_native_1m_claude_5_family_resolves_to_1m_with_no_marker() -> None:
+    # claude-opus-5 / claude-sonnet-5 / claude-fable-5 ship natively at 1M --
+    # unlike pre-5 Claude models, they never carry a "[1m]"/"-1m" suffix.
+    for model in ("claude-opus-5", "claude-sonnet-5", "claude-fable-5"):
+        assert hook._context_window_tokens({"model": model}) == 1_000_000
+
+
+def test_pre_5_claude_model_still_resolves_to_200k() -> None:
+    assert (
+        hook._context_window_tokens({"model": "claude-sonnet-4-5-20250929"}) == 200_000
+    )
+
+
+def test_explicit_1m_marker_on_native_1m_id_still_resolves_to_1m() -> None:
+    assert hook._context_window_tokens({"model": "claude-opus-5[1m]"}) == 1_000_000
