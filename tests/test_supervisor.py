@@ -1561,7 +1561,9 @@ def test_guardian_resumes_a_stopped_native_runtime_below_a_wrapper(tmp_path) -> 
     try:
         while driver.is_alive(managed):
             if time.monotonic() >= deadline:
-                raise AssertionError("guardian did not resume the stopped native runtime")
+                raise AssertionError(
+                    "guardian did not resume the stopped native runtime"
+                )
             time.sleep(0.02)
     finally:
         if driver.is_alive(managed):
