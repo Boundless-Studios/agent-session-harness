@@ -183,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=timeout,
             process_group_session_id=child_session_id,
             acknowledgement_abort_requested=(lambda: acknowledgement_abort_requested),
+            terminal_lease=terminal_lease,
         )
         if terminal_lease is not None:
             terminal_lease.restore()
@@ -224,6 +225,7 @@ def _watch_child(
     timeout_seconds: float,
     process_group_session_id: int | None = None,
     acknowledgement_abort_requested: Callable[[], bool] | None = None,
+    terminal_lease: _TerminalLease | None = None,
 ) -> ProcessExit:
     deadline = time.monotonic() + timeout_seconds
     parent_pid = os.getppid()
@@ -251,10 +253,28 @@ def _watch_child(
             # A nested managed runtime cannot safely hand shell job control back
             # without also suspending the outer supervisor and its lease. Keep
             # terminal input live instead of leaving both layers deadlocked.
-            try:
-                os.killpg(child.pid, signal.SIGCONT)
-            except ProcessLookupError:
-                pass
+            #
+            # SIGCONT alone cannot clear a SIGTTIN/SIGTTOU stop: the runtime
+            # resumes, touches a terminal it still does not own, and is stopped
+            # again before the next poll. That is the common shape here, because
+            # a descendant in its own process group -- an MCP server launched
+            # through `npm exec`/`uvx` -- can take the foreground and then exit,
+            # leaving `tcsetpgrp` naming a process group with no living members.
+            # Re-assert the foreground first; `foreground()` sends the SIGCONT.
+            resumed = False
+            if terminal_lease is not None:
+                try:
+                    terminal_lease.foreground(child.pid)
+                    resumed = True
+                except RuntimeError:
+                    # Losing a race for the terminal is transient. Retry on the
+                    # next poll rather than tearing the guardian down over it.
+                    resumed = False
+            if not resumed:
+                try:
+                    os.killpg(child.pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
         if state_path is None:
             # Unmanaged mode: there is no supervisor state to consult, so the
             # only ownership signal is the process that spawned this guardian.
