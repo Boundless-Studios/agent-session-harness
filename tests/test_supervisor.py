@@ -1609,6 +1609,116 @@ def test_guardian_throttles_descendant_stop_probes(monkeypatch) -> None:
     assert probes == 1
 
 
+class _RecordingTerminalLease:
+    """Stands in for `_TerminalLease`, recording foreground transfers."""
+
+    def __init__(self, *, fails: bool = False) -> None:
+        self.foreground_calls: list[int] = []
+        self.fails = fails
+
+    def foreground(self, process_group_id: int) -> None:
+        self.foreground_calls.append(process_group_id)
+        if self.fails:
+            raise RuntimeError(
+                "interactive guardian cannot transfer terminal ownership"
+            )
+
+
+def _watch_stopped_child(monkeypatch, guardian, **watch_kwargs):
+    """Run `_watch_child` once against a child reported as stopped."""
+
+    stop_reports = 0
+
+    def report_stopped_once(_pid: int) -> bool:
+        nonlocal stop_reports
+        stop_reports += 1
+        return stop_reports == 1
+
+    monkeypatch.setattr(guardian, "_child_was_stopped", report_stopped_once)
+    monkeypatch.setattr(
+        guardian,
+        "_process_group_has_stopped_descendant",
+        lambda _pgid, *, expected_session_id: False,
+    )
+    signalled: list[tuple[int, int]] = []
+    real_killpg = os.killpg
+    monkeypatch.setattr(
+        guardian.os,
+        "killpg",
+        lambda pgid, sig: signalled.append((pgid, sig)) or real_killpg(pgid, 0),
+    )
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.35)"],
+        start_new_session=True,
+    )
+    terminal = guardian._watch_child(
+        child,
+        process_pid=os.getpid(),
+        chain_id="chain-sigttin-foreground",
+        generation=0,
+        state_path=None,
+        timeout_seconds=2,
+        **watch_kwargs,
+    )
+    return terminal, signalled, child.pid
+
+
+def test_guardian_reasserts_the_terminal_before_resuming_a_stopped_runtime(
+    monkeypatch,
+) -> None:
+    """A SIGTTIN stop needs `tcsetpgrp`, not just `SIGCONT`.
+
+    A runtime stopped behind a foreground process group that no longer exists
+    resumes, touches the terminal it still does not own, and stops again. Only
+    re-asserting the foreground breaks that loop, so the guardian must go
+    through the terminal lease rather than signalling the group directly.
+    """
+
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    lease = _RecordingTerminalLease()
+
+    terminal, signalled, child_pid = _watch_stopped_child(
+        monkeypatch, guardian, terminal_lease=lease
+    )
+
+    assert terminal.reason is process.ExitReason.NATURAL
+    assert lease.foreground_calls == [child_pid]
+    # `foreground()` issues the SIGCONT itself; a bare one here would mean the
+    # terminal was never handed over.
+    assert not [sig for _pgid, sig in signalled if sig == signal.SIGCONT]
+
+
+def test_guardian_falls_back_to_sigcont_without_a_terminal_lease(monkeypatch) -> None:
+    """Detached (non-tty) guardians keep the original resume behaviour."""
+
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+
+    terminal, signalled, child_pid = _watch_stopped_child(
+        monkeypatch, guardian, terminal_lease=None
+    )
+
+    assert terminal.reason is process.ExitReason.NATURAL
+    assert (child_pid, signal.SIGCONT) in signalled
+
+
+def test_guardian_resumes_when_the_terminal_handover_fails(monkeypatch) -> None:
+    """A lost race for the terminal must still resume the runtime."""
+
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    lease = _RecordingTerminalLease(fails=True)
+
+    terminal, signalled, child_pid = _watch_stopped_child(
+        monkeypatch, guardian, terminal_lease=lease
+    )
+
+    assert terminal.reason is process.ExitReason.NATURAL
+    assert lease.foreground_calls == [child_pid]
+    assert (child_pid, signal.SIGCONT) in signalled
+
+
 def test_recent_unspawned_launch_intent_recovers_in_the_same_call(tmp_path) -> None:
     process, _supervisor_module = _modules()
     driver = process.PosixProcessDriver(tmp_path, startup_timeout_seconds=0.5)
