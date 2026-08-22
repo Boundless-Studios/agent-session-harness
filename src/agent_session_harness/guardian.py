@@ -236,7 +236,10 @@ def _watch_child(
             reason = ExitReason.ACKNOWLEDGEMENT_FAILED
             _terminate_child(child)
             break
-        if _child_was_stopped(child.pid):
+        if _process_group_has_stopped_member(
+            child.pid,
+            expected_session_id=process_group_session_id,
+        ):
             # A nested managed runtime cannot safely hand shell job control back
             # without also suspending the outer supervisor and its lease. Keep
             # terminal input live instead of leaving both layers deadlocked.
@@ -309,6 +312,51 @@ def _child_was_stopped(pid: int) -> bool:
     except (AttributeError, ChildProcessError, OSError):
         return False
     return status is not None and status.si_code == os.CLD_STOPPED
+
+
+def _process_group_has_stopped_member(
+    process_group_id: int,
+    *,
+    expected_session_id: int | None,
+) -> bool:
+    if _child_was_stopped(process_group_id):
+        return True
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if completed.returncode != 0:
+        return False
+    stopped = False
+    for line in completed.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2:
+            return False
+        try:
+            pid = int(fields[0])
+            pgid = int(fields[1])
+        except ValueError:
+            return False
+        if pgid != process_group_id:
+            continue
+        try:
+            session_id = os.getsid(pid)
+        except ProcessLookupError:
+            continue
+        except (OSError, PermissionError):
+            return False
+        required_session_id = expected_session_id or process_group_id
+        if session_id != required_session_id:
+            return False
+        stopped = stopped or (len(fields) == 3 and fields[2].startswith("T"))
+    return stopped
 
 
 def _read_watchdog_state(

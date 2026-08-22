@@ -1529,6 +1529,51 @@ def test_guardian_drains_descendants_before_recording_natural_exit(tmp_path) -> 
     assert terminal.reason is process.ExitReason.NATURAL
 
 
+def test_guardian_resumes_a_stopped_native_runtime_below_a_wrapper(tmp_path) -> None:
+    process, _supervisor_module = _modules()
+    native = tmp_path / "native_runtime.py"
+    resumed_marker = tmp_path / "native-resumed"
+    native.write_text(
+        "import os, pathlib, signal, sys\n"
+        "os.kill(os.getpid(), signal.SIGSTOP)\n"
+        "pathlib.Path(sys.argv[1]).write_text('resumed')\n",
+        encoding="utf-8",
+    )
+    wrapper = tmp_path / "node_wrapper.py"
+    wrapper.write_text(
+        "import subprocess, sys\n"
+        "native = subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n"
+        "raise SystemExit(native.wait())\n",
+        encoding="utf-8",
+    )
+    driver = process.PosixProcessDriver(tmp_path / "process-state")
+    managed = driver.start_fresh(
+        process.LaunchRequest(
+            runtime="codex",
+            chain_id="chain-wrapper-native",
+            generation=0,
+            cwd=tmp_path,
+            executable=sys.executable,
+            runtime_args=(str(wrapper), str(native), str(resumed_marker)),
+        )
+    )
+    deadline = time.monotonic() + 5
+    try:
+        while driver.is_alive(managed):
+            if time.monotonic() >= deadline:
+                raise AssertionError("guardian did not resume the stopped native runtime")
+            time.sleep(0.02)
+    finally:
+        if driver.is_alive(managed):
+            os.killpg(managed.process_group_id, signal.SIGCONT)
+            driver.graceful_stop(managed, timeout_seconds=1)
+
+    assert resumed_marker.read_text(encoding="utf-8") == "resumed"
+    terminal = driver.exit_status(managed)
+    assert terminal is not None
+    assert terminal.reason is process.ExitReason.NATURAL
+
+
 def test_recent_unspawned_launch_intent_recovers_in_the_same_call(tmp_path) -> None:
     process, _supervisor_module = _modules()
     driver = process.PosixProcessDriver(tmp_path, startup_timeout_seconds=0.5)
