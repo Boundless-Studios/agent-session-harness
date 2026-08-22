@@ -23,6 +23,7 @@ from .process import (
 from .secure_files import lexical_absolute, read_private_text
 
 WATCHDOG_POLL_MAX_SECONDS = 0.1
+DESCENDANT_STOP_POLL_SECONDS = 1.0
 TERMINATE_GRACE_SECONDS = 1.0
 KILL_WAIT_SECONDS = 1.0
 WATCHDOG_SHUTDOWN_SLACK_SECONDS = 0.9
@@ -227,6 +228,7 @@ def _watch_child(
     deadline = time.monotonic() + timeout_seconds
     parent_pid = os.getppid()
     interval = min(WATCHDOG_POLL_MAX_SECONDS, timeout_seconds / 4)
+    next_descendant_stop_probe = 0.0
     reason = ExitReason.NATURAL
     while child.poll() is None:
         if (
@@ -236,7 +238,16 @@ def _watch_child(
             reason = ExitReason.ACKNOWLEDGEMENT_FAILED
             _terminate_child(child)
             break
-        if _child_was_stopped(child.pid):
+        now = time.monotonic()
+        child_was_stopped = _child_was_stopped(child.pid)
+        descendant_was_stopped = False
+        if now >= next_descendant_stop_probe:
+            descendant_was_stopped = _process_group_has_stopped_descendant(
+                child.pid,
+                expected_session_id=process_group_session_id,
+            )
+            next_descendant_stop_probe = now + DESCENDANT_STOP_POLL_SECONDS
+        if child_was_stopped or descendant_was_stopped:
             # A nested managed runtime cannot safely hand shell job control back
             # without also suspending the outer supervisor and its lease. Keep
             # terminal input live instead of leaving both layers deadlocked.
@@ -309,6 +320,49 @@ def _child_was_stopped(pid: int) -> bool:
     except (AttributeError, ChildProcessError, OSError):
         return False
     return status is not None and status.si_code == os.CLD_STOPPED
+
+
+def _process_group_has_stopped_descendant(
+    process_group_id: int,
+    *,
+    expected_session_id: int | None,
+) -> bool:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=2,
+            text=True,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if completed.returncode != 0:
+        return False
+    stopped = False
+    for line in completed.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 2:
+            return False
+        try:
+            pid = int(fields[0])
+            pgid = int(fields[1])
+        except ValueError:
+            return False
+        if pgid != process_group_id:
+            continue
+        try:
+            session_id = os.getsid(pid)
+        except ProcessLookupError:
+            continue
+        except (OSError, PermissionError):
+            return False
+        required_session_id = expected_session_id or process_group_id
+        if session_id != required_session_id:
+            return False
+        stopped = stopped or (len(fields) == 3 and fields[2].startswith("T"))
+    return stopped
 
 
 def _read_watchdog_state(
