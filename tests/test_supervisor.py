@@ -1576,6 +1576,39 @@ def test_guardian_resumes_a_stopped_native_runtime_below_a_wrapper(tmp_path) -> 
     assert terminal.reason is process.ExitReason.NATURAL
 
 
+def test_guardian_throttles_descendant_stop_probes(monkeypatch) -> None:
+    process, _supervisor_module = _modules()
+    guardian = importlib.import_module("agent_session_harness.guardian")
+    probes = 0
+
+    def record_probe(
+        _process_group_id: int,
+        *,
+        expected_session_id: int | None,
+    ) -> bool:
+        nonlocal probes
+        probes += 1
+        return False
+
+    monkeypatch.setattr(guardian, "_process_group_has_stopped_descendant", record_probe)
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(0.35)"],
+        start_new_session=True,
+    )
+
+    terminal = guardian._watch_child(
+        child,
+        process_pid=os.getpid(),
+        chain_id="chain-throttled-stop-probe",
+        generation=0,
+        state_path=None,
+        timeout_seconds=2,
+    )
+
+    assert terminal.reason is process.ExitReason.NATURAL
+    assert probes == 1
+
+
 def test_recent_unspawned_launch_intent_recovers_in_the_same_call(tmp_path) -> None:
     process, _supervisor_module = _modules()
     driver = process.PosixProcessDriver(tmp_path, startup_timeout_seconds=0.5)

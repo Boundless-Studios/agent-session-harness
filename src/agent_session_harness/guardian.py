@@ -23,6 +23,7 @@ from .process import (
 from .secure_files import lexical_absolute, read_private_text
 
 WATCHDOG_POLL_MAX_SECONDS = 0.1
+DESCENDANT_STOP_POLL_SECONDS = 1.0
 TERMINATE_GRACE_SECONDS = 1.0
 KILL_WAIT_SECONDS = 1.0
 WATCHDOG_SHUTDOWN_SLACK_SECONDS = 0.9
@@ -227,6 +228,7 @@ def _watch_child(
     deadline = time.monotonic() + timeout_seconds
     parent_pid = os.getppid()
     interval = min(WATCHDOG_POLL_MAX_SECONDS, timeout_seconds / 4)
+    next_descendant_stop_probe = 0.0
     reason = ExitReason.NATURAL
     while child.poll() is None:
         if (
@@ -236,10 +238,16 @@ def _watch_child(
             reason = ExitReason.ACKNOWLEDGEMENT_FAILED
             _terminate_child(child)
             break
-        if _process_group_has_stopped_member(
-            child.pid,
-            expected_session_id=process_group_session_id,
-        ):
+        now = time.monotonic()
+        child_was_stopped = _child_was_stopped(child.pid)
+        descendant_was_stopped = False
+        if now >= next_descendant_stop_probe:
+            descendant_was_stopped = _process_group_has_stopped_descendant(
+                child.pid,
+                expected_session_id=process_group_session_id,
+            )
+            next_descendant_stop_probe = now + DESCENDANT_STOP_POLL_SECONDS
+        if child_was_stopped or descendant_was_stopped:
             # A nested managed runtime cannot safely hand shell job control back
             # without also suspending the outer supervisor and its lease. Keep
             # terminal input live instead of leaving both layers deadlocked.
@@ -314,13 +322,11 @@ def _child_was_stopped(pid: int) -> bool:
     return status is not None and status.si_code == os.CLD_STOPPED
 
 
-def _process_group_has_stopped_member(
+def _process_group_has_stopped_descendant(
     process_group_id: int,
     *,
     expected_session_id: int | None,
 ) -> bool:
-    if _child_was_stopped(process_group_id):
-        return True
     try:
         completed = subprocess.run(
             ["/bin/ps", "-ax", "-o", "pid=", "-o", "pgid=", "-o", "stat="],
