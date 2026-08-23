@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from enum import StrEnum
 import json
 import os
+from enum import StrEnum
 from pathlib import Path
 from typing import Self
 
