@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_session_harness import finalization
 from agent_session_harness.finalization import (
     FinalizationPhase,
     FinalizationStore,
@@ -85,6 +86,30 @@ def test_updates_are_validated_before_they_replace_durable_state(
         store.record_block("x" * 161, "blocked")
 
     assert store.load() == original
+
+
+def test_record_block_rejects_a_blank_message_without_changing_state(
+    tmp_path: Path,
+) -> None:
+    store = FinalizationStore(tmp_path / "finalization.json")
+    original = store.begin("session-1", "Done.")
+
+    with pytest.raises(ValueError):
+        store.record_block("dispatch-7", " \t\n")
+
+    assert store.load() == original
+
+
+def test_load_rejects_state_larger_than_the_durable_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "finalization.json"
+    path.write_text(" " * 129, encoding="utf-8")
+    monkeypatch.setattr(finalization, "MAX_FINALIZATION_STATE_BYTES", 128)
+
+    with pytest.raises(ValueError, match="private file exceeds 128 bytes"):
+        FinalizationStore(path).load()
 
 
 def test_future_schema_version_fails_closed(tmp_path: Path) -> None:

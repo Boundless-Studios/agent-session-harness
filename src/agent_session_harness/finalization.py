@@ -18,6 +18,8 @@ from .secure_files import (
     read_private_text,
 )
 
+MAX_FINALIZATION_STATE_BYTES = 64 * 1024
+
 
 class FinalizationPhase(StrEnum):
     ACTIVE = "active"
@@ -34,7 +36,7 @@ class FinalizationRecord(BaseModel):
     session_id: str = Field(min_length=1, max_length=160)
     summary: str = Field(min_length=1, max_length=20_000)
     phase: FinalizationPhase = FinalizationPhase.ACTIVE
-    pending_block: str | None = Field(default=None, max_length=20_000)
+    pending_block: str | None = Field(default=None, min_length=1, max_length=20_000)
     block_dispatch_id: str | None = Field(default=None, max_length=160)
     retro_submitted: bool = False
     summary_surfaced: bool = False
@@ -58,7 +60,9 @@ class FinalizationStore:
     def load(self) -> FinalizationRecord:
         if not private_exists(self.path):
             raise FileNotFoundError(self.path)
-        return FinalizationRecord.model_validate_json(read_private_text(self.path))
+        return FinalizationRecord.model_validate_json(
+            read_private_text(self.path, max_bytes=MAX_FINALIZATION_STATE_BYTES)
+        )
 
     def begin(self, session_id: str, summary: str) -> FinalizationRecord:
         normalized_summary = summary.strip()
