@@ -1,0 +1,60 @@
+from pathlib import Path
+
+import pytest
+
+from agent_session_harness.finalization import (
+    FinalizationPhase,
+    FinalizationStore,
+)
+
+
+def test_begin_is_idempotent_and_requires_a_human_summary(tmp_path: Path) -> None:
+    store = FinalizationStore(tmp_path / "finalization.json")
+
+    first = store.begin("session-1", "Implemented PI lifecycle reliability.")
+    second = store.begin("session-1", "Implemented PI lifecycle reliability.")
+
+    assert first == second
+    assert first.phase is FinalizationPhase.ACTIVE
+
+
+def test_block_survives_restart_until_matching_acknowledgement(tmp_path: Path) -> None:
+    path = tmp_path / "finalization.json"
+    store = FinalizationStore(path)
+    store.begin("session-1", "Implemented PI lifecycle reliability.")
+    blocked = store.record_block("dispatch-7", "Open and settle the pull request.")
+
+    assert blocked.phase is FinalizationPhase.BLOCKED
+    assert blocked.pending_block == "Open and settle the pull request."
+
+    restarted = FinalizationStore(path)
+    assert restarted.load().block_dispatch_id == "dispatch-7"
+    assert restarted.acknowledge_block("dispatch-other").pending_block is not None
+    assert restarted.acknowledge_block("dispatch-7").pending_block is None
+
+
+def test_retro_summary_and_finalization_are_exactly_once(tmp_path: Path) -> None:
+    store = FinalizationStore(tmp_path / "finalization.json")
+    store.begin("session-1", "Implemented PI lifecycle reliability.")
+
+    assert store.mark_retro_submitted().retro_submitted is True
+    assert store.mark_retro_submitted().retro_submitted is True
+    assert store.mark_summary_surfaced().summary_surfaced is True
+    assert store.mark_summary_surfaced().summary_surfaced is True
+    assert store.finalize().phase is FinalizationPhase.FINALIZED
+    assert store.finalize().phase is FinalizationPhase.FINALIZED
+
+
+def test_finalize_requires_no_block_and_completed_human_artifacts(tmp_path: Path) -> None:
+    store = FinalizationStore(tmp_path / "finalization.json")
+    store.begin("session-1", "Implemented PI lifecycle reliability.")
+
+    with pytest.raises(ValueError, match="retro and summary"):
+        store.finalize()
+
+    store.mark_retro_submitted()
+    store.mark_summary_surfaced()
+    store.record_block("dispatch-7", "Settle required review.")
+
+    with pytest.raises(ValueError, match="pending block"):
+        store.finalize()
