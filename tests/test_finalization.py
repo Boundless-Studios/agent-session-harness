@@ -58,3 +58,39 @@ def test_finalize_requires_no_block_and_completed_human_artifacts(tmp_path: Path
 
     with pytest.raises(ValueError, match="pending block"):
         store.finalize()
+
+
+def test_finalized_record_cannot_be_reopened_by_a_stale_runtime(tmp_path: Path) -> None:
+    store = FinalizationStore(tmp_path / "finalization.json")
+    store.begin("session-1", "Done.")
+    store.mark_retro_submitted()
+    store.mark_summary_surfaced()
+    store.finalize()
+
+    with pytest.raises(ValueError, match="after finalization"):
+        store.record_block("late-dispatch", "late block")
+
+    assert store.load().phase is FinalizationPhase.FINALIZED
+
+
+def test_updates_are_validated_before_they_replace_durable_state(tmp_path: Path) -> None:
+    store = FinalizationStore(tmp_path / "finalization.json")
+    original = store.begin("session-1", "Done.")
+
+    with pytest.raises(ValueError):
+        store.record_block("x" * 161, "blocked")
+
+    assert store.load() == original
+
+
+def test_future_schema_version_fails_closed(tmp_path: Path) -> None:
+    path = tmp_path / "finalization.json"
+    path.write_text(
+        '{"schema_version":2,"session_id":"session-1","summary":"Done.",'
+        '"phase":"active","pending_block":null,"block_dispatch_id":null,'
+        '"retro_submitted":false,"summary_surfaced":false}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        FinalizationStore(path).load()

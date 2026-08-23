@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -29,7 +30,7 @@ class FinalizationRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: int = 1
+    schema_version: Literal[1] = 1
     session_id: str = Field(min_length=1, max_length=160)
     summary: str = Field(min_length=1, max_length=20_000)
     phase: FinalizationPhase = FinalizationPhase.ACTIVE
@@ -75,21 +76,28 @@ class FinalizationStore:
             return candidate
 
     def record_block(self, dispatch_id: str, message: str) -> FinalizationRecord:
-        return self._update(
-            phase=FinalizationPhase.BLOCKED,
-            pending_block=message.strip(),
-            block_dispatch_id=dispatch_id,
-        )
+        def transition(current: FinalizationRecord) -> dict[str, object]:
+            if current.phase is FinalizationPhase.FINALIZED:
+                raise ValueError("cannot record a block after finalization")
+            return {
+                "phase": FinalizationPhase.BLOCKED,
+                "pending_block": message.strip(),
+                "block_dispatch_id": dispatch_id,
+            }
+
+        return self._transition(transition)
 
     def acknowledge_block(self, dispatch_id: str) -> FinalizationRecord:
-        current = self.load()
-        if current.block_dispatch_id != dispatch_id:
-            return current
-        return self._update(
-            phase=FinalizationPhase.ACTIVE,
-            pending_block=None,
-            block_dispatch_id=None,
-        )
+        def transition(current: FinalizationRecord) -> dict[str, object]:
+            if current.block_dispatch_id != dispatch_id:
+                return {}
+            return {
+                "phase": FinalizationPhase.ACTIVE,
+                "pending_block": None,
+                "block_dispatch_id": None,
+            }
+
+        return self._transition(transition)
 
     def mark_retro_submitted(self) -> FinalizationRecord:
         return self._update(retro_submitted=True)
@@ -98,18 +106,28 @@ class FinalizationStore:
         return self._update(summary_surfaced=True)
 
     def finalize(self) -> FinalizationRecord:
-        current = self.load()
-        if current.pending_block is not None:
-            raise ValueError("cannot finalize with a pending block")
-        if not current.retro_submitted or not current.summary_surfaced:
-            raise ValueError("cannot finalize before retro and summary are complete")
-        return self._update(phase=FinalizationPhase.FINALIZED)
+        def transition(current: FinalizationRecord) -> dict[str, object]:
+            if current.pending_block is not None:
+                raise ValueError("cannot finalize with a pending block")
+            if not current.retro_submitted or not current.summary_surfaced:
+                raise ValueError("cannot finalize before retro and summary are complete")
+            return {"phase": FinalizationPhase.FINALIZED}
+
+        return self._transition(transition)
 
     def _update(self, **changes: object) -> FinalizationRecord:
+        return self._transition(lambda _current: changes)
+
+    def _transition(
+        self,
+        transition: Callable[[FinalizationRecord], dict[str, object]],
+    ) -> FinalizationRecord:
         with exclusive_lock(self.lock_path):
             current = self.load()
-            updated = current.model_copy(update=changes)
-            updated = FinalizationRecord.model_validate(updated)
+            changes = transition(current)
+            updated = FinalizationRecord.model_validate(
+                {**current.model_dump(mode="python"), **changes}
+            )
             self._write(updated)
             return updated
 
