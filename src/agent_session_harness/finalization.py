@@ -69,7 +69,10 @@ class FinalizationStore:
         with exclusive_lock(self.lock_path):
             if private_exists(self.path):
                 current = self.load()
-                if current.session_id != session_id or current.summary != normalized_summary:
+                if (
+                    current.session_id != session_id
+                    or current.summary != normalized_summary
+                ):
                     raise ValueError("finalization already belongs to another request")
                 return current
             self._write(candidate)
@@ -110,7 +113,9 @@ class FinalizationStore:
             if current.pending_block is not None:
                 raise ValueError("cannot finalize with a pending block")
             if not current.retro_submitted or not current.summary_surfaced:
-                raise ValueError("cannot finalize before retro and summary are complete")
+                raise ValueError(
+                    "cannot finalize before retro and summary are complete"
+                )
             return {"phase": FinalizationPhase.FINALIZED}
 
         return self._transition(transition)

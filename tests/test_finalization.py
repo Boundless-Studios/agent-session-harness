@@ -45,7 +45,9 @@ def test_retro_summary_and_finalization_are_exactly_once(tmp_path: Path) -> None
     assert store.finalize().phase is FinalizationPhase.FINALIZED
 
 
-def test_finalize_requires_no_block_and_completed_human_artifacts(tmp_path: Path) -> None:
+def test_finalize_requires_no_block_and_completed_human_artifacts(
+    tmp_path: Path,
+) -> None:
     store = FinalizationStore(tmp_path / "finalization.json")
     store.begin("session-1", "Implemented PI lifecycle reliability.")
 
@@ -73,7 +75,9 @@ def test_finalized_record_cannot_be_reopened_by_a_stale_runtime(tmp_path: Path) 
     assert store.load().phase is FinalizationPhase.FINALIZED
 
 
-def test_updates_are_validated_before_they_replace_durable_state(tmp_path: Path) -> None:
+def test_updates_are_validated_before_they_replace_durable_state(
+    tmp_path: Path,
+) -> None:
     store = FinalizationStore(tmp_path / "finalization.json")
     original = store.begin("session-1", "Done.")
 
