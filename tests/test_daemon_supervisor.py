@@ -305,6 +305,51 @@ def test_takeover_controller_stops_live_group_with_zombie_leader(
     assert signals == [(identity.pid, signal.SIGTERM)]
 
 
+def test_takeover_status_preserves_zombie_led_live_group_identity(
+    tmp_path, monkeypatch
+) -> None:
+    takeover = DaemonSupervisor(
+        definition(tmp_path),
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "lifecycle.lock",
+        allow_process_takeover=True,
+    )
+    identity = ProcessIdentity(
+        platform=(
+            ProcessPlatform.DARWIN
+            if sys.platform == "darwin"
+            else ProcessPlatform.LINUX
+        ),
+        pid=12345,
+        opaque_start_token="token",
+        executable_identity=sys.executable,
+        captured_at=datetime.now(UTC),
+    )
+    takeover.store.publish(
+        DaemonLifecycleRecord(
+            daemon_key="sleeper",
+            phase=DaemonLifecyclePhase.FAILED,
+            generation=1,
+            changed_at=datetime.now(UTC),
+            process_identity=identity,
+        )
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_supervisor.observe_process_identity",
+        lambda _identity: Mock(state=ProcessState.ZOMBIE),
+    )
+    monkeypatch.setattr(
+        takeover,
+        "_process_group_has_live_members",
+        lambda *_args, **_kwargs: True,
+    )
+
+    status = takeover.status()
+
+    assert status.phase is DaemonLifecyclePhase.FAILED
+    assert status.process_identity == identity
+
+
 def test_start_persists_recovered_running_phase(tmp_path) -> None:
     owner = supervisor(tmp_path)
     running = owner.start()

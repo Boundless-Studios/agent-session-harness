@@ -122,9 +122,9 @@ class DaemonSupervisor:
             child = self._owned_child(identity.pid)
             if (
                 observation.state is ProcessState.ZOMBIE
-                and child is not None
+                and (child is not None or self.allow_process_takeover)
                 and self._process_group_has_live_members(
-                    child.pid, timeout=min(self.stop_timeout, 0.25)
+                    identity.pid, timeout=min(self.stop_timeout, 0.25)
                 )
             ):
                 return self._publish(

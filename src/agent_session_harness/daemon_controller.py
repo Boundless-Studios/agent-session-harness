@@ -162,7 +162,6 @@ class DaemonControllerServer:
         self.socket_path = Path(socket_path)
         self.state_directory = Path(state_directory)
         self.max_message_bytes = max_message_bytes
-        self.allow_process_takeover = allow_process_takeover
         self.supervisor_options = supervisor_options
         self._supervisors: dict[str, DaemonSupervisor] = {}
         self._definitions: dict[str, DaemonDefinition] = {}
@@ -358,7 +357,6 @@ class DaemonControllerServer:
             definition,
             state_path=self.state_directory / f"{stem}.json",
             lock_path=self.state_directory / f"{stem}.lock",
-            allow_process_takeover=self.allow_process_takeover,
             **self.supervisor_options,
         )
 

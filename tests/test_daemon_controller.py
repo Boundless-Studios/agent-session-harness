@@ -562,6 +562,37 @@ def test_takeover_request_upgrades_already_running_controller(controller, tmp_pa
     assert supervisor.allow_process_takeover is True
 
 
+def test_controller_startup_takeover_does_not_authorize_unrelated_key(tmp_path):
+    server = DaemonControllerServer(
+        socket_path=tmp_path / "controller.sock",
+        state_directory=tmp_path / "state",
+        allow_process_takeover=True,
+    )
+    takeover_definition = _definition(tmp_path)
+    server._dispatch(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=takeover_definition,
+            allow_process_takeover=True,
+        )
+    )
+    ordinary_definition = takeover_definition.model_copy(
+        update={"daemon_key": "ordinary-daemon"}
+    )
+
+    server._dispatch(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=ordinary_definition,
+        )
+    )
+
+    assert server._supervisors[takeover_definition.daemon_key].allow_process_takeover
+    assert not server._supervisors[
+        ordinary_definition.daemon_key
+    ].allow_process_takeover
+
+
 def test_ensure_controller_rejects_live_state_directory_mismatch(controller, tmp_path):
     server, _ = controller
 
