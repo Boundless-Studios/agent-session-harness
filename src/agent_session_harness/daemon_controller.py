@@ -43,6 +43,7 @@ class DaemonRequest(BaseModel):
     schema_version: Literal[1] = 1
     operation: DaemonOperation
     definition: DaemonDefinition
+    allow_process_takeover: bool = False
 
 
 class DaemonResponse(BaseModel):
@@ -240,7 +241,9 @@ class DaemonControllerServer:
             self._supervisors[key] = supervisor
         elif definition is None:
             raise RuntimeError("daemon controller definition ownership is inconsistent")
-        elif definition != request.definition:
+        if request.allow_process_takeover:
+            supervisor.allow_process_takeover = True
+        if definition is not None and definition != request.definition:
             return self._dispatch_definition_drift(
                 request,
                 supervisor,
@@ -329,6 +332,7 @@ class DaemonControllerServer:
             if (
                 observed.phase is DaemonLifecyclePhase.RUNNING
                 or observed.process_identity is not None
+                or replacement.owns_live_child()
             ):
                 raise
             self._definitions[key] = previous_definition

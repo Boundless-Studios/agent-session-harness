@@ -100,7 +100,51 @@ def test_daemon_cli_bootstraps_controller_and_sends_direct_argv(
         )
     ]
     assert requests[0].definition.argv[-1] == "print('safe argv')"
+    assert requests[0].allow_process_takeover is False
     assert _json_stdout(capsys)["phase"] == "stopped"
+
+
+def test_daemon_takeover_is_sent_to_existing_controller(monkeypatch, tmp_path):
+    requests = []
+    monkeypatch.setattr(cli, "ensure_controller", lambda *_args, **_kwargs: None)
+
+    class FakeClient:
+        def __init__(self, _socket_path):
+            pass
+
+        def request(self, request):
+            requests.append(request)
+            return DaemonResponse(
+                record=DaemonLifecycleRecord(
+                    daemon_key="worker",
+                    phase=DaemonLifecyclePhase.STOPPED,
+                    generation=0,
+                    changed_at=datetime.now(UTC),
+                )
+            )
+
+    monkeypatch.setattr(cli, "DaemonControllerClient", FakeClient)
+
+    result = cli.main(
+        [
+            "daemon",
+            "stop",
+            "--takeover",
+            "--socket",
+            str(tmp_path / "controller.sock"),
+            "--state-directory",
+            str(tmp_path / "state"),
+            "--key",
+            "worker",
+            "--cwd",
+            str(tmp_path),
+            "--",
+            sys.executable,
+        ]
+    )
+
+    assert result == 0
+    assert requests[0].allow_process_takeover is True
 
 
 def test_doctor_reports_managed_policy_only_when_capabilities_are_known(

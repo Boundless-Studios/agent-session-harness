@@ -140,6 +140,13 @@ class DaemonSupervisor:
                 detail="tracked process lifetime is absent",
             )
 
+    def owns_live_child(self) -> bool:
+        child = self._child
+        return (
+            child is not None
+            and self._owned_child_state(child) is not _OwnedChildState.MISSING
+        )
+
     def _start_locked(self, generation: int) -> DaemonLifecycleRecord:
         self._publish(DaemonLifecyclePhase.STARTING, generation)
         try:
@@ -233,17 +240,23 @@ class DaemonSupervisor:
             )
         if observation.state is ProcessState.ZOMBIE:
             child = self._owned_child(identity.pid)
-            if child is not None and self._process_group_has_live_members(
-                child.pid, timeout=min(self.stop_timeout, 0.25)
-            ):
-                self._terminate_owned_child(child)
-            else:
-                self._reap_owned_child(identity.pid)
-            return self._publish(
-                DaemonLifecyclePhase.STOPPED,
-                current.generation,
-                detail="tracked process lifetime is absent",
+            group_has_live_members = self._process_group_has_live_members(
+                identity.pid, timeout=min(self.stop_timeout, 0.25)
             )
+            if group_has_live_members and child is not None:
+                self._terminate_owned_child(child)
+            elif not group_has_live_members or not self.allow_process_takeover:
+                self._reap_owned_child(identity.pid)
+            if (
+                child is not None
+                or not group_has_live_members
+                or not self.allow_process_takeover
+            ):
+                return self._publish(
+                    DaemonLifecyclePhase.STOPPED,
+                    current.generation,
+                    detail="tracked process lifetime is absent",
+                )
 
         child = self._owned_child(identity.pid)
         if child is None and not self.allow_process_takeover:

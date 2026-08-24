@@ -169,6 +169,39 @@ def test_changed_definition_retains_failed_supervisor_with_live_process_group(
     client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
 
 
+def test_changed_definition_retains_replacement_that_still_owns_child(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    original = server._supervisors[definition.daemon_key]
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    monkeypatch.setattr(original, "stop", Mock())
+    original_start = Mock()
+    monkeypatch.setattr(original, "start", original_start)
+    replacement = Mock()
+    replacement.start.side_effect = TimeoutError("cleanup timed out")
+    replacement.status.return_value.phase = DaemonLifecyclePhase.STARTING
+    replacement.status.return_value.process_identity = None
+    replacement.owns_live_child.return_value = True
+    monkeypatch.setattr(server, "_new_supervisor", lambda _definition: replacement)
+
+    with pytest.raises(RuntimeError, match="cleanup timed out"):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
+
+    assert server._definitions[definition.daemon_key] == changed
+    assert server._supervisors[definition.daemon_key] is replacement
+    original_start.assert_not_called()
+
+
 @pytest.mark.parametrize("operation", [DaemonOperation.START, DaemonOperation.RESTART])
 def test_changed_definition_restart_uses_new_definition(
     controller, tmp_path: Path, operation: DaemonOperation
@@ -440,6 +473,26 @@ def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path:
     )
 
     ensure_controller(tmp_path / "controller.sock", tmp_path / "state")
+
+
+def test_takeover_request_upgrades_already_running_controller(controller, tmp_path):
+    server, client = controller
+    definition = _definition(tmp_path)
+    supervisor = server._new_supervisor(definition)
+    supervisor.allow_process_takeover = False
+    server._definitions[definition.daemon_key] = definition
+    server._supervisors[definition.daemon_key] = supervisor
+
+    response = client.request(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=definition,
+            allow_process_takeover=True,
+        )
+    )
+
+    assert response.record.phase is DaemonLifecyclePhase.STOPPED
+    assert supervisor.allow_process_takeover is True
 
 
 def test_ensure_controller_rejects_live_state_directory_mismatch(controller, tmp_path):

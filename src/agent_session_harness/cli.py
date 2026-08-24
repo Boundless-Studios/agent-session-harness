@@ -375,7 +375,11 @@ def _run_daemon(args: argparse.Namespace) -> int:
         allow_process_takeover=args.takeover,
     )
     response = DaemonControllerClient(args.socket).request(
-        DaemonRequest(operation=args.daemon_operation, definition=definition)
+        DaemonRequest(
+            operation=args.daemon_operation,
+            definition=definition,
+            allow_process_takeover=args.takeover,
+        )
     )
     _emit(response.record.model_dump(mode="json"), json_output=args.json_output)
     return 0
