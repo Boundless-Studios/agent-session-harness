@@ -291,7 +291,9 @@ def test_changed_definition_restart_reports_launch_and_recovery_status_errors(
 ):
     server, client = controller
     definition = _definition(tmp_path)
-    client.request(DaemonRequest(operation=DaemonOperation.START, definition=definition))
+    client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
     changed = definition.model_copy(
         update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
     )
