@@ -402,8 +402,31 @@ def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path)
 
     assert len(launches) == 1
     argv, options = launches[0]
-    assert argv[2:4] == ("agent_session_harness.daemon_controller", "serve")
+    assert argv[2:4] == ["agent_session_harness.daemon_controller", "serve"]
     assert options["start_new_session"] is True
+
+
+def test_ensure_controller_passes_takeover_to_detached_server(
+    monkeypatch, tmp_path: Path
+):
+    availability = iter((False, True))
+    launches = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._controller_available",
+        lambda _path, _state: next(availability),
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.subprocess.Popen",
+        lambda argv, **options: launches.append((argv, options)),
+    )
+
+    ensure_controller(
+        tmp_path / "controller.sock",
+        tmp_path / "state",
+        allow_process_takeover=True,
+    )
+
+    assert "--takeover" in launches[0][0]
 
 
 def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path: Path):

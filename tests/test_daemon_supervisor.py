@@ -236,6 +236,25 @@ def test_detached_controller_refuses_pid_only_stop(tmp_path) -> None:
         owner.stop()
 
 
+def test_takeover_controller_can_stop_identity_verified_process(tmp_path) -> None:
+    owner = supervisor(tmp_path)
+    running = owner.start()
+    takeover = DaemonSupervisor(
+        definition(tmp_path),
+        state_path=tmp_path / "state.json",
+        lock_path=tmp_path / "lifecycle.lock",
+        lock_timeout=1,
+        startup_probe_seconds=0.05,
+        stop_timeout=1,
+        allow_process_takeover=True,
+    )
+
+    assert running.process_identity is not None
+    stopped = takeover.stop()
+
+    assert stopped.phase is DaemonLifecyclePhase.STOPPED
+
+
 def test_start_persists_recovered_running_phase(tmp_path) -> None:
     owner = supervisor(tmp_path)
     running = owner.start()

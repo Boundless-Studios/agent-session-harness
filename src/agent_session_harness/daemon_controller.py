@@ -113,23 +113,27 @@ def ensure_controller(
     state_directory: str | Path,
     *,
     startup_timeout: float = DEFAULT_CONTROLLER_STARTUP_TIMEOUT,
+    allow_process_takeover: bool = False,
 ) -> None:
     """Ensure a detached controller is accepting local requests."""
     resolved_socket = Path(socket_path)
     resolved_state = Path(state_directory)
     if _controller_available(resolved_socket, resolved_state):
         return
+    command = [
+        sys.executable,
+        "-m",
+        "agent_session_harness.daemon_controller",
+        "serve",
+        "--socket",
+        str(resolved_socket),
+        "--state-directory",
+        str(resolved_state),
+    ]
+    if allow_process_takeover:
+        command.append("--takeover")
     subprocess.Popen(
-        (
-            sys.executable,
-            "-m",
-            "agent_session_harness.daemon_controller",
-            "serve",
-            "--socket",
-            str(resolved_socket),
-            "--state-directory",
-            str(resolved_state),
-        ),
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -150,11 +154,13 @@ class DaemonControllerServer:
         socket_path: str | Path,
         state_directory: str | Path,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        allow_process_takeover: bool = False,
         **supervisor_options: float,
     ) -> None:
         self.socket_path = Path(socket_path)
         self.state_directory = Path(state_directory)
         self.max_message_bytes = max_message_bytes
+        self.allow_process_takeover = allow_process_takeover
         self.supervisor_options = supervisor_options
         self._supervisors: dict[str, DaemonSupervisor] = {}
         self._definitions: dict[str, DaemonDefinition] = {}
@@ -346,6 +352,7 @@ class DaemonControllerServer:
             definition,
             state_path=self.state_directory / f"{stem}.json",
             lock_path=self.state_directory / f"{stem}.lock",
+            allow_process_takeover=self.allow_process_takeover,
             **self.supervisor_options,
         )
 
@@ -444,10 +451,12 @@ def main(argv: list[str] | None = None) -> int:
     serve = subparsers.add_parser("serve")
     serve.add_argument("--socket", required=True)
     serve.add_argument("--state-directory", required=True)
+    serve.add_argument("--takeover", action="store_true")
     args = parser.parse_args(argv)
     DaemonControllerServer(
         socket_path=args.socket,
         state_directory=args.state_directory,
+        allow_process_takeover=args.takeover,
     ).serve()
     return 0
 

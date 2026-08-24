@@ -51,6 +51,7 @@ class DaemonSupervisor:
         *,
         state_path: str | Path,
         lock_path: str | Path,
+        allow_process_takeover: bool = False,
         lock_timeout: float = 5,
         startup_probe_seconds: float = 0.1,
         stop_timeout: float = 5,
@@ -71,6 +72,7 @@ class DaemonSupervisor:
         self.definition = definition
         self.store = DaemonLifecycleStore(state_path)
         self.lock = OwnerDiagnosticLock(lock_path, purpose=definition.daemon_key)
+        self.allow_process_takeover = allow_process_takeover
         self.lock_timeout = lock_timeout
         self.startup_probe_seconds = startup_probe_seconds
         self.stop_timeout = stop_timeout
@@ -244,7 +246,7 @@ class DaemonSupervisor:
             )
 
         child = self._owned_child(identity.pid)
-        if child is None:
+        if child is None and not self.allow_process_takeover:
             raise DaemonIdentityUnknownError(
                 "daemon is owned by another controller; refusing PID-only signal"
             )
@@ -257,13 +259,13 @@ class DaemonSupervisor:
             os.killpg(identity.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        if self._wait_group_absent(child, self.stop_timeout):
+        if self._wait_group_absent(identity.pid, child, self.stop_timeout):
             return self._publish(DaemonLifecyclePhase.STOPPED, current.generation)
         try:
             os.killpg(identity.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        if self._wait_group_absent(child, self.kill_timeout):
+        if self._wait_group_absent(identity.pid, child, self.kill_timeout):
             return self._publish(DaemonLifecyclePhase.STOPPED, current.generation)
         self._publish(
             DaemonLifecyclePhase.FAILED,
@@ -274,16 +276,21 @@ class DaemonSupervisor:
         raise DaemonStopTimeoutError("daemon did not stop before the deadline")
 
     @staticmethod
-    def _wait_group_absent(child: subprocess.Popen[bytes], timeout: float) -> bool:
+    def _wait_group_absent(
+        process_group_id: int,
+        child: subprocess.Popen[bytes] | None,
+        timeout: float,
+    ) -> bool:
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
             if not DaemonSupervisor._process_group_has_live_members(
-                child.pid, timeout=min(remaining, 0.25)
+                process_group_id, timeout=min(remaining, 0.25)
             ):
-                child.wait(timeout=0)
+                if child is not None:
+                    child.wait(timeout=0)
                 return True
             time.sleep(0.01)
 
@@ -339,12 +346,12 @@ class DaemonSupervisor:
         except ProcessLookupError:
             child.wait()
             return
-        if not self._wait_group_absent(child, self.stop_timeout):
+        if not self._wait_group_absent(child.pid, child, self.stop_timeout):
             try:
                 os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            if not self._wait_group_absent(child, self.kill_timeout):
+            if not self._wait_group_absent(child.pid, child, self.kill_timeout):
                 raise DaemonStopTimeoutError(
                     "failed launch process group survived cleanup deadlines"
                 )

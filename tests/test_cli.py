@@ -49,7 +49,11 @@ def test_daemon_cli_bootstraps_controller_and_sends_direct_argv(
 ) -> None:
     ensured = []
     requests = []
-    monkeypatch.setattr(cli, "ensure_controller", lambda *paths: ensured.append(paths))
+    monkeypatch.setattr(
+        cli,
+        "ensure_controller",
+        lambda *paths, **options: ensured.append((paths, options)),
+    )
 
     class FakeClient:
         def __init__(self, socket_path):
@@ -89,7 +93,12 @@ def test_daemon_cli_bootstraps_controller_and_sends_direct_argv(
     )
 
     assert result == 0
-    assert ensured == [(str(tmp_path / "controller.sock"), str(tmp_path / "state"))]
+    assert ensured == [
+        (
+            (str(tmp_path / "controller.sock"), str(tmp_path / "state")),
+            {"allow_process_takeover": False},
+        )
+    ]
     assert requests[0].definition.argv[-1] == "print('safe argv')"
     assert _json_stdout(capsys)["phase"] == "stopped"
 
