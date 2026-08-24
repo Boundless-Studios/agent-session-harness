@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import tempfile
@@ -7,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from shutil import rmtree
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -167,6 +168,32 @@ def test_changed_definition_retains_failed_supervisor_with_live_process_group(
     assert server._definitions[definition.daemon_key] == definition
     assert server._supervisors[definition.daemon_key] is supervisor
     client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_retains_starting_supervisor_that_owns_child(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    supervisor = server._new_supervisor(definition)
+    starting = supervisor.status().model_copy(
+        update={"phase": DaemonLifecyclePhase.STARTING, "process_identity": None}
+    )
+    monkeypatch.setattr(supervisor, "status", lambda: starting)
+    monkeypatch.setattr(supervisor, "owns_live_child", lambda: True)
+    server._definitions[definition.daemon_key] = definition
+    server._supervisors[definition.daemon_key] = supervisor
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    drifted = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert drifted.record.phase is DaemonLifecyclePhase.STARTING
+    assert server._definitions[definition.daemon_key] == definition
+    assert server._supervisors[definition.daemon_key] is supervisor
 
 
 def test_changed_definition_retains_replacement_that_still_owns_child(
@@ -417,6 +444,46 @@ def test_request_payload_is_bounded(tmp_path: Path):
 
     with pytest.raises(ValueError, match="exceeds"):
         client.request(request)
+
+
+def test_default_takeover_field_is_omitted_from_schema_v1_request(
+    monkeypatch, tmp_path: Path
+):
+    sent = bytearray()
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.sendall.side_effect = sent.extend
+
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.socket.socket",
+        lambda *_args, **_kwargs: connection,
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._read_message",
+        lambda *_args: json.dumps(
+            {
+                "schema_version": 1,
+                "record": {
+                    "schema_version": 1,
+                    "daemon_key": "test-daemon",
+                    "phase": "stopped",
+                    "generation": 0,
+                    "process_identity": None,
+                    "detail": None,
+                    "changed_at": "2026-01-01T00:00:00Z",
+                },
+            }
+        ).encode(),
+    )
+
+    DaemonControllerClient(tmp_path / "controller.sock").request(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=_definition(tmp_path),
+        )
+    )
+
+    assert "allow_process_takeover" not in json.loads(sent)
 
 
 def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path):

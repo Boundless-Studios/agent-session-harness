@@ -89,7 +89,8 @@ class DaemonControllerClient:
         self.max_message_bytes = max_message_bytes
 
     def request(self, request: DaemonRequest) -> DaemonResponse:
-        payload = request.model_dump_json().encode() + b"\n"
+        exclude = None if request.allow_process_takeover else {"allow_process_takeover"}
+        payload = request.model_dump_json(exclude=exclude).encode() + b"\n"
         if len(payload) > self.max_message_bytes:
             raise ValueError(
                 f"daemon controller request exceeds {self.max_message_bytes} bytes"
@@ -284,6 +285,7 @@ class DaemonControllerServer:
         if (
             current.phase is DaemonLifecyclePhase.RUNNING
             or current.process_identity is not None
+            or supervisor.owns_live_child()
         ):
             if request.operation is DaemonOperation.STATUS:
                 return current
