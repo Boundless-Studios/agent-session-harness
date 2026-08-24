@@ -316,11 +316,14 @@ class DaemonControllerServer:
             try:
                 observed = replacement.status()
             except Exception as observe_error:
-                start_error.add_note(
-                    f"failed definition recovery status: {type(observe_error).__name__}"
-                )
-                raise
-            if observed.phase is DaemonLifecyclePhase.RUNNING:
+                raise RuntimeError(
+                    f"{start_error}; definition recovery status failed: "
+                    f"{type(observe_error).__name__}: {observe_error}"
+                ) from start_error
+            if (
+                observed.phase is DaemonLifecyclePhase.RUNNING
+                or observed.process_identity is not None
+            ):
                 raise
             self._definitions[key] = previous_definition
             self._supervisors[key] = supervisor

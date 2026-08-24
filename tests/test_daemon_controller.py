@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 from shutil import rmtree
+from unittest.mock import Mock
 
 import pytest
 
@@ -246,6 +247,62 @@ def test_changed_definition_restart_reports_failed_rollback(controller, tmp_path
     with pytest.raises(
         RuntimeError,
         match="process creation failed.*rollback failed.*DaemonLaunchError",
+    ):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
+
+
+def test_changed_definition_restart_retains_failed_replacement_with_identity(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    old_supervisor = server._supervisors[definition.daemon_key]
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+    replacement = Mock()
+    replacement.start.side_effect = RuntimeError("replacement launch failed")
+    replacement.status.return_value = running.record.model_copy(
+        update={
+            "phase": DaemonLifecyclePhase.FAILED,
+            "detail": "cleanup timed out with descendants alive",
+        }
+    )
+    monkeypatch.setattr(server, "_new_supervisor", lambda _definition: replacement)
+
+    with pytest.raises(RuntimeError, match="replacement launch failed"):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
+
+    assert server._definitions[definition.daemon_key] == changed
+    assert server._supervisors[definition.daemon_key] is replacement
+    replacement.status.assert_called_once_with()
+    assert old_supervisor.status().phase is DaemonLifecyclePhase.STOPPED
+
+
+def test_changed_definition_restart_reports_launch_and_recovery_status_errors(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    client.request(DaemonRequest(operation=DaemonOperation.START, definition=definition))
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+    replacement = Mock()
+    replacement.start.side_effect = RuntimeError("replacement launch failed")
+    replacement.status.side_effect = OSError("replacement status failed")
+    monkeypatch.setattr(server, "_new_supervisor", lambda _definition: replacement)
+
+    with pytest.raises(
+        RuntimeError,
+        match="replacement launch failed.*recovery status failed.*OSError.*replacement status failed",
     ):
         client.request(
             DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
