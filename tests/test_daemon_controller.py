@@ -94,9 +94,7 @@ def test_controller_adopts_changed_definition_after_failed_start(
 
     assert running.record.phase is DaemonLifecyclePhase.RUNNING
     assert controller[0]._definitions[definition.daemon_key] == changed
-    client.request(
-        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
-    )
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
 
 
 def test_changed_definition_status_preserves_live_process_identity(
@@ -117,14 +115,10 @@ def test_changed_definition_status_preserves_live_process_identity(
 
     assert status.record.phase is DaemonLifecyclePhase.RUNNING
     assert status.record.process_identity == running.record.process_identity
-    client.request(
-        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
-    )
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
 
 
-def test_changed_cwd_status_preserves_live_process_identity(
-    controller, tmp_path: Path
-):
+def test_changed_cwd_status_preserves_live_process_identity(controller, tmp_path: Path):
     _, client = controller
     definition = _definition(tmp_path)
     running = client.request(
@@ -140,9 +134,38 @@ def test_changed_cwd_status_preserves_live_process_identity(
 
     assert status.record.phase is DaemonLifecyclePhase.RUNNING
     assert status.record.process_identity == running.record.process_identity
-    client.request(
-        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_retains_failed_supervisor_with_live_process_group(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
     )
+    supervisor = server._supervisors[definition.daemon_key]
+    failed = running.record.model_copy(
+        update={
+            "phase": DaemonLifecyclePhase.FAILED,
+            "detail": "daemon leader exited while its process group remains",
+        }
+    )
+    monkeypatch.setattr(supervisor, "status", lambda: failed)
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    drifted = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert drifted.record.phase is DaemonLifecyclePhase.FAILED
+    assert drifted.record.process_identity == running.record.process_identity
+    assert server._definitions[definition.daemon_key] == definition
+    assert server._supervisors[definition.daemon_key] is supervisor
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
 
 
 @pytest.mark.parametrize("operation", [DaemonOperation.START, DaemonOperation.RESTART])
@@ -168,9 +191,7 @@ def test_changed_definition_restart_uses_new_definition(
         }
     )
 
-    restarted = client.request(
-        DaemonRequest(operation=operation, definition=changed)
-    )
+    restarted = client.request(DaemonRequest(operation=operation, definition=changed))
 
     assert restarted.record.phase is DaemonLifecyclePhase.RUNNING
     for _ in range(50):
@@ -179,9 +200,7 @@ def test_changed_definition_restart_uses_new_definition(
         time.sleep(0.01)
     assert marker.exists()
     assert controller[0]._definitions[definition.daemon_key] == changed
-    client.request(
-        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
-    )
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
 
 
 def test_changed_definition_restart_restores_old_process_after_failed_start(
@@ -208,9 +227,29 @@ def test_changed_definition_restart_restores_old_process_after_failed_start(
     assert status.record.phase is DaemonLifecyclePhase.RUNNING
     assert status.record.generation > running.record.generation
     assert controller[0]._definitions[definition.daemon_key] == definition
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_restart_reports_failed_rollback(controller, tmp_path: Path):
+    _, client = controller
+    old_cwd = tmp_path / "old-cwd"
+    old_cwd.mkdir()
+    definition = _definition(old_cwd)
     client.request(
-        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
     )
+    changed = definition.model_copy(
+        update={"argv": (str(tmp_path / "missing-daemon"),)}
+    )
+    old_cwd.rmdir()
+
+    with pytest.raises(
+        RuntimeError,
+        match="process creation failed.*rollback failed.*DaemonLaunchError",
+    ):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
 
 
 def test_status_from_separate_client_preserves_controller_ownership(

@@ -272,7 +272,10 @@ class DaemonControllerServer:
         fails, the old definition is started again before the error escapes.
         """
         current = supervisor.status()
-        if current.phase is DaemonLifecyclePhase.RUNNING:
+        if (
+            current.phase is DaemonLifecyclePhase.RUNNING
+            or current.process_identity is not None
+        ):
             if request.operation is DaemonOperation.STATUS:
                 return current
             if request.operation is DaemonOperation.STOP:
@@ -314,8 +317,7 @@ class DaemonControllerServer:
                 observed = replacement.status()
             except Exception as observe_error:
                 start_error.add_note(
-                    "failed definition recovery status: "
-                    f"{type(observe_error).__name__}"
+                    f"failed definition recovery status: {type(observe_error).__name__}"
                 )
                 raise
             if observed.phase is DaemonLifecyclePhase.RUNNING:
@@ -325,10 +327,10 @@ class DaemonControllerServer:
             try:
                 supervisor.start()
             except Exception as rollback_error:
-                start_error.add_note(
-                    "failed definition recovery rollback: "
-                    f"{type(rollback_error).__name__}"
-                )
+                raise RuntimeError(
+                    f"{start_error}; definition rollback failed: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                ) from start_error
             raise
 
     def _forget(self, key: str) -> None:
