@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .daemon_lifecycle import (
     DaemonDefinition,
+    DaemonLifecyclePhase,
     DaemonLifecycleRecord,
     OwnerDiagnosticLock,
 )
@@ -224,24 +225,115 @@ class DaemonControllerServer:
             pass
 
     def _dispatch(self, request: DaemonRequest) -> DaemonLifecycleRecord:
-        definition = self._definitions.get(request.definition.daemon_key)
-        if definition is not None and definition != request.definition:
-            raise RuntimeError("daemon definition changed while controller owns it")
-        supervisor = self._supervisors.get(request.definition.daemon_key)
+        key = request.definition.daemon_key
+        definition = self._definitions.get(key)
+        supervisor = self._supervisors.get(key)
         if supervisor is None:
             supervisor = self._new_supervisor(request.definition)
-            self._definitions[request.definition.daemon_key] = request.definition
-            self._supervisors[request.definition.daemon_key] = supervisor
+            self._definitions[key] = request.definition
+            self._supervisors[key] = supervisor
+        elif definition is None:
+            raise RuntimeError("daemon controller definition ownership is inconsistent")
+        elif definition != request.definition:
+            return self._dispatch_definition_drift(
+                request,
+                supervisor,
+                definition,
+            )
+        return self._dispatch_owned(request, supervisor)
+
+    def _dispatch_owned(
+        self,
+        request: DaemonRequest,
+        supervisor: DaemonSupervisor,
+    ) -> DaemonLifecycleRecord:
         if request.operation is DaemonOperation.START:
             return supervisor.start()
         if request.operation is DaemonOperation.STOP:
             record = supervisor.stop()
-            del self._definitions[request.definition.daemon_key]
-            del self._supervisors[request.definition.daemon_key]
+            self._forget(request.definition.daemon_key)
             return record
         if request.operation is DaemonOperation.STATUS:
             return supervisor.status()
         return supervisor.restart()
+
+    def _dispatch_definition_drift(
+        self,
+        request: DaemonRequest,
+        supervisor: DaemonSupervisor,
+        previous_definition: DaemonDefinition,
+    ) -> DaemonLifecycleRecord:
+        """Reconcile a changed definition while retaining identity fencing.
+
+        The supervisor that owns the existing key remains the authority for
+        observing or stopping its process.  A stopped key can be replaced by
+        the requested definition.  A running key is restarted through the old
+        supervisor first, then the new definition is started; if that launch
+        fails, the old definition is started again before the error escapes.
+        """
+        current = supervisor.status()
+        if current.phase is DaemonLifecyclePhase.RUNNING:
+            if request.operation is DaemonOperation.STATUS:
+                return current
+            if request.operation is DaemonOperation.STOP:
+                record = supervisor.stop()
+                self._forget(request.definition.daemon_key)
+                return record
+            return self._restart_definition(
+                request,
+                supervisor,
+                previous_definition,
+            )
+
+        if request.operation is DaemonOperation.STOP:
+            record = supervisor.stop()
+            self._forget(request.definition.daemon_key)
+            return record
+
+        replacement = self._new_supervisor(request.definition)
+        key = request.definition.daemon_key
+        self._definitions[key] = request.definition
+        self._supervisors[key] = replacement
+        return self._dispatch_owned(request, replacement)
+
+    def _restart_definition(
+        self,
+        request: DaemonRequest,
+        supervisor: DaemonSupervisor,
+        previous_definition: DaemonDefinition,
+    ) -> DaemonLifecycleRecord:
+        key = request.definition.daemon_key
+        supervisor.stop()
+        replacement = self._new_supervisor(request.definition)
+        self._definitions[key] = request.definition
+        self._supervisors[key] = replacement
+        try:
+            return replacement.start()
+        except Exception as start_error:
+            try:
+                observed = replacement.status()
+            except Exception as observe_error:
+                start_error.add_note(
+                    "failed definition recovery status: "
+                    f"{type(observe_error).__name__}"
+                )
+                raise
+            if observed.phase is DaemonLifecyclePhase.RUNNING:
+                raise
+            self._definitions[key] = previous_definition
+            self._supervisors[key] = supervisor
+            try:
+                supervisor.start()
+            except Exception as rollback_error:
+                start_error.add_note(
+                    "failed definition recovery rollback: "
+                    f"{type(rollback_error).__name__}"
+                )
+            raise
+
+    def _forget(self, key: str) -> None:
+        self._definitions.pop(key, None)
+        self._supervisors.pop(key, None)
 
     def _new_supervisor(self, definition: DaemonDefinition) -> DaemonSupervisor:
         stem = hashlib.sha256(definition.daemon_key.encode()).hexdigest()

@@ -4,6 +4,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from shutil import rmtree
 
@@ -68,18 +69,148 @@ def test_separate_clients_share_controller_ownership(controller, tmp_path: Path)
     assert server.socket_path.exists()
 
 
-def test_controller_rejects_changed_definition(controller, tmp_path: Path):
+def test_controller_adopts_changed_definition_after_failed_start(
+    controller, tmp_path: Path
+):
+    _, client = controller
+    definition = _definition(tmp_path)
+    failed_definition = definition.model_copy(
+        update={"argv": (str(tmp_path / "missing-daemon"),)}
+    )
+    with pytest.raises(RuntimeError, match="process creation failed"):
+        client.request(
+            DaemonRequest(
+                operation=DaemonOperation.START,
+                definition=failed_definition,
+            )
+        )
+
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=changed)
+    )
+
+    assert running.record.phase is DaemonLifecyclePhase.RUNNING
+    assert controller[0]._definitions[definition.daemon_key] == changed
+    client.request(
+        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+    )
+
+
+def test_changed_definition_status_preserves_live_process_identity(
+    controller, tmp_path: Path
+):
+    _, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    status = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+    assert status.record.process_identity == running.record.process_identity
+    client.request(
+        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+    )
+
+
+def test_changed_cwd_status_preserves_live_process_identity(
+    controller, tmp_path: Path
+):
+    _, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed_cwd = tmp_path / "changed-cwd"
+    changed_cwd.mkdir()
+    changed = definition.model_copy(update={"cwd": changed_cwd})
+
+    status = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+    assert status.record.process_identity == running.record.process_identity
+    client.request(
+        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+    )
+
+
+@pytest.mark.parametrize("operation", [DaemonOperation.START, DaemonOperation.RESTART])
+def test_changed_definition_restart_uses_new_definition(
+    controller, tmp_path: Path, operation: DaemonOperation
+):
     _, client = controller
     definition = _definition(tmp_path)
     client.request(
         DaemonRequest(operation=DaemonOperation.START, definition=definition)
     )
-    changed = definition.model_copy(update={"argv": (sys.executable, "-V")})
+    changed_cwd = tmp_path / "changed-cwd"
+    changed_cwd.mkdir()
+    marker = changed_cwd / "started.txt"
+    changed = definition.model_copy(
+        update={
+            "argv": (
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import time; Path('started.txt').touch(); time.sleep(60)",
+            ),
+            "cwd": changed_cwd,
+        }
+    )
 
-    with pytest.raises(RuntimeError, match="definition changed"):
+    restarted = client.request(
+        DaemonRequest(operation=operation, definition=changed)
+    )
+
+    assert restarted.record.phase is DaemonLifecyclePhase.RUNNING
+    for _ in range(50):
+        if marker.exists():
+            break
+        time.sleep(0.01)
+    assert marker.exists()
+    assert controller[0]._definitions[definition.daemon_key] == changed
+    client.request(
+        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+    )
+
+
+def test_changed_definition_restart_restores_old_process_after_failed_start(
+    controller, tmp_path: Path
+):
+    _, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed = definition.model_copy(
+        update={"argv": (str(tmp_path / "missing-daemon"),)}
+    )
+
+    with pytest.raises(RuntimeError, match="process creation failed"):
         client.request(
-            DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
         )
+
+    status = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+    assert status.record.generation > running.record.generation
+    assert controller[0]._definitions[definition.daemon_key] == definition
+    client.request(
+        DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+    )
 
 
 def test_status_from_separate_client_preserves_controller_ownership(
