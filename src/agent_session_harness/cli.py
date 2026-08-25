@@ -180,6 +180,7 @@ def _parser() -> argparse.ArgumentParser:
         action = daemon_actions.add_parser(operation.value)
         action.add_argument("--socket", required=True)
         action.add_argument("--state-directory", required=True)
+        action.add_argument("--takeover", action="store_true")
         action.add_argument("--key", required=True)
         action.add_argument("--cwd", required=True)
         action.add_argument("command_argv", nargs=argparse.REMAINDER)
@@ -368,9 +369,17 @@ def _run_daemon(args: argparse.Namespace) -> int:
         argv=command,
         cwd=Path(args.cwd),
     )
-    ensure_controller(args.socket, args.state_directory)
+    ensure_controller(
+        args.socket,
+        args.state_directory,
+        allow_process_takeover=args.takeover,
+    )
     response = DaemonControllerClient(args.socket).request(
-        DaemonRequest(operation=args.daemon_operation, definition=definition)
+        DaemonRequest(
+            operation=args.daemon_operation,
+            definition=definition,
+            allow_process_takeover=args.takeover,
+        )
     )
     _emit(response.record.model_dump(mode="json"), json_output=args.json_output)
     return 0

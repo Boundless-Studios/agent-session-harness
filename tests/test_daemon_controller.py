@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import json
 import socket
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from shutil import rmtree
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -68,17 +71,303 @@ def test_separate_clients_share_controller_ownership(controller, tmp_path: Path)
     assert server.socket_path.exists()
 
 
-def test_controller_rejects_changed_definition(controller, tmp_path: Path):
+def test_controller_adopts_changed_definition_after_failed_start(
+    controller, tmp_path: Path
+):
+    _, client = controller
+    definition = _definition(tmp_path)
+    failed_definition = definition.model_copy(
+        update={"argv": (str(tmp_path / "missing-daemon"),)}
+    )
+    with pytest.raises(RuntimeError, match="process creation failed"):
+        client.request(
+            DaemonRequest(
+                operation=DaemonOperation.START,
+                definition=failed_definition,
+            )
+        )
+
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=changed)
+    )
+
+    assert running.record.phase is DaemonLifecyclePhase.RUNNING
+    assert controller[0]._definitions[definition.daemon_key] == changed
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_status_preserves_live_process_identity(
+    controller, tmp_path: Path
+):
+    _, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    status = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+    assert status.record.process_identity == running.record.process_identity
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_cwd_status_preserves_live_process_identity(controller, tmp_path: Path):
+    _, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed_cwd = tmp_path / "changed-cwd"
+    changed_cwd.mkdir()
+    changed = definition.model_copy(update={"cwd": changed_cwd})
+
+    status = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+    assert status.record.process_identity == running.record.process_identity
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_retains_failed_supervisor_with_live_process_group(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    supervisor = server._supervisors[definition.daemon_key]
+    failed = running.record.model_copy(
+        update={
+            "phase": DaemonLifecyclePhase.FAILED,
+            "detail": "daemon leader exited while its process group remains",
+        }
+    )
+    monkeypatch.setattr(supervisor, "status", lambda: failed)
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    drifted = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert drifted.record.phase is DaemonLifecyclePhase.FAILED
+    assert drifted.record.process_identity == running.record.process_identity
+    assert server._definitions[definition.daemon_key] == definition
+    assert server._supervisors[definition.daemon_key] is supervisor
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_retains_starting_supervisor_that_owns_child(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    supervisor = server._new_supervisor(definition)
+    starting = supervisor.status().model_copy(
+        update={"phase": DaemonLifecyclePhase.STARTING, "process_identity": None}
+    )
+    monkeypatch.setattr(supervisor, "status", lambda: starting)
+    monkeypatch.setattr(supervisor, "owns_live_child", lambda: True)
+    server._definitions[definition.daemon_key] = definition
+    server._supervisors[definition.daemon_key] = supervisor
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    drifted = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert drifted.record.phase is DaemonLifecyclePhase.STARTING
+    assert server._definitions[definition.daemon_key] == definition
+    assert server._supervisors[definition.daemon_key] is supervisor
+
+
+def test_changed_definition_retains_replacement_that_still_owns_child(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    original = server._supervisors[definition.daemon_key]
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+
+    monkeypatch.setattr(original, "stop", Mock())
+    original_start = Mock()
+    monkeypatch.setattr(original, "start", original_start)
+    replacement = Mock()
+    replacement.start.side_effect = TimeoutError("cleanup timed out")
+    replacement.status.return_value.phase = DaemonLifecyclePhase.STARTING
+    replacement.status.return_value.process_identity = None
+    replacement.owns_live_child.return_value = True
+    monkeypatch.setattr(server, "_new_supervisor", lambda _definition: replacement)
+
+    with pytest.raises(RuntimeError, match="cleanup timed out"):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
+
+    assert server._definitions[definition.daemon_key] == changed
+    assert server._supervisors[definition.daemon_key] is replacement
+    original_start.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", [DaemonOperation.START, DaemonOperation.RESTART])
+def test_changed_definition_restart_uses_new_definition(
+    controller, tmp_path: Path, operation: DaemonOperation
+):
     _, client = controller
     definition = _definition(tmp_path)
     client.request(
         DaemonRequest(operation=DaemonOperation.START, definition=definition)
     )
-    changed = definition.model_copy(update={"argv": (sys.executable, "-V")})
+    changed_cwd = tmp_path / "changed-cwd"
+    changed_cwd.mkdir()
+    marker = changed_cwd / "started.txt"
+    changed = definition.model_copy(
+        update={
+            "argv": (
+                sys.executable,
+                "-c",
+                "from pathlib import Path; import time; Path('started.txt').touch(); time.sleep(60)",
+            ),
+            "cwd": changed_cwd,
+        }
+    )
 
-    with pytest.raises(RuntimeError, match="definition changed"):
+    restarted = client.request(DaemonRequest(operation=operation, definition=changed))
+
+    assert restarted.record.phase is DaemonLifecyclePhase.RUNNING
+    for _ in range(50):
+        if marker.exists():
+            break
+        time.sleep(0.01)
+    assert marker.exists()
+    assert controller[0]._definitions[definition.daemon_key] == changed
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_restart_restores_old_process_after_failed_start(
+    controller, tmp_path: Path
+):
+    _, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed = definition.model_copy(
+        update={"argv": (str(tmp_path / "missing-daemon"),)}
+    )
+
+    with pytest.raises(RuntimeError, match="process creation failed"):
         client.request(
-            DaemonRequest(operation=DaemonOperation.STOP, definition=changed)
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
+
+    status = client.request(
+        DaemonRequest(operation=DaemonOperation.STATUS, definition=changed)
+    )
+
+    assert status.record.phase is DaemonLifecyclePhase.RUNNING
+    assert status.record.generation > running.record.generation
+    assert controller[0]._definitions[definition.daemon_key] == definition
+    client.request(DaemonRequest(operation=DaemonOperation.STOP, definition=changed))
+
+
+def test_changed_definition_restart_reports_failed_rollback(controller, tmp_path: Path):
+    _, client = controller
+    old_cwd = tmp_path / "old-cwd"
+    old_cwd.mkdir()
+    definition = _definition(old_cwd)
+    client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed = definition.model_copy(
+        update={"argv": (str(tmp_path / "missing-daemon"),)}
+    )
+    old_cwd.rmdir()
+
+    with pytest.raises(
+        RuntimeError,
+        match="process creation failed.*rollback failed.*DaemonLaunchError",
+    ):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
+
+
+def test_changed_definition_restart_retains_failed_replacement_with_identity(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    running = client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    old_supervisor = server._supervisors[definition.daemon_key]
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+    replacement = Mock()
+    replacement.start.side_effect = RuntimeError("replacement launch failed")
+    replacement.status.return_value = running.record.model_copy(
+        update={
+            "phase": DaemonLifecyclePhase.FAILED,
+            "detail": "cleanup timed out with descendants alive",
+        }
+    )
+    monkeypatch.setattr(server, "_new_supervisor", lambda _definition: replacement)
+
+    with pytest.raises(RuntimeError, match="replacement launch failed"):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
+        )
+
+    assert server._definitions[definition.daemon_key] == changed
+    assert server._supervisors[definition.daemon_key] is replacement
+    replacement.status.assert_called_once_with()
+    assert old_supervisor.status().phase is DaemonLifecyclePhase.STOPPED
+
+
+def test_changed_definition_restart_reports_launch_and_recovery_status_errors(
+    controller, tmp_path: Path, monkeypatch
+):
+    server, client = controller
+    definition = _definition(tmp_path)
+    client.request(
+        DaemonRequest(operation=DaemonOperation.START, definition=definition)
+    )
+    changed = definition.model_copy(
+        update={"argv": (sys.executable, "-c", "import time; time.sleep(61)")}
+    )
+    replacement = Mock()
+    replacement.start.side_effect = RuntimeError("replacement launch failed")
+    replacement.status.side_effect = OSError("replacement status failed")
+    monkeypatch.setattr(server, "_new_supervisor", lambda _definition: replacement)
+
+    with pytest.raises(
+        RuntimeError,
+        match="replacement launch failed.*recovery status failed.*OSError.*replacement status failed",
+    ):
+        client.request(
+            DaemonRequest(operation=DaemonOperation.RESTART, definition=changed)
         )
 
 
@@ -157,6 +446,46 @@ def test_request_payload_is_bounded(tmp_path: Path):
         client.request(request)
 
 
+def test_default_takeover_field_is_omitted_from_schema_v1_request(
+    monkeypatch, tmp_path: Path
+):
+    sent = bytearray()
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    connection.sendall.side_effect = sent.extend
+
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.socket.socket",
+        lambda *_args, **_kwargs: connection,
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._read_message",
+        lambda *_args: json.dumps(
+            {
+                "schema_version": 1,
+                "record": {
+                    "schema_version": 1,
+                    "daemon_key": "test-daemon",
+                    "phase": "stopped",
+                    "generation": 0,
+                    "process_identity": None,
+                    "detail": None,
+                    "changed_at": "2026-01-01T00:00:00Z",
+                },
+            }
+        ).encode(),
+    )
+
+    DaemonControllerClient(tmp_path / "controller.sock").request(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=_definition(tmp_path),
+        )
+    )
+
+    assert "allow_process_takeover" not in json.loads(sent)
+
+
 def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path):
     availability = iter((False, False, True))
     launches = []
@@ -173,8 +502,31 @@ def test_ensure_controller_launches_detached_server(monkeypatch, tmp_path: Path)
 
     assert len(launches) == 1
     argv, options = launches[0]
-    assert argv[2:4] == ("agent_session_harness.daemon_controller", "serve")
+    assert argv[2:4] == ["agent_session_harness.daemon_controller", "serve"]
     assert options["start_new_session"] is True
+
+
+def test_ensure_controller_passes_takeover_to_detached_server(
+    monkeypatch, tmp_path: Path
+):
+    availability = iter((False, True))
+    launches = []
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller._controller_available",
+        lambda _path, _state: next(availability),
+    )
+    monkeypatch.setattr(
+        "agent_session_harness.daemon_controller.subprocess.Popen",
+        lambda argv, **options: launches.append((argv, options)),
+    )
+
+    ensure_controller(
+        tmp_path / "controller.sock",
+        tmp_path / "state",
+        allow_process_takeover=True,
+    )
+
+    assert "--takeover" in launches[0][0]
 
 
 def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path: Path):
@@ -188,6 +540,57 @@ def test_ensure_controller_does_not_launch_when_available(monkeypatch, tmp_path:
     )
 
     ensure_controller(tmp_path / "controller.sock", tmp_path / "state")
+
+
+def test_takeover_request_upgrades_already_running_controller(controller, tmp_path):
+    server, client = controller
+    definition = _definition(tmp_path)
+    supervisor = server._new_supervisor(definition)
+    supervisor.allow_process_takeover = False
+    server._definitions[definition.daemon_key] = definition
+    server._supervisors[definition.daemon_key] = supervisor
+
+    response = client.request(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=definition,
+            allow_process_takeover=True,
+        )
+    )
+
+    assert response.record.phase is DaemonLifecyclePhase.STOPPED
+    assert supervisor.allow_process_takeover is True
+
+
+def test_controller_startup_takeover_does_not_authorize_unrelated_key(tmp_path):
+    server = DaemonControllerServer(
+        socket_path=tmp_path / "controller.sock",
+        state_directory=tmp_path / "state",
+        allow_process_takeover=True,
+    )
+    takeover_definition = _definition(tmp_path)
+    server._dispatch(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=takeover_definition,
+            allow_process_takeover=True,
+        )
+    )
+    ordinary_definition = takeover_definition.model_copy(
+        update={"daemon_key": "ordinary-daemon"}
+    )
+
+    server._dispatch(
+        DaemonRequest(
+            operation=DaemonOperation.STATUS,
+            definition=ordinary_definition,
+        )
+    )
+
+    assert server._supervisors[takeover_definition.daemon_key].allow_process_takeover
+    assert not server._supervisors[
+        ordinary_definition.daemon_key
+    ].allow_process_takeover
 
 
 def test_ensure_controller_rejects_live_state_directory_mismatch(controller, tmp_path):

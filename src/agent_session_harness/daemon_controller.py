@@ -19,6 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .daemon_lifecycle import (
     DaemonDefinition,
+    DaemonLifecyclePhase,
     DaemonLifecycleRecord,
     OwnerDiagnosticLock,
 )
@@ -42,6 +43,7 @@ class DaemonRequest(BaseModel):
     schema_version: Literal[1] = 1
     operation: DaemonOperation
     definition: DaemonDefinition
+    allow_process_takeover: bool = False
 
 
 class DaemonResponse(BaseModel):
@@ -87,7 +89,8 @@ class DaemonControllerClient:
         self.max_message_bytes = max_message_bytes
 
     def request(self, request: DaemonRequest) -> DaemonResponse:
-        payload = request.model_dump_json().encode() + b"\n"
+        exclude = None if request.allow_process_takeover else {"allow_process_takeover"}
+        payload = request.model_dump_json(exclude=exclude).encode() + b"\n"
         if len(payload) > self.max_message_bytes:
             raise ValueError(
                 f"daemon controller request exceeds {self.max_message_bytes} bytes"
@@ -112,23 +115,27 @@ def ensure_controller(
     state_directory: str | Path,
     *,
     startup_timeout: float = DEFAULT_CONTROLLER_STARTUP_TIMEOUT,
+    allow_process_takeover: bool = False,
 ) -> None:
     """Ensure a detached controller is accepting local requests."""
     resolved_socket = Path(socket_path)
     resolved_state = Path(state_directory)
     if _controller_available(resolved_socket, resolved_state):
         return
+    command = [
+        sys.executable,
+        "-m",
+        "agent_session_harness.daemon_controller",
+        "serve",
+        "--socket",
+        str(resolved_socket),
+        "--state-directory",
+        str(resolved_state),
+    ]
+    if allow_process_takeover:
+        command.append("--takeover")
     subprocess.Popen(
-        (
-            sys.executable,
-            "-m",
-            "agent_session_harness.daemon_controller",
-            "serve",
-            "--socket",
-            str(resolved_socket),
-            "--state-directory",
-            str(resolved_state),
-        ),
+        command,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -149,6 +156,7 @@ class DaemonControllerServer:
         socket_path: str | Path,
         state_directory: str | Path,
         max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
+        allow_process_takeover: bool = False,
         **supervisor_options: float,
     ) -> None:
         self.socket_path = Path(socket_path)
@@ -224,24 +232,124 @@ class DaemonControllerServer:
             pass
 
     def _dispatch(self, request: DaemonRequest) -> DaemonLifecycleRecord:
-        definition = self._definitions.get(request.definition.daemon_key)
-        if definition is not None and definition != request.definition:
-            raise RuntimeError("daemon definition changed while controller owns it")
-        supervisor = self._supervisors.get(request.definition.daemon_key)
+        key = request.definition.daemon_key
+        definition = self._definitions.get(key)
+        supervisor = self._supervisors.get(key)
         if supervisor is None:
             supervisor = self._new_supervisor(request.definition)
-            self._definitions[request.definition.daemon_key] = request.definition
-            self._supervisors[request.definition.daemon_key] = supervisor
+            self._definitions[key] = request.definition
+            self._supervisors[key] = supervisor
+        elif definition is None:
+            raise RuntimeError("daemon controller definition ownership is inconsistent")
+        if request.allow_process_takeover:
+            supervisor.allow_process_takeover = True
+        if definition is not None and definition != request.definition:
+            return self._dispatch_definition_drift(
+                request,
+                supervisor,
+                definition,
+            )
+        return self._dispatch_owned(request, supervisor)
+
+    def _dispatch_owned(
+        self,
+        request: DaemonRequest,
+        supervisor: DaemonSupervisor,
+    ) -> DaemonLifecycleRecord:
         if request.operation is DaemonOperation.START:
             return supervisor.start()
         if request.operation is DaemonOperation.STOP:
             record = supervisor.stop()
-            del self._definitions[request.definition.daemon_key]
-            del self._supervisors[request.definition.daemon_key]
+            self._forget(request.definition.daemon_key)
             return record
         if request.operation is DaemonOperation.STATUS:
             return supervisor.status()
         return supervisor.restart()
+
+    def _dispatch_definition_drift(
+        self,
+        request: DaemonRequest,
+        supervisor: DaemonSupervisor,
+        previous_definition: DaemonDefinition,
+    ) -> DaemonLifecycleRecord:
+        """Reconcile a changed definition while retaining identity fencing.
+
+        The supervisor that owns the existing key remains the authority for
+        observing or stopping its process.  A stopped key can be replaced by
+        the requested definition.  A running key is restarted through the old
+        supervisor first, then the new definition is started; if that launch
+        fails, the old definition is started again before the error escapes.
+        """
+        current = supervisor.status()
+        if (
+            current.phase is DaemonLifecyclePhase.RUNNING
+            or current.process_identity is not None
+            or supervisor.owns_live_child()
+        ):
+            if request.operation is DaemonOperation.STATUS:
+                return current
+            if request.operation is DaemonOperation.STOP:
+                record = supervisor.stop()
+                self._forget(request.definition.daemon_key)
+                return record
+            return self._restart_definition(
+                request,
+                supervisor,
+                previous_definition,
+            )
+
+        if request.operation is DaemonOperation.STOP:
+            record = supervisor.stop()
+            self._forget(request.definition.daemon_key)
+            return record
+
+        replacement = self._new_supervisor(request.definition)
+        key = request.definition.daemon_key
+        self._definitions[key] = request.definition
+        self._supervisors[key] = replacement
+        return self._dispatch_owned(request, replacement)
+
+    def _restart_definition(
+        self,
+        request: DaemonRequest,
+        supervisor: DaemonSupervisor,
+        previous_definition: DaemonDefinition,
+    ) -> DaemonLifecycleRecord:
+        key = request.definition.daemon_key
+        supervisor.stop()
+        replacement = self._new_supervisor(request.definition)
+        self._definitions[key] = request.definition
+        self._supervisors[key] = replacement
+        try:
+            return replacement.start()
+        except Exception as start_error:
+            try:
+                observed = replacement.status()
+            except Exception as observe_error:
+                raise RuntimeError(
+                    f"{start_error}; definition recovery status failed: "
+                    f"{type(observe_error).__name__}: {observe_error}"
+                ) from start_error
+            if (
+                observed.phase is DaemonLifecyclePhase.RUNNING
+                or observed.process_identity is not None
+                or replacement.owns_live_child()
+            ):
+                raise
+            self._definitions[key] = previous_definition
+            self._supervisors[key] = supervisor
+            try:
+                supervisor.start()
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    f"{start_error}; definition rollback failed: "
+                    f"{type(rollback_error).__name__}: {rollback_error}"
+                ) from start_error
+            raise
+
+    def _forget(self, key: str) -> None:
+        self._definitions.pop(key, None)
+        self._supervisors.pop(key, None)
 
     def _new_supervisor(self, definition: DaemonDefinition) -> DaemonSupervisor:
         stem = hashlib.sha256(definition.daemon_key.encode()).hexdigest()
@@ -347,10 +455,12 @@ def main(argv: list[str] | None = None) -> int:
     serve = subparsers.add_parser("serve")
     serve.add_argument("--socket", required=True)
     serve.add_argument("--state-directory", required=True)
+    serve.add_argument("--takeover", action="store_true")
     args = parser.parse_args(argv)
     DaemonControllerServer(
         socket_path=args.socket,
         state_directory=args.state_directory,
+        allow_process_takeover=args.takeover,
     ).serve()
     return 0
 
